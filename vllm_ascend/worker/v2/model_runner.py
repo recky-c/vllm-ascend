@@ -21,16 +21,23 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    get_uniform_token_count,
+)
 from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
 )
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -44,6 +51,7 @@ from vllm_ascend.ascend_forward_context import (
 from vllm_ascend.utils import set_weight_prefetch_method
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.dp_utils import sync_cudagraph_and_dp_padding_ascend
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.spec_decode.eagle import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
@@ -135,14 +143,191 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
 
-        # we need to use return value of `get_cudagraph_and_dp_padding`
-        # to set forward_context in `run_fullgraph`.
-        # so we can inherit `execute_model` method.
-        self.cudagraph_and_dp_padding: tuple[int, torch.Tensor | None, int] | None = None
+        # we need to store num_tokens_across_dp from execute_model
+        # so that run_fullgraph can use it to set forward_context.
+        self._num_tokens_across_dp: torch.Tensor | None = None
 
         # we need to use input_batch to set forward_context in run_fullgraph.
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+    ):
+        if not dummy_run:
+            self.finish_requests(scheduler_output)
+            self.free_states(scheduler_output)
+            self.add_requests(scheduler_output)
+            self.update_requests(scheduler_output)
+            self.block_tables.apply_staged_writes()
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                empty_output = self.kv_connector.no_forward(scheduler_output)
+                return empty_output
+
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_toks = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+
+        batch_desc = self.cudagraph_manager.dispatch(
+            num_reqs, num_toks, uniform_tok_count
+        )
+        num_tokens_across_dp = None
+
+        skip_compiled = False
+        if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
+            skip_compiled = True
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_toks,
+                num_reqs=num_reqs,
+            )
+
+        if self.dp_size > 1:
+            batch_desc, num_tokens_across_dp = sync_cudagraph_and_dp_padding_ascend(
+                self.cudagraph_manager,
+                batch_desc,
+                num_toks,
+                num_reqs,
+                uniform_tok_count,
+                self.dp_size,
+                self.dp_rank,
+                vllm_config=self.vllm_config,
+            )
+
+        self._num_tokens_across_dp = num_tokens_across_dp
+
+        if batch_desc.num_tokens == 0:
+            empty_output = self.kv_connector.no_forward(scheduler_output)
+            return empty_output
+
+        if not dummy_run:
+            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            block_tables, slot_mappings = self.prepare_attn(input_batch)
+
+            if self.lora_config:
+                lora_inputs = self.lora_state.make_lora_inputs(
+                    input_batch.req_ids,
+                    input_batch.idx_mapping_np,
+                    input_batch.num_scheduled_tokens,
+                )
+                self._set_active_loras(*lora_inputs)
+        else:
+            input_batch = AscendInputBatch.make_dummy(
+                batch_desc.num_reqs or num_reqs,
+                batch_desc.num_tokens,
+                self.input_buffers,
+            )
+            if not skip_attn_for_dummy_run:
+                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+            else:
+                block_tables = None
+                slot_mappings = None
+
+        attn_metadata = None
+        slot_mappings_by_layer = None
+        if not (dummy_run and skip_attn_for_dummy_run):
+            assert slot_mappings is not None
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_mappings, self.kv_cache_config
+            )
+            assert block_tables is not None
+            attn_metadata = self.model_state.prepare_attn(
+                input_batch,
+                batch_desc.cg_mode,
+                block_tables,
+                slot_mappings,
+                self.attn_groups,
+                self.kv_cache_config,
+            )
+
+        inputs_embeds = None
+        if self.supports_mm_inputs and self.is_first_pp_rank:
+            inputs_embeds = self.model_state.get_mm_embeddings(
+                scheduler_output.scheduled_encoder_inputs,
+                input_batch,
+                self.req_states,
+            )
+
+        model_inputs = {
+            "input_ids": input_batch.input_ids,
+            "positions": input_batch.positions,
+            "inputs_embeds": inputs_embeds,
+            **self.model_state.prepare_inputs(input_batch, self.req_states),
+        }
+        if not self.is_first_pp_rank:
+            model_inputs["input_ids"] = None
+            model_inputs["inputs_embeds"] = None
+
+            assert intermediate_tensors is not None
+            assert self.intermediate_tensors is not None
+            n = input_batch.num_tokens_after_padding
+            model_inputs["intermediate_tensors"] = IntermediateTensors(
+                {
+                    k: v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                    for k, v in self.intermediate_tensors.tensors.items()
+                }
+            )
+            del intermediate_tensors
+
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            self.kv_connector.pre_forward(scheduler_output)
+            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+        else:
+            batch_descriptor = BatchDescriptor(
+                num_tokens=input_batch.num_tokens_after_padding,
+                has_lora=self.lora_config is not None,
+            )
+
+            with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=input_batch.num_tokens_after_padding,
+                cudagraph_runtime_mode=batch_desc.cg_mode,
+                num_tokens_across_dp=num_tokens_across_dp,
+                batch_descriptor=batch_descriptor,
+                slot_mapping=slot_mappings_by_layer,
+                skip_compiled=skip_compiled,
+            ):
+                self.kv_connector.pre_forward(scheduler_output)
+                model_output = self.model(**model_inputs)
+
+        if self.is_last_pp_rank:
+            if self.use_aux_hidden_state_outputs:
+                assert isinstance(model_output, tuple)
+                hidden_states, aux_hidden_states = model_output
+            else:
+                assert isinstance(model_output, torch.Tensor)
+                hidden_states = model_output
+                aux_hidden_states = None
+            output_intermediate_tensors = None
+        else:
+            assert isinstance(model_output, IntermediateTensors)
+            hidden_states = None
+            aux_hidden_states = None
+            output_intermediate_tensors = model_output
+
+        kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+        self.execute_model_state = ExecuteModelState(
+            input_batch=input_batch,
+            attn_metadata=attn_metadata,
+            slot_mappings_by_layer=slot_mappings_by_layer,
+            hidden_states=hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            kv_connector_output=kv_connector_output,
+            num_tokens_across_dp=num_tokens_across_dp,
+        )
+
+        if not self.is_last_pp_rank:
+            assert output_intermediate_tensors is not None
+            output_intermediate_tensors.kv_connector_output = kv_connector_output
+            return output_intermediate_tensors
+        return None
 
     @torch.inference_mode()
     def profile_run(self) -> None:

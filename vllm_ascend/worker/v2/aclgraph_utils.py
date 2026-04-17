@@ -72,16 +72,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         ret = super().run_fullgraph(desc)
 
         positions = self.model_runner.input_buffers.positions[:num_tokens]
-        # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
-        # calculate num_tokens_across_dp.
-        num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens, device=self.device)
+        num_tokens_across_dp = self.model_runner._num_tokens_across_dp
         with set_forward_context(
             self.model_runner.model_state.attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
             cudagraph_runtime_mode=desc.cg_mode,
             num_tokens_across_dp=num_tokens_across_dp,
-            batch_descriptor=None,  # Full graph model don't need batch_descriptor
+            batch_descriptor=None,
             slot_mapping=None,
         ):
             forward_context = get_forward_context()
