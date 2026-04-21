@@ -151,6 +151,13 @@ class NPUModelRunner(GPUModelRunner):
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
 
+        # Initialize decode_token_per_req
+        self.decode_token_per_req = 1
+        if self.speculative_config:
+            spec_token_num = self.speculative_config.num_speculative_tokens
+            assert spec_token_num > 0
+            self.decode_token_per_req = 1 + spec_token_num
+
     @torch.inference_mode()
     def execute_model(
         self,
