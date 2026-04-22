@@ -45,6 +45,7 @@ from vllm_ascend.ascend_forward_context import (
     get_mc2_tokens_capacity,
     override_mrv2_in_profile_run,
     select_moe_comm_method,
+    set_ascend_forward_context,
     set_mc2_mask,
     set_mc2_tokens_capacity,
 )
@@ -291,14 +292,15 @@ class NPUModelRunner(GPUModelRunner):
                 has_lora=self.lora_config is not None,
             )
 
-            with set_forward_context(
+            with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
+                aclgraph_runtime_mode=batch_desc.cg_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
                 batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
+                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                model_instance=self.model,
                 skip_compiled=skip_compiled,
             ):
                 self.kv_connector.pre_forward(scheduler_output)

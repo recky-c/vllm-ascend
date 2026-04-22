@@ -23,6 +23,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -73,14 +74,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
         positions = self.model_runner.input_buffers.positions[:num_tokens]
         num_tokens_across_dp = self.model_runner._num_tokens_across_dp
-        with set_forward_context(
+        with set_ascend_forward_context(
             self.model_runner.model_state.attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
             cudagraph_runtime_mode=desc.cg_mode,
             num_tokens_across_dp=num_tokens_across_dp,
             batch_descriptor=None,
-            slot_mapping=None,
+            model_instance=self.model_runner.model,
         ):
             forward_context = get_forward_context()
             update_full_graph_params(
