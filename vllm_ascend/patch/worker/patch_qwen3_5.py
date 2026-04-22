@@ -21,6 +21,7 @@ import torch
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
@@ -82,6 +83,8 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        logger.info(f"[Qwen3_5DecoderLayer] Before processing: hidden_states.shape = {hidden_states.shape}, layer_idx={self.layer_idx}")
+        
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -92,6 +95,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
             tp_size = get_tensor_model_parallel_world_size()
             n_out = (hidden_states.shape[0] + tp_size - 1) // tp_size
             hidden_dim = hidden_states.shape[-1]
+            logger.info(f"[Qwen3_5DecoderLayer] Creating self_attention_output: n_out={n_out}, tp_size={tp_size}, hidden_states.shape={hidden_states.shape}")
             self_attention_output = torch.empty(
                 (n_out, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
             )
@@ -112,6 +116,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+        logger.info(f"[Qwen3_5DecoderLayer] After attention: hidden_states.shape = {hidden_states.shape}")
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -121,7 +126,9 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        logger.info(f"[Qwen3_5DecoderLayer] Before MLP: hidden_states.shape = {hidden_states.shape}")
         hidden_states = self.mlp(hidden_states)
+        logger.info(f"[Qwen3_5DecoderLayer] After MLP: hidden_states.shape = {hidden_states.shape}")
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

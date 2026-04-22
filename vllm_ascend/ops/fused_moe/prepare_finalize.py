@@ -26,6 +26,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -251,25 +252,32 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         Returns:
             MoEPrepareOutput, possibly sliced/padded.
         """
+        logger.info(f"[PrepareAndFinalizeWithMC2] Before prepare: hidden_states.shape = {hidden_states.shape}, router_logits.shape = {router_logits.shape}")
+        
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
+        logger.info(f"[PrepareAndFinalizeWithMC2] Original mc2_mask.shape = {mc2_mask.shape}, tp_size={self.tp_size}, tp_rank={self.tp_rank}")
+        
         if self.tp_size > 1:
             # Also slice mc2_mask
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
             mc2_mask = split_mc2_mask[self.tp_rank]
+            logger.info(f"[PrepareAndFinalizeWithMC2] After slicing mc2_mask.shape = {mc2_mask.shape}")
 
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
             self.num_tokens, _ = hidden_states.shape
             target_pad_length = _EXTRA_CTX.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
+            logger.info(f"[PrepareAndFinalizeWithMC2] pad_size = {pad_size}, target_pad_length={target_pad_length}, num_tokens={self.num_tokens}")
 
             # Pad if necessary (unless shared expert DP is enabled)
             if pad_size > 0 and not self.enable_shared_expert_dp:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
                 padded_hidden_states_shape = hidden_states.shape
+                logger.info(f"[PrepareAndFinalizeWithMC2] After padding: hidden_states.shape = {hidden_states.shape}, router_logits.shape = {router_logits.shape}")
 
             # Slice across TP ranks
             if self.tp_size > 1 and not self.enable_shared_expert_dp:
@@ -277,6 +285,9 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
+                logger.info(f"[PrepareAndFinalizeWithMC2] After TP slicing: hidden_states.shape = {hidden_states.shape}, router_logits.shape = {router_logits.shape}")
+        
+        logger.info(f"[PrepareAndFinalizeWithMC2] Final: hidden_states.shape = {hidden_states.shape}, mc2_mask.shape = {mc2_mask.shape}")
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,

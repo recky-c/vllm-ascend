@@ -220,17 +220,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
-        # Log input parameters for debugging
-        if logger.isEnabledFor(10):  # DEBUG level
-            log_kwargs = {}
-            for key, value in kwargs_mc2.items():
-                if isinstance(value, torch.Tensor):
-                    log_kwargs[key] = f"Tensor(shape={value.shape}, dtype={value.dtype})"
-                elif isinstance(value, (int, float, bool, str)):
-                    log_kwargs[key] = value
-                else:
-                    log_kwargs[key] = type(value).__name__
-            logger.debug(f"Calling torch_npu.npu_moe_distribute_dispatch_v2 with kwargs: {log_kwargs}")
+        log_kwargs = {}
+        for key, value in kwargs_mc2.items():
+            if isinstance(value, torch.Tensor):
+                log_kwargs[key] = f"Tensor(shape={value.shape}, dtype={value.dtype})"
+            elif isinstance(value, (int, float, bool, str)):
+                log_kwargs[key] = value
+            else:
+                log_kwargs[key] = type(value).__name__
+        logger.info(f"Calling torch_npu.npu_moe_distribute_dispatch_v2 with kwargs: {log_kwargs}")
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2

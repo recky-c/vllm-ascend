@@ -468,6 +468,8 @@ class AscendFusedMoE(FusedMoE):
 
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+        logger.info(f"[AscendFusedMoE] Before prepare: hidden_states.shape = {hidden_states.shape}, router_logits.shape = {router_logits.shape if router_logits is not None else 'None'}")
+        
         prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -480,6 +482,9 @@ class AscendFusedMoE(FusedMoE):
         mc2_mask = prepare_output.mc2_mask
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
         pertoken_scale = prepare_output.pertoken_scale
+        
+        logger.info(f"[AscendFusedMoE] After prepare: hidden_states.shape = {hidden_states.shape}, mc2_mask.shape = {mc2_mask.shape if mc2_mask is not None else 'None'}")
+        logger.info(f"[AscendFusedMoE] padded_hidden_states_shape = {padded_hidden_states_shape}")
 
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
