@@ -77,28 +77,44 @@ def _dbg_loop_consistency(tag: str, tok: Any) -> None:
         return
     is_float = t.is_floating_point() if hasattr(t, "is_floating_point") else False
     if is_float:
-        # Non-sensitive aggregate stats for activations / hidden states.
         f32 = flat.to(torch.float32)
+        # Multi-scale aggregates so that small, padded tensors are still
+        # distinguishable: head8 captures the actually-valid prefix while
+        # the global stats cover the entire (possibly padded) buffer.
+        head_n = min(8, numel)
+        head_stat = (
+            f"head8_sum={float(f32[:head_n].sum().item()):.6g} "
+            f"head8_absmean={float(f32[:head_n].abs().mean().item()):.6g}"
+        )
         stat = (
             f"sum={float(f32.sum().item()):.6g} "
             f"mean={float(f32.mean().item()):.6g} "
             f"min={float(f32.min().item()):.6g} "
             f"max={float(f32.max().item()):.6g} "
-            f"absmean={float(f32.abs().mean().item()):.6g}"
+            f"absmean={float(f32.abs().mean().item()):.6g} "
+            + head_stat
         )
     else:
-        # Integer (or bool) tensor: use a simple checksum + xor hash.
         as_i64 = flat.to(torch.int64)
         idx = torch.arange(numel, dtype=torch.int64)
-        # XOR-fold first 1024 elements (or less). Position-weighted so
-        # permutations differ.
-        n = min(numel, 1024)
-        xor = int((as_i64[:n] * (idx[:n] + 1)).sum().item() ^ as_i64[:n].sum().item())
+
+        def _xor_hash(end: int) -> int:
+            n = min(numel, end)
+            return int(
+                (as_i64[:n] * (idx[:n] + 1)).sum().item() ^ as_i64[:n].sum().item()
+            ) & 0xFFFFFFFFFFFFFFFF
+
+        # Multi-scale xor hashes. `xor8` is the most useful for triaging
+        # single-prompt batches: the valid region is tiny (e.g. 4 tokens
+        # for num_spec=3) and the global xorhash would otherwise be
+        # dominated by the padded tail.
         stat = (
             f"sum={int(as_i64.sum().item())} "
             f"min={int(as_i64.min().item())} "
             f"max={int(as_i64.max().item())} "
-            f"xorhash={xor & 0xFFFFFFFFFFFFFFFF}"
+            f"xor8={_xor_hash(8)} "
+            f"xor64={_xor_hash(64)} "
+            f"xorhash={_xor_hash(1024)}"
         )
     head = ""
     if _DEBUG_LOOP_TRACE_VERBOSE:

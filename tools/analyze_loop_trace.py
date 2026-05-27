@@ -51,27 +51,33 @@ HEAD_RE = re.compile(
     r"shape=(?P<shape>\([^)]*\))\s+"
     r"dtype=(?P<dtype>\S+)"
 )
-SUM_RE = re.compile(r"\bsum=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)")
+XOR8_RE = re.compile(r"\bxor8=(\d+)")
+XOR64_RE = re.compile(r"\bxor64=(\d+)")
 XOR_RE = re.compile(r"\bxorhash=(\d+)")
+HEAD8_SUM_RE = re.compile(r"\bhead8_sum=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)")
+SUM_RE = re.compile(r"\bsum=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)")
 SUM32_RE = re.compile(r"\bsum32=(-?\d+)")  # backward compat
 
 
 def _extract_fingerprint(line: str) -> str | None:
     """Return a string that uniquely fingerprints the tensor on the line.
 
-    We prefer xorhash (ints) > sum32 (legacy) > sum (floats).  The exact
-    numeric type does not matter as long as the same tensor produces the
-    same string across rank/iter comparisons.
+    Preference: xor8 (most sensitive for small / padded buffers) > xor64
+    > xorhash > head8_sum (floats) > sum32 (legacy) > sum (floats). The
+    exact numeric type does not matter as long as the same tensor
+    produces the same string across rank/iter comparisons.
     """
-    m = XOR_RE.search(line)
-    if m:
-        return f"x{m.group(1)}"
-    m = SUM32_RE.search(line)
-    if m:
-        return f"s{m.group(1)}"
-    m = SUM_RE.search(line)
-    if m:
-        return f"f{m.group(1)}"
+    for rx, prefix in (
+        (XOR8_RE, "x8"),
+        (XOR64_RE, "x64"),
+        (XOR_RE, "x"),
+        (HEAD8_SUM_RE, "h"),
+        (SUM32_RE, "s"),
+        (SUM_RE, "f"),
+    ):
+        m = rx.search(line)
+        if m:
+            return f"{prefix}{m.group(1)}"
     return None
 
 
@@ -121,26 +127,67 @@ def bucket_by_iter(recs: list[dict], tp_size: int) -> list[dict[str, dict[int, s
     return iters
 
 
-def report_single(iters: list[dict[str, dict[int, str]]]) -> None:
+def report_single(
+    iters: list[dict[str, dict[int, str]]],
+    tp_size: int,
+    dcp_size: int = 1,
+    pcp_size: int = 1,
+) -> None:
     n = len(iters)
     print(f"Grouped into {n} iters.\n")
     if n == 0:
         return
 
-    # A) Cross-rank divergence.
+    # Build the expected (within-CP-group) rank partition. With
+    # tp=tp_size, dcp=dcp_size, pcp=pcp_size, ranks within the same
+    # (dcp_rank, pcp_rank) group are expected to see the same KV slot
+    # mapping / positions. Ranks across groups are expected to differ.
+    # The exact group key depends on launcher rank layout; we make the
+    # common assumption (matching vllm-ascend) that the global rank is
+    # laid out as [tp_within_cp, dcp_rank, pcp_rank] in row-major order
+    # with TP innermost. Under that layout, rank r belongs to the CP
+    # group `r // (tp_size // (dcp_size * pcp_size))`.
+    cp_groups = max(1, dcp_size * pcp_size)
+    tp_per_cp = max(1, tp_size // cp_groups)
+
+    def _cp_group(rank: int) -> int:
+        return rank // tp_per_cp
+
+    # A) Cross-rank divergence, separated into:
+    #    A1) within-CP-group (these should ALWAYS match -- divergence = real bug)
+    #    A2) across-CP-group (expected to differ when KV cache is dcp-sharded;
+    #        only useful to flag when distinct count != expected cp_groups)
     print("=== A) Cross-rank divergence (per iter, per tag) ===")
-    diverged: Counter[str] = Counter()
+    if cp_groups > 1:
+        print(f"  (TP={tp_size}, DCP={dcp_size}, PCP={pcp_size} -> {cp_groups} CP groups of {tp_per_cp} ranks each)")
+    diverged_within: Counter[str] = Counter()
+    diverged_across_unexpected: Counter[str] = Counter()
     seen_tags: Counter[str] = Counter()
     for it in iters:
         for tag, by_rank in it.items():
             seen_tags[tag] += 1
-            if len(set(by_rank.values())) > 1:
-                diverged[tag] += 1
-    if not diverged:
-        print("  [OK] No cross-rank divergence in any iter.")
+            # within-group check
+            by_group: dict[int, set[str]] = defaultdict(set)
+            for rk, fp in by_rank.items():
+                by_group[_cp_group(rk)].add(fp)
+            if any(len(s) > 1 for s in by_group.values()):
+                diverged_within[tag] += 1
+            # across-group check (only meaningful if cp_groups > 1)
+            if cp_groups > 1:
+                group_fps = {next(iter(s)) for s in by_group.values() if s}
+                if 1 < len(group_fps) < cp_groups:
+                    # partial divergence across groups - unexpected
+                    diverged_across_unexpected[tag] += 1
+    if diverged_within:
+        for tag, k in diverged_within.most_common():
+            print(f"  [BAD-WITHIN-CP] {tag:50s} divergent_iters={k}/{seen_tags[tag]}")
     else:
-        for tag, k in diverged.most_common():
-            print(f"  [DIVERGE] {tag:50s} divergent_iters={k}/{seen_tags[tag]}")
+        print("  [OK] No within-CP-group divergence in any iter.")
+    if cp_groups > 1:
+        if diverged_across_unexpected:
+            print("  --- unexpected partial divergence across CP groups: ---")
+            for tag, k in diverged_across_unexpected.most_common():
+                print(f"  [PARTIAL-ACROSS-CP] {tag:50s} iters={k}/{seen_tags[tag]}")
 
     # B) Loop signature on set_prev_sampled.main (rank 0).
     print("\n=== B) Loop signature in set_prev_sampled.main ===")
@@ -259,6 +306,18 @@ def main() -> int:
     )
     ap.add_argument("--tp-size", type=int, required=True)
     ap.add_argument(
+        "--dcp-size",
+        type=int,
+        default=1,
+        help="decode_context_parallel_size used during the run (default 1). Used to ignore expected cross-DCP-group divergence in slot_mapping / positions.",
+    )
+    ap.add_argument(
+        "--pcp-size",
+        type=int,
+        default=1,
+        help="prefill_context_parallel_size used during the run (default 1).",
+    )
+    ap.add_argument(
         "--compare",
         default=None,
         help="(optional) path to a second log; equivalent to passing it as the second positional arg.",
@@ -284,7 +343,7 @@ def main() -> int:
     iters_a = bucket_by_iter(recs_a, args.tp_size)
     print(f"# Log A ({args.label_a}): {log_a}")
     print(f"# Parsed {len(recs_a)} trace lines from log A.")
-    report_single(iters_a)
+    report_single(iters_a, args.tp_size, args.dcp_size, args.pcp_size)
 
     if log_b is not None:
         recs_b = parse(log_b)
@@ -294,7 +353,7 @@ def main() -> int:
         iters_b = bucket_by_iter(recs_b, args.tp_size)
         print(f"\n# Log B ({args.label_b}): {log_b}")
         print(f"# Parsed {len(recs_b)} trace lines from log B.")
-        report_single(iters_b)
+        report_single(iters_b, args.tp_size, args.dcp_size, args.pcp_size)
         report_compare(iters_a, iters_b, args.label_a, args.label_b)
 
     return 0
