@@ -49,6 +49,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.worker.pcp_utils import _dbg_loop_consistency
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
@@ -718,6 +719,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
 
+        _dbg_loop_consistency("eagle.step0.slot_mapping", common_attn_metadata.slot_mapping)
+        _dbg_loop_consistency("eagle.step0.positions", common_attn_metadata.positions)
+        _dbg_loop_consistency(
+            "eagle.step0.block_table_first_col",
+            common_attn_metadata.block_table_tensor[:, 0]
+            if common_attn_metadata.block_table_tensor is not None
+            else None,
+        )
+        _dbg_loop_consistency("eagle.step0.seq_lens", common_attn_metadata.seq_lens)
+
         if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
             attn_metadata.attn_mask = None
 
@@ -1060,6 +1071,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
+
+            _dbg_loop_consistency(f"eagle.draft{draft_step + 1}.hidden_in", model_hidden_states)
+            _dbg_loop_consistency(f"eagle.draft{draft_step + 1}.input_ids", model_input_ids)
+            _dbg_loop_consistency(f"eagle.draft{draft_step + 1}.positions", model_positions)
 
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -1434,6 +1449,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             slot_mapping = mtp_slot_mapping[slot_indices]
             self.slot_mapping_group[draft_step][: batch_size * self.pcp_size] = slot_mapping
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+            _dbg_loop_consistency(f"eagle.step{draft_step}.dcp.slot_indices", slot_indices)
+            _dbg_loop_consistency(f"eagle.step{draft_step}.dcp.slot_mapping", common_attn_metadata.slot_mapping)
+            _dbg_loop_consistency(f"eagle.step{draft_step}.dcp.cp_seq_len", cp_seq_len)
+            _dbg_loop_consistency(f"eagle.step{draft_step}.dcp.positions", common_attn_metadata.positions)
         else:
             # NOTE: In vllm, `block_size = attn_metadata_builder.kv_cache_spec.block_size`.
             # However, in vllm-ascend, the above value can be multiple of `kernel_block_size`,
@@ -1462,6 +1481,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.slot_mapping_group[draft_step][slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+            _dbg_loop_consistency(f"eagle.step{draft_step}.normal.slot_mapping", common_attn_metadata.slot_mapping)
+            _dbg_loop_consistency(f"eagle.step{draft_step}.normal.positions", common_attn_metadata.positions)
 
         self.seq_lens_group[draft_step][: common_attn_metadata.seq_lens.shape[0]].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[draft_step][common_attn_metadata.seq_lens.shape[0] :].fill_(0)

@@ -35,15 +35,15 @@ if TYPE_CHECKING:
 
 # Debug helper for triaging the FLASHCOMM1 + DCP>1 + EAGLE3 (num_spec>1) +
 # async-scheduling output-loop issue. Enable by setting
-# VLLM_ASCEND_DEBUG_LOOP_TRACE=1. Prints cross-rank fingerprints (first 8
-# values + a 32-element sum) of token tensors that travel through the
-# async-scheduling / pcp_full path. The intent is to find out whether
-# `prev_sampled_token_ids` (and the draft tokens scattered after it) are
-# consistent across TP ranks before they get scattered into
-# `input_ids_pcp_full.cpu`. Cross-rank divergence here would explain why
-# turning OFF any one of {FLASHCOMM1, DCP, multi-step spec, async-sched}
-# breaks the loop.
+# VLLM_ASCEND_DEBUG_LOOP_TRACE=1. Prints non-sensitive structural
+# fingerprints (sum + a small xor-hash) of tensors that travel through the
+# spec-decode / async-scheduling / pcp_full path. The default fingerprint
+# does NOT include any raw token ids or hidden-state values, so it is safe
+# to share for triage of customer workloads. Set
+# VLLM_ASCEND_DEBUG_LOOP_TRACE_VERBOSE=1 to additionally include the first
+# few raw values (use only when the input is non-sensitive).
 _DEBUG_LOOP_TRACE = bool(int(os.getenv("VLLM_ASCEND_DEBUG_LOOP_TRACE", "0")))
+_DEBUG_LOOP_TRACE_VERBOSE = bool(int(os.getenv("VLLM_ASCEND_DEBUG_LOOP_TRACE_VERBOSE", "0")))
 
 
 def _dbg_loop_consistency(tag: str, tok: Any) -> None:
@@ -68,11 +68,45 @@ def _dbg_loop_consistency(tag: str, tok: Any) -> None:
     except Exception:
         pass
     flat = t.flatten()
-    head = flat[:8].tolist() if flat.numel() else []
-    sum32 = int(flat[:32].sum().item()) if flat.numel() else 0
+    numel = flat.numel()
+    if numel == 0:
+        print(
+            f"[LOOP-TRACE][{tag}] rank={rank} tp_rank={tp_rank} shape={tuple(t.shape)} EMPTY",
+            flush=True,
+        )
+        return
+    is_float = t.is_floating_point() if hasattr(t, "is_floating_point") else False
+    if is_float:
+        # Non-sensitive aggregate stats for activations / hidden states.
+        f32 = flat.to(torch.float32)
+        stat = (
+            f"sum={float(f32.sum().item()):.6g} "
+            f"mean={float(f32.mean().item()):.6g} "
+            f"min={float(f32.min().item()):.6g} "
+            f"max={float(f32.max().item()):.6g} "
+            f"absmean={float(f32.abs().mean().item()):.6g}"
+        )
+    else:
+        # Integer (or bool) tensor: use a simple checksum + xor hash.
+        as_i64 = flat.to(torch.int64)
+        idx = torch.arange(numel, dtype=torch.int64)
+        # XOR-fold first 1024 elements (or less). Position-weighted so
+        # permutations differ.
+        n = min(numel, 1024)
+        xor = int((as_i64[:n] * (idx[:n] + 1)).sum().item() ^ as_i64[:n].sum().item())
+        stat = (
+            f"sum={int(as_i64.sum().item())} "
+            f"min={int(as_i64.min().item())} "
+            f"max={int(as_i64.max().item())} "
+            f"xorhash={xor & 0xFFFFFFFFFFFFFFFF}"
+        )
+    head = ""
+    if _DEBUG_LOOP_TRACE_VERBOSE:
+        head_n = min(8, numel)
+        head = f" first{head_n}={flat[:head_n].tolist()}"
     print(
         f"[LOOP-TRACE][{tag}] rank={rank} tp_rank={tp_rank} "
-        f"shape={tuple(t.shape)} dtype={t.dtype} first8={head} sum32={sum32}",
+        f"shape={tuple(t.shape)} dtype={t.dtype} numel={numel} {stat}{head}",
         flush=True,
     )
 
