@@ -995,7 +995,8 @@ class PCPManager:
         if self.decode_threshold > 2 and not with_prefill:
             num_tokens_ori = sum(list(num_scheduled_tokens.values()))
             num_tokens_mtp = num_tokens_ori + self.num_reqs * (self.decode_threshold - 2)
-            num_tokens_mtp_pad = num_tokens_mtp * self.pcp_world_size
+            cp_world_size = self.pcp_world_size * self.dcp_world_size
+            num_tokens_mtp_pad = num_tokens_mtp * cp_world_size
             req_indices_split = np.array_split(req_indices, cu_num_tokens)[: self.num_reqs]
             positions_split = np.array_split(positions_np, cu_num_tokens)[: self.num_reqs]
             for req_idx in range(self.num_reqs):
@@ -1012,7 +1013,7 @@ class PCPManager:
             input_batch.block_table.compute_slot_mapping_draft(req_indices_mtp, positions_mtp)
             mtp_slot_ori = input_batch.block_table.block_tables[0].slot_mapping.cpu[:num_tokens_mtp]
             unpad_mask = np.repeat(False, num_tokens_mtp_pad)
-            unpad_mask[:: self.pcp_world_size] = True
+            unpad_mask[:: cp_world_size] = True
             mtp_slot_pad = torch.full([num_tokens_mtp_pad], -1, dtype=torch.int32)
             mtp_slot_pad[unpad_mask] = mtp_slot_ori
             self.mtp_slot_pad = mtp_slot_pad.to(self.device, non_blocking=True)
