@@ -22,14 +22,15 @@ Two modes:
            rank-0 xorhash starts disagreeing with the most-common pattern
            (helps spot the moment KV cache layout drifts).
 
-2. Compare mode:
-       python tools/analyze_loop_trace.py path/to/buggy.log \\
-              --compare path/to/control.log --tp-size 16
+2. Compare mode (either form works):
+       python tools/analyze_loop_trace.py buggy.log control.log --tp-size 16
+       python tools/analyze_loop_trace.py buggy.log --compare control.log --tp-size 16
 
    For each tag present in both runs, reports the first iter where
    rank-0 xorhash differs between the two runs. This is the cleanest way
-   to find the exact code point at which FLASHCOMM1-ON diverges from
-   FLASHCOMM1-OFF (or any other A/B you want to run).
+   to find the exact code point at which a buggy run diverges from a
+   baseline run (e.g. async-sched ON vs OFF, num_spec=3 vs num_spec=1,
+   FLASHCOMM1 ON vs OFF, ...).
 """
 from __future__ import annotations
 
@@ -251,33 +252,47 @@ def report_compare(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("log", help="path to the [LOOP-TRACE] log")
+    ap.add_argument(
+        "logs",
+        nargs="+",
+        help="path(s) to [LOOP-TRACE] log(s). Pass one log for single-log mode, or two logs for compare mode.",
+    )
     ap.add_argument("--tp-size", type=int, required=True)
     ap.add_argument(
         "--compare",
         default=None,
-        help="path to a second log; report first iter where its fingerprints diverge from the first log",
+        help="(optional) path to a second log; equivalent to passing it as the second positional arg.",
     )
     ap.add_argument("--label-a", default="A", help="label for the first log in compare mode")
     ap.add_argument("--label-b", default="B", help="label for the second log in compare mode")
     args = ap.parse_args()
 
-    recs_a = parse(args.log)
+    logs: list[str] = list(args.logs)
+    if args.compare:
+        logs.append(args.compare)
+    if len(logs) > 2:
+        print("expected at most 2 log files", file=sys.stderr)
+        return 2
+
+    log_a = logs[0]
+    log_b = logs[1] if len(logs) == 2 else None
+
+    recs_a = parse(log_a)
     if not recs_a:
-        print(f"no [LOOP-TRACE] lines found in {args.log}", file=sys.stderr)
+        print(f"no [LOOP-TRACE] lines found in {log_a}", file=sys.stderr)
         return 1
     iters_a = bucket_by_iter(recs_a, args.tp_size)
-    print(f"# Log A: {args.log}")
+    print(f"# Log A ({args.label_a}): {log_a}")
     print(f"# Parsed {len(recs_a)} trace lines from log A.")
     report_single(iters_a)
 
-    if args.compare:
-        recs_b = parse(args.compare)
+    if log_b is not None:
+        recs_b = parse(log_b)
         if not recs_b:
-            print(f"\nno [LOOP-TRACE] lines found in {args.compare}", file=sys.stderr)
+            print(f"\nno [LOOP-TRACE] lines found in {log_b}", file=sys.stderr)
             return 1
         iters_b = bucket_by_iter(recs_b, args.tp_size)
-        print(f"\n# Log B: {args.compare}")
+        print(f"\n# Log B ({args.label_b}): {log_b}")
         print(f"# Parsed {len(recs_b)} trace lines from log B.")
         report_single(iters_b)
         report_compare(iters_a, iters_b, args.label_a, args.label_b)
