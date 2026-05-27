@@ -44,6 +44,9 @@ if TYPE_CHECKING:
 # few raw values (use only when the input is non-sensitive).
 _DEBUG_LOOP_TRACE = bool(int(os.getenv("VLLM_ASCEND_DEBUG_LOOP_TRACE", "0")))
 _DEBUG_LOOP_TRACE_VERBOSE = bool(int(os.getenv("VLLM_ASCEND_DEBUG_LOOP_TRACE_VERBOSE", "0")))
+_ASYNC_SPEC_SAFE_DRAFT_SCATTER_FALLBACK = bool(
+    int(os.getenv("VLLM_ASCEND_ASYNC_SPEC_DRAFT_SCATTER_SAFE_FALLBACK", "1"))
+)
 
 
 def _dbg_loop_consistency(tag: str, tok: Any) -> None:
@@ -1040,6 +1043,7 @@ class PCPManager:
         spec_flattened_indices: list[int] = []
         prev_common_req_indices: list[int] = []
         prev_draft_token_indices: list[int] = []
+        draft_lens_for_common_reqs: list[int] = []
         total_num_spec_tokens = 0
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
@@ -1050,6 +1054,7 @@ class PCPManager:
                 # last token in each common request.
                 draft_len = len(scheduled_spec_tokens.get(req_id, ()))
                 total_num_spec_tokens += draft_len
+                draft_lens_for_common_reqs.append(draft_len)
                 flattened_index = cu_num_tokens[cur_index].item() - 1
                 # example: cu_num_tokens = [2, 5, 8], draft_tokens = [1, 2, 2]
                 # sample_flattened_indices = [0, 2, 5]
@@ -1094,6 +1099,36 @@ class PCPManager:
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
         draft_token_ids = draft_token_ids.to(dtype=torch.int32)
+
+        # Safety fallback for async + spec(num_spec_tokens>1):
+        # We observed unstable behavior (output loops) on some DCP+async
+        # setups when using flattened draft-token indexing directly.
+        # As a safe workaround, fill spec slots with per-request
+        # prev_sampled_token_ids expansion. This prioritizes correctness /
+        # stability over speculative quality and can be disabled by:
+        # VLLM_ASCEND_ASYNC_SPEC_DRAFT_SCATTER_SAFE_FALLBACK=0
+        if num_spec_tokens > 1 and _ASYNC_SPEC_SAFE_DRAFT_SCATTER_FALLBACK:
+            prev_sampled_ids = input_batch.prev_sampled_token_ids[prev_common_req_indices_tensor, 0].to(torch.int32).cpu()
+            if len(draft_lens_for_common_reqs) != prev_sampled_ids.shape[0]:
+                # Defensive fallback: skip draft scatter if shape bookkeeping
+                # is inconsistent, while keeping sampled-token scatter above.
+                return
+            expanded_prev_sampled = torch.repeat_interleave(
+                prev_sampled_ids,
+                torch.tensor(draft_lens_for_common_reqs, dtype=torch.int64),
+            )
+            if expanded_prev_sampled.numel() != draft_tokens_index_tensor.numel():
+                return
+            _dbg_loop_consistency(
+                "pcp_full.draft_for_scatter_fallback_prev_sampled",
+                expanded_prev_sampled,
+            )
+            self.input_ids_pcp_full.cpu.scatter_(
+                dim=0,
+                index=draft_tokens_index_tensor,
+                src=expanded_prev_sampled,
+            )
+            return
 
         _dbg_loop_consistency(
             "pcp_full.draft_for_scatter",
