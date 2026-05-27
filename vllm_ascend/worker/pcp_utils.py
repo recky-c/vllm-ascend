@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/worker.py
 #
 
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,50 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+
+# Debug helper for triaging the FLASHCOMM1 + DCP>1 + EAGLE3 (num_spec>1) +
+# async-scheduling output-loop issue. Enable by setting
+# VLLM_ASCEND_DEBUG_LOOP_TRACE=1. Prints cross-rank fingerprints (first 8
+# values + a 32-element sum) of token tensors that travel through the
+# async-scheduling / pcp_full path. The intent is to find out whether
+# `prev_sampled_token_ids` (and the draft tokens scattered after it) are
+# consistent across TP ranks before they get scattered into
+# `input_ids_pcp_full.cpu`. Cross-rank divergence here would explain why
+# turning OFF any one of {FLASHCOMM1, DCP, multi-step spec, async-sched}
+# breaks the loop.
+_DEBUG_LOOP_TRACE = bool(int(os.getenv("VLLM_ASCEND_DEBUG_LOOP_TRACE", "0")))
+
+
+def _dbg_loop_consistency(tag: str, tok: Any) -> None:
+    if not _DEBUG_LOOP_TRACE or tok is None:
+        return
+    try:
+        import torch.distributed as dist
+    except Exception:
+        return
+    try:
+        t = tok.detach()
+        if getattr(t, "is_cuda", False) or (hasattr(t, "device") and t.device.type != "cpu"):
+            t = t.cpu()
+    except Exception:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    tp_rank: Any = -1
+    try:
+        from vllm.distributed import get_tp_group
+
+        tp_rank = get_tp_group().rank_in_group
+    except Exception:
+        pass
+    flat = t.flatten()
+    head = flat[:8].tolist() if flat.numel() else []
+    sum32 = int(flat[:32].sum().item()) if flat.numel() else 0
+    print(
+        f"[LOOP-TRACE][{tag}] rank={rank} tp_rank={tp_rank} "
+        f"shape={tuple(t.shape)} dtype={t.dtype} first8={head} sum32={sum32}",
+        flush=True,
+    )
 
 
 class PCPManager:
@@ -978,6 +1023,10 @@ class PCPManager:
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
         sampled_tokens_index_tensor = torch.tensor(sample_flattened_indices, dtype=torch.int64)
         prev_common_req_indices_tensor = torch.tensor(prev_common_req_indices, dtype=torch.int64)
+        _dbg_loop_consistency(
+            "pcp_full.prev_sampled_for_scatter",
+            input_batch.prev_sampled_token_ids[prev_common_req_indices_tensor, 0],
+        )
         self.input_ids_pcp_full.cpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
@@ -996,6 +1045,10 @@ class PCPManager:
         # so convert draft_token_ids to torch.int32 here.
         draft_token_ids = draft_token_ids.to(dtype=torch.int32)
 
+        _dbg_loop_consistency(
+            "pcp_full.draft_for_scatter",
+            draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+        )
         self.input_ids_pcp_full.cpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,

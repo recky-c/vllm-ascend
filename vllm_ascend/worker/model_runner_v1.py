@@ -150,7 +150,7 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
-from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.pcp_utils import PCPManager, _dbg_loop_consistency
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -1373,6 +1373,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
+        _dbg_loop_consistency("set_prev_sampled.main", next_token_ids)
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
@@ -1427,6 +1428,7 @@ class NPUModelRunner(GPUModelRunner):
 
             # only async scheduling, set prev_sampled_token_ids，
             if self.use_async_scheduling:
+                _dbg_loop_consistency("set_prev_sampled.ngram", next_token_ids)
                 self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
             # save num_valid_draft_tokens for scheduler trim
