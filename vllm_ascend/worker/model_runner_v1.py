@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -180,6 +181,13 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+# Debug/triage switch:
+# when set to 1, bypass async spec GPU-side correction of
+# num_computed_tokens and always copy from CPU values.
+_DEBUG_DISABLE_ASYNC_SPEC_NUM_COMPUTED_GPU_CORRECTION = bool(
+    int(os.getenv("VLLM_ASCEND_DEBUG_DISABLE_ASYNC_SPEC_NUM_COMPUTED_GPU_CORRECTION", "0"))
+)
 
 
 @dataclass
@@ -933,8 +941,14 @@ class NPUModelRunner(GPUModelRunner):
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+        if _DEBUG_DISABLE_ASYNC_SPEC_NUM_COMPUTED_GPU_CORRECTION:
+            logger.warning_once(
+                "VLLM_ASCEND_DEBUG_DISABLE_ASYNC_SPEC_NUM_COMPUTED_GPU_CORRECTION=1: "
+                "skip async spec GPU correction and use CPU num_computed_tokens."
+            )
         if (
             self.use_async_spec_decode
+            and not _DEBUG_DISABLE_ASYNC_SPEC_NUM_COMPUTED_GPU_CORRECTION
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         ):
