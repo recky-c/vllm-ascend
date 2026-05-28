@@ -188,6 +188,9 @@ SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 _DEBUG_DISABLE_ASYNC_SPEC_NUM_COMPUTED_GPU_CORRECTION = bool(
     int(os.getenv("VLLM_ASCEND_DEBUG_DISABLE_ASYNC_SPEC_NUM_COMPUTED_GPU_CORRECTION", "0"))
 )
+_DEBUG_FORCE_SYNC_SPEC_DECODE_WITH_ASYNC_SCHED = bool(
+    int(os.getenv("VLLM_ASCEND_DEBUG_FORCE_SYNC_SPEC_DECODE_WITH_ASYNC_SCHED", "0"))
+)
 
 
 @dataclass
@@ -269,6 +272,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+        if _DEBUG_FORCE_SYNC_SPEC_DECODE_WITH_ASYNC_SCHED and self.use_async_spec_decode:
+            logger.warning_once(
+                "VLLM_ASCEND_DEBUG_FORCE_SYNC_SPEC_DECODE_WITH_ASYNC_SCHED=1: "
+                "disable async-spec path while keeping async scheduling on."
+            )
+            self.use_async_spec_decode = False
 
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
