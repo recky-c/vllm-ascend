@@ -750,6 +750,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if self.pcp_size * self.dcp_size > 1:
             if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
+                cp_size = self.pcp_size * self.dcp_size
                 # For pcp/dcp, tokens are split across different cp ranks,
                 # so we can not simply update slot_mapping by += 1.
                 # Instead, we pre-allocate mtp slot_mapping in model_runner
@@ -770,17 +771,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     torch.cat(
                         [
                             torch.tensor([0], dtype=torch.int32, device=self.device),
-                            (torch.cumsum(query_lens_d, dim=0)[:-1] * self.pcp_size).to(self.device),
+                            (torch.cumsum(query_lens_d, dim=0)[:-1] * cp_size).to(self.device),
                         ]
                     )
                     + torch.arange(num_decode_reqs, device=self.device)
                     * (self.num_speculative_tokens - 1)
-                    * self.pcp_size
-                    + (num_accept_tokens - 1) * self.pcp_size
+                    * cp_size
+                    + (num_accept_tokens - 1) * cp_size
                 )
                 slot_indices_list = []
                 for req_id in range(num_decode_reqs):
                     slot_indices_list.append(
+                        # Keep one slot index per PCP lane on the current rank.
+                        # In DCP mode, adjacent speculative steps should jump by
+                        # full cp_size; otherwise indices can land on PADDING_SLOT_ID.
                         torch.arange(slot_idx_base[req_id], slot_idx_base[req_id] + self.pcp_size, device=self.device)
                     )
                 slot_indices = torch.cat(slot_indices_list, dim=0)
@@ -1430,7 +1434,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
             cp_seq_len = num_computed_tokens_of_pcp_dcp[:, self.pcp_rank, self.dcp_rank]
             # update slot_mapping
-            slot_indices += self.pcp_size
+            slot_indices += self.pcp_size * self.dcp_size
+            slot_indices.clamp_(max=mtp_slot_mapping.shape[0] - 1)
             slot_mapping = mtp_slot_mapping[slot_indices]
             self.slot_mapping_group[draft_step][: batch_size * self.pcp_size] = slot_mapping
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
