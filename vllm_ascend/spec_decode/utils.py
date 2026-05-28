@@ -13,18 +13,23 @@ def update_num_computed_tokens_for_batch_change(
 ) -> None:
     """Correct num_computed_tokens for async spec decode drift.
 
-    Requests that had drafts: corrected = prev_gpu + valid_count.
+    CPU values are optimistic (assume all previous draft tokens accepted).
+    For requests that participated in previous draft, convert optimistic CPU
+    value to corrected value using:
+
+        corrected = cpu_optimistic - prev_num_draft_tokens + valid_count
+
+    This avoids accumulating historical GPU drift from previous iterations.
     New requests or non-draft (e.g. prefills): use CPU value directly.
     """
     # Clamp because prev_positions can be -1 for new requests
     gather_indices = prev_positions.clamp(min=0)
 
     valid_counts = valid_sampled_token_count[gather_indices]
-    prev_computed = num_computed_tokens[gather_indices]
     prev_drafts = prev_num_draft_tokens[gather_indices]
 
     participating = (prev_positions >= 0) & (prev_drafts > 0)
-    corrected = prev_computed + valid_counts.int()
+    corrected = cpu_num_computed_tokens - prev_drafts.int() + valid_counts.int()
 
     n = prev_positions.shape[0]
     num_computed_tokens[:n].copy_(torch.where(participating, corrected, cpu_num_computed_tokens))
