@@ -1594,7 +1594,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if getattr(attn_metadata, "decode", None):
                     attn_metadata.decode.cp_seq_len = cp_seq_len
             else:
-                attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
+                if getattr(attn_metadata, "decode_meta", None) is not None:
+                    attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
 
         return common_attn_metadata, attn_metadata
 
