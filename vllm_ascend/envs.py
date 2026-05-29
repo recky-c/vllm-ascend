@@ -114,6 +114,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Log Eagle3 + DCP multi-step draft slot_mapping / cp_seq_len (see eagle_dcp_debug.py).
+    "VLLM_ASCEND_DEBUG_EAGLE_DCP": lambda: bool(int(os.getenv("VLLM_ASCEND_DEBUG_EAGLE_DCP", "0"))),
 }
 
 # end-env-vars-definition

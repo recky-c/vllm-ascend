@@ -48,6 +48,9 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.eagle_dcp_debug import is_enabled as eagle_dcp_debug_enabled
+from vllm_ascend.spec_decode.eagle_dcp_debug import log as eagle_dcp_log
+from vllm_ascend.spec_decode.eagle_dcp_debug import log_cp_topology as eagle_dcp_log_topology
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -785,6 +788,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
                 slot_indices = torch.cat(slot_indices_list, dim=0)
 
+                if eagle_dcp_debug_enabled():
+                    eagle_dcp_log_topology(
+                        self.pcp_size, self.dcp_size, self.pcp_rank, self.dcp_rank
+                    )
+                    eagle_dcp_log(
+                        "cp_multistep_init",
+                        num_decode_reqs=num_decode_reqs,
+                        num_speculative_tokens=self.num_speculative_tokens,
+                        query_lens_d=query_lens_d,
+                        num_reject_tokens=num_reject_tokens,
+                        num_accept_tokens=num_accept_tokens,
+                        slot_idx_base=slot_idx_base,
+                        slot_indices=slot_indices,
+                        mtp_slot_pad_len=(
+                            mtp_slot_mapping.shape[0]
+                            if mtp_slot_mapping is not None
+                            else None
+                        ),
+                        mtp_slot_pad_head=mtp_slot_mapping[:16]
+                        if mtp_slot_mapping is not None
+                        else None,
+                    )
+
                 # fold block_table (restore it to original size before flattened)
                 block_indices = torch.cat(
                     [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d, dim=0)[:-1]]
@@ -907,6 +933,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
+        if eagle_dcp_debug_enabled():
+            eagle_dcp_log(
+                "draft_first_pass",
+                dcp_rank=self.dcp_rank,
+                num_input_tokens=num_input_tokens,
+                input_ids=model_kwargs.get("input_ids"),
+                positions=model_kwargs.get("positions"),
+                has_hidden_states="hidden_states" in model_kwargs,
+            )
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -957,6 +992,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
+        if eagle_dcp_debug_enabled():
+            eagle_dcp_log(
+                "draft_first_pass_logits",
+                dcp_rank=self.dcp_rank,
+                draft_token_ids=draft_token_ids,
+            )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -1061,6 +1102,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
 
+            if eagle_dcp_debug_enabled():
+                eagle_dcp_log(
+                    "draft_step_forward",
+                    dcp_rank=self.dcp_rank,
+                    draft_step=draft_step + 1,
+                    input_batch_size=input_batch_size,
+                    input_ids=model_kwargs.get("input_ids"),
+                    positions=model_kwargs.get("positions"),
+                    has_hidden_states="hidden_states" in model_kwargs,
+                )
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
@@ -1092,6 +1143,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
+            if eagle_dcp_debug_enabled():
+                eagle_dcp_log(
+                    "draft_step_logits",
+                    dcp_rank=self.dcp_rank,
+                    draft_step=draft_step + 1,
+                    draft_token_ids=draft_token_ids,
+                )
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]
@@ -1434,6 +1492,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             slot_mapping = mtp_slot_mapping[slot_indices]
             self.slot_mapping_group[draft_step][: batch_size * self.pcp_size] = slot_mapping
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+            if eagle_dcp_debug_enabled():
+                eagle_dcp_log(
+                    "cp_slot_update",
+                    dcp_rank=self.dcp_rank,
+                    draft_step=draft_step,
+                    batch_size=batch_size,
+                    ori_seq_len=ori_seq_len,
+                    slot_indices=slot_indices,
+                    slot_mapping=slot_mapping,
+                    cp_seq_len=cp_seq_len,
+                )
         else:
             # NOTE: In vllm, `block_size = attn_metadata_builder.kv_cache_spec.block_size`.
             # However, in vllm-ascend, the above value can be multiple of `kernel_block_size`,

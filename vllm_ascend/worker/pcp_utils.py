@@ -26,6 +26,8 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.v1.utils import CpuGpuBuffer
 
+from vllm_ascend.spec_decode.eagle_dcp_debug import is_enabled as eagle_dcp_debug_enabled
+from vllm_ascend.spec_decode.eagle_dcp_debug import log as eagle_dcp_log
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -918,6 +920,19 @@ class PCPManager:
             mtp_slot_pad = torch.full([num_tokens_mtp_pad], -1, dtype=torch.int32)
             mtp_slot_pad[unpad_mask] = mtp_slot_ori
             self.mtp_slot_pad = mtp_slot_pad.to(self.device, non_blocking=True)
+            if eagle_dcp_debug_enabled():
+                eagle_dcp_log(
+                    "mtp_slot_pad_built",
+                    pcp_rank=self.pcp_world_rank,
+                    dcp_rank=self.dcp_world_rank,
+                    decode_threshold=self.decode_threshold,
+                    num_tokens_ori=num_tokens_ori,
+                    num_tokens_mtp=num_tokens_mtp,
+                    num_tokens_mtp_pad=num_tokens_mtp_pad,
+                    positions_mtp_tail=positions_mtp[-min(8, len(positions_mtp)) :].tolist(),
+                    mtp_slot_ori_head=mtp_slot_ori[:16].tolist(),
+                    mtp_slot_pad_head=mtp_slot_pad[:16].tolist(),
+                )
 
     def _update_input_ids_pcp_full_ids(
         self,

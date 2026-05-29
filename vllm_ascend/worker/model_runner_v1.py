@@ -150,6 +150,8 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.spec_decode.eagle_dcp_debug import is_enabled as eagle_dcp_debug_enabled
+from vllm_ascend.spec_decode.eagle_dcp_debug import log as eagle_dcp_log
 from vllm_ascend.worker.pcp_utils import PCPManager
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -1585,6 +1587,19 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
+            if eagle_dcp_debug_enabled():
+                eagle_dcp_log(
+                    "propose_draft_inputs",
+                    dcp_rank=self.dcp_rank,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states_norm=(
+                        target_hidden_states.float().norm(dim=-1)
+                        if target_hidden_states is not None
+                        else None
+                    ),
+                )
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -2474,6 +2489,14 @@ class NPUModelRunner(GPUModelRunner):
             "inputs_embeds": inputs_embeds,
             **model_kwargs,
         }
+        if eagle_dcp_debug_enabled() and positions is not None and positions.numel() > 0:
+            eagle_dcp_log(
+                "target_forward",
+                dcp_rank=self.dcp_rank,
+                num_tokens_padded=num_tokens_padded,
+                input_ids=input_ids,
+                positions=positions,
+            )
         run_model = partial(self.model, **model_inputs)
 
         if self.enable_enpu:
