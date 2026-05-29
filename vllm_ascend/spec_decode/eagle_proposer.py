@@ -1008,6 +1008,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # [batch_size, 1]
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
+        if self.pcp_size == 1 and self.dcp_size > 1 and is_prefill:
+            return [[int(token)] for token in draft_token_ids.detach().cpu().tolist()]
+
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list = []
