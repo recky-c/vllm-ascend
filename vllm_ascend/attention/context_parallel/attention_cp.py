@@ -170,36 +170,37 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
                 actual_seq_lengths_kv = torch.cumsum(local_chunked_kv_lens_rank, dim=0).tolist()
                 local_total_toks = local_chunked_kv_lens_rank.sum()
                 chunked_req_mask = self._get_chunked_req_mask(local_context_lens_allranks)
-                local_chunk_starts = torch.zeros(
-                    (len(local_context_lens_allranks),), dtype=torch.int32, device=self.device
-                )
-                # Note(qcs): we only do restore and recover for pcp, and set these vars to None
-                # when only using dcp.
-                if self.pcp_size > 1:
-                    kv_inverse_idx_for_chunk = torch.argsort(
-                        common_long_seq_metadata.pcp_allgather_restore_idx[self.pcp_size * num_decode_tokens :].to(
-                            torch.float32
-                        )
+                if any(chunked_req_mask):
+                    local_chunk_starts = torch.zeros(
+                        (len(local_context_lens_allranks),), dtype=torch.int32, device=self.device
                     )
-                    cp_kv_recover_idx_for_chunk = torch.argsort(kv_inverse_idx_for_chunk)
-                else:
-                    kv_inverse_idx_for_chunk = None
-                    cp_kv_recover_idx_for_chunk = None
+                    # Note(qcs): we only do restore and recover for pcp, and set these vars to None
+                    # when only using dcp.
+                    if self.pcp_size > 1:
+                        kv_inverse_idx_for_chunk = torch.argsort(
+                            common_long_seq_metadata.pcp_allgather_restore_idx[self.pcp_size * num_decode_tokens :].to(
+                                torch.float32
+                            )
+                        )
+                        cp_kv_recover_idx_for_chunk = torch.argsort(kv_inverse_idx_for_chunk)
+                    else:
+                        kv_inverse_idx_for_chunk = None
+                        cp_kv_recover_idx_for_chunk = None
 
-                chunk_seq_mask_filtered_indices = filter_chunked_req_indices(query_lens, chunked_req_mask).to(
-                    self.device
-                )
-                chunked_context_metadata = AscendMetadataForPrefill.ChunkedContextMetadata(
-                    actual_chunk_seq_lengths=torch.cumsum(query_lens * self.pcp_size, dim=0),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    chunked_req_mask=chunked_req_mask,
-                    starts=local_chunk_starts,
-                    local_context_lens_allranks=local_context_lens_allranks,
-                    cp_kv_recover_idx_for_chunk=cp_kv_recover_idx_for_chunk,
-                    kv_inverse_idx_for_chunk=kv_inverse_idx_for_chunk,
-                    chunk_seq_mask_filtered_indices=chunk_seq_mask_filtered_indices,
-                    local_total_toks=local_total_toks.item(),
-                )
+                    chunk_seq_mask_filtered_indices = filter_chunked_req_indices(query_lens, chunked_req_mask).to(
+                        self.device
+                    )
+                    chunked_context_metadata = AscendMetadataForPrefill.ChunkedContextMetadata(
+                        actual_chunk_seq_lengths=torch.cumsum(query_lens * self.pcp_size, dim=0),
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        chunked_req_mask=chunked_req_mask,
+                        starts=local_chunk_starts,
+                        local_context_lens_allranks=local_context_lens_allranks,
+                        cp_kv_recover_idx_for_chunk=cp_kv_recover_idx_for_chunk,
+                        kv_inverse_idx_for_chunk=kv_inverse_idx_for_chunk,
+                        chunk_seq_mask_filtered_indices=chunk_seq_mask_filtered_indices,
+                        local_total_toks=local_total_toks.item(),
+                    )
             head_attn_nomask_seqlens = common_long_seq_metadata.head_attn_nomask_seqlens
             tail_attn_nomask_seqlens = common_long_seq_metadata.tail_attn_nomask_seqlens
 
