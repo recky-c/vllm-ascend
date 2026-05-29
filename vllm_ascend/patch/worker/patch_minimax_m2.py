@@ -239,12 +239,10 @@ def _patched_minimax_m2_forward(
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
-    aux_hidden_states: list[torch.Tensor] = []
+    aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
     for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-        layer_idx = self.start_layer + idx
-        if layer_idx in aux_layers:
-            aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
         hidden_states, residual = layer(positions, hidden_states, residual)
+        self._maybe_add_hidden_state(aux_hidden_states, self.start_layer + idx + 1, hidden_states, residual)
 
     if not get_pp_group().is_last_rank:
         return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
