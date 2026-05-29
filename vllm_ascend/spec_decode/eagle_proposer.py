@@ -1480,8 +1480,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.positions[:batch_size].copy_(clamped_positions)
 
         if self.pcp_size * self.dcp_size > 1:
+            if self.pcp_size == 1 and self.dcp_size > 1:
+                if self.uses_mrope:
+                    cp_seq_input_lens = clamped_positions[0][:batch_size].detach().cpu().to(torch.int32) + 1
+                else:
+                    cp_seq_input_lens = clamped_positions[:batch_size].detach().cpu().to(torch.int32) + 1
+            else:
+                cp_seq_input_lens = ori_seq_len + draft_step + 1
             num_computed_tokens_of_pcp_dcp = self.runner.pcp_manager._get_cp_local_seq_lens(
-                ori_seq_len + draft_step + 1,
+                cp_seq_input_lens,
                 self.pcp_size,
                 self.dcp_size,
                 self.runner.parallel_config.cp_kv_cache_interleave_size,
@@ -1499,6 +1506,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     draft_step=draft_step,
                     batch_size=batch_size,
                     ori_seq_len=ori_seq_len,
+                    cp_seq_input_lens=cp_seq_input_lens,
                     slot_indices=slot_indices,
                     slot_mapping=slot_mapping,
                     cp_seq_len=cp_seq_len,
