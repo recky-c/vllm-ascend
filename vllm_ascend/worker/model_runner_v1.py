@@ -772,6 +772,13 @@ class NPUModelRunner(GPUModelRunner):
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
+        if self.speculative_config and self.use_cp and self.pcp_size == 1:
+            # DCP-only keeps the original token layout. Reuse the CP helper's
+            # async-spec scatter so target verification sees the same draft
+            # tokens that the drafter just proposed.
+            self.input_ids.cpu[:total_num_scheduled_tokens].copy_(
+                self.pcp_manager.input_ids_pcp_full.cpu[:total_num_scheduled_tokens]
+            )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
