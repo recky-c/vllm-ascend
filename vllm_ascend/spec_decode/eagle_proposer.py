@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
@@ -885,6 +886,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
+        should_log_tp0 = get_tensor_model_parallel_rank() == 0
+
+        if should_log_tp0:
+            logger.info(
+                "[EAGLE_DEBUG] _run_merged_draft enter: num_input_tokens=%s, batch_size=%s, "
+                "num_tokens=%s, is_prefill=%s, token_indices_to_sample(shape=%s, values=%s)",
+                num_input_tokens,
+                batch_size,
+                num_tokens,
+                is_prefill,
+                tuple(token_indices_to_sample.shape),
+                token_indices_to_sample.tolist(),
+            )
+
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
@@ -957,6 +972,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
+        if should_log_tp0:
+            logger.info(
+                "[EAGLE_DEBUG] first draft_token_ids(shape=%s, values=%s)",
+                tuple(draft_token_ids.shape),
+                draft_token_ids.tolist(),
+            )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -968,6 +989,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
+            if should_log_tp0:
+                logger.info(
+                    "[EAGLE_DEBUG] prefill draft_token_ids_list(len=%s, values=%s)",
+                    len(draft_token_ids_list),
+                    [ids.tolist() for ids in draft_token_ids_list],
+                )
             return torch.stack(draft_token_ids_list, dim=1)
 
         # The logits are split and then merged only when lmhead_tp_enable() is enabled.
@@ -1092,10 +1119,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
+            if should_log_tp0:
+                logger.info(
+                    "[EAGLE_DEBUG] draft_step=%s draft_token_ids(shape=%s, values=%s)",
+                    draft_step + 1,
+                    tuple(draft_token_ids.shape),
+                    draft_token_ids.tolist(),
+                )
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
+        if should_log_tp0:
+            logger.info(
+                "[EAGLE_DEBUG] merged draft_token_ids(shape=%s, values=%s)",
+                tuple(draft_token_ids.shape),
+                draft_token_ids.tolist(),
+            )
         return draft_token_ids
 
     def set_inputs_first_pass(

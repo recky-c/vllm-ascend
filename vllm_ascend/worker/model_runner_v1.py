@@ -35,7 +35,11 @@ import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
@@ -1855,6 +1859,12 @@ class NPUModelRunner(GPUModelRunner):
                     self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                if (not use_spec_decode) and get_tensor_model_parallel_rank() == 0:
+                    logger.info(
+                        "[BASE_DECODE_DEBUG] execute_model non-spec logits_indices(shape=%s, values=%s)",
+                        tuple(logits_indices.shape),
+                        logits_indices.tolist(),
+                    )
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
                 if (
@@ -1951,6 +1961,20 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if get_tensor_model_parallel_rank() == 0:
+                num_valid_input_ids = scheduler_output.total_num_scheduled_tokens
+                valid_input_ids = input_ids[:num_valid_input_ids]
+                logger.info(
+                    "[EAGLE_DEBUG] model forward input_ids(valid_shape=%s, num_tokens_padded=%s, values=%s)",
+                    tuple(valid_input_ids.shape),
+                    num_tokens_padded,
+                    valid_input_ids.tolist(),
+                )
+                logger.info(
+                    "[EAGLE_DEBUG] model forward input_ids(full_shape=%s, values=%s)",
+                    tuple(input_ids.shape),
+                    input_ids.tolist(),
+                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -2086,6 +2110,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if spec_decode_metadata is None and get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                "[BASE_DECODE_DEBUG] sample_tokens non-spec sampled_token_ids(shape=%s, values=%s)",
+                tuple(sampler_output.sampled_token_ids.shape),
+                sampler_output.sampled_token_ids.tolist(),
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
