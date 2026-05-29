@@ -752,41 +752,56 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
 
         if self.pcp_size * self.dcp_size > 1:
-            if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
+            dcp_only_prefill_multistep = (
+                self.pcp_size == 1 and self.dcp_size > 1 and attn_metadata_i.num_prefills
+            )
+            if self.num_speculative_tokens > 1 and (
+                not attn_metadata_i.num_prefills or dcp_only_prefill_multistep
+            ):
                 # For pcp/dcp, tokens are split across different cp ranks,
                 # so we can not simply update slot_mapping by += 1.
                 # Instead, we pre-allocate mtp slot_mapping in model_runner
                 # (_generate_pcp_mtp_input), and use updated slot_indices
                 # to get corresponding slot_mapping in each step.
-                num_reject_tokens = (
-                    torch.tensor(self.runner.pcp_manager.cu_num_tokens_pcp_full, dtype=torch.int32).to(self.device)
-                    - ori_token_indices_to_sample
-                    - 1
-                )
-                num_accept_tokens = query_lens_d.to(self.device) - num_reject_tokens
                 ori_seq_len = attn_metadata_i.seq_lens_cpu[:batch_size].clone()
                 mtp_slot_mapping = self.runner.pcp_manager.mtp_slot_pad
 
-                # slot_mapping index base offset:
-                # scheduled tokens + pre-allocated mtp tokens + accepted tokens
-                slot_idx_base = (
-                    torch.cat(
-                        [
-                            torch.tensor([0], dtype=torch.int32, device=self.device),
-                            (torch.cumsum(query_lens_d, dim=0)[:-1] * self.pcp_size).to(self.device),
-                        ]
+                if dcp_only_prefill_multistep:
+                    num_reject_tokens = None
+                    num_accept_tokens = None
+                    slot_idx_base = None
+                    slot_indices = ori_token_indices_to_sample.to(device=self.device, dtype=torch.long)
+                else:
+                    num_reject_tokens = (
+                        torch.tensor(self.runner.pcp_manager.cu_num_tokens_pcp_full, dtype=torch.int32).to(self.device)
+                        - ori_token_indices_to_sample
+                        - 1
                     )
-                    + torch.arange(num_decode_reqs, device=self.device)
-                    * (self.num_speculative_tokens - 1)
-                    * self.pcp_size
-                    + (num_accept_tokens - 1) * self.pcp_size
-                )
-                slot_indices_list = []
-                for req_id in range(num_decode_reqs):
-                    slot_indices_list.append(
-                        torch.arange(slot_idx_base[req_id], slot_idx_base[req_id] + self.pcp_size, device=self.device)
+                    num_accept_tokens = query_lens_d.to(self.device) - num_reject_tokens
+                    # slot_mapping index base offset:
+                    # scheduled tokens + pre-allocated mtp tokens + accepted tokens
+                    slot_idx_base = (
+                        torch.cat(
+                            [
+                                torch.tensor([0], dtype=torch.int32, device=self.device),
+                                (torch.cumsum(query_lens_d, dim=0)[:-1] * self.pcp_size).to(self.device),
+                            ]
+                        )
+                        + torch.arange(num_decode_reqs, device=self.device)
+                        * (self.num_speculative_tokens - 1)
+                        * self.pcp_size
+                        + (num_accept_tokens - 1) * self.pcp_size
                     )
-                slot_indices = torch.cat(slot_indices_list, dim=0)
+                    slot_indices_list = []
+                    for req_id in range(num_decode_reqs):
+                        slot_indices_list.append(
+                            torch.arange(
+                                slot_idx_base[req_id],
+                                slot_idx_base[req_id] + self.pcp_size,
+                                device=self.device,
+                            )
+                        )
+                    slot_indices = torch.cat(slot_indices_list, dim=0)
 
                 if eagle_dcp_debug_enabled():
                     eagle_dcp_log_topology(
@@ -811,14 +826,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         else None,
                     )
 
-                # fold block_table (restore it to original size before flattened)
-                block_indices = torch.cat(
-                    [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d, dim=0)[:-1]]
-                )
-                common_attn_metadata.block_table_tensor[:batch_size] = common_attn_metadata.block_table_tensor[
-                    block_indices
-                ]
-                common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor[:batch_size]
+                if not dcp_only_prefill_multistep:
+                    # fold block_table (restore it to original size before flattened)
+                    block_indices = torch.cat(
+                        [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d, dim=0)[:-1]]
+                    )
+                    common_attn_metadata.block_table_tensor[:batch_size] = common_attn_metadata.block_table_tensor[
+                        block_indices
+                    ]
+                    common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor[:batch_size]
 
                 # Copy the old attn_metadata and update
                 if not self.parallel_drafting:
@@ -1004,7 +1020,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # [batch_size, 1]
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
-        if self.pcp_size * self.dcp_size > 1 and is_prefill:
+        if self.pcp_size > 1 and is_prefill:
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):

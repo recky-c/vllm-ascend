@@ -896,7 +896,10 @@ class PCPManager:
         self.input_ids_pcp_full.copy_to_gpu(total_num_scheduled_tokens_pcp_full)
         self.cu_num_tokens_pcp_full = cu_num_tokens_pcp_full
         # For mtpx, pre-allocate mtp slot_mapping here
-        if self.decode_threshold > 2 and not with_prefill:
+        build_mtp_slots = self.decode_threshold > 2 and (
+            not with_prefill or (self.pcp_world_size == 1 and self.dcp_world_size > 1)
+        )
+        if build_mtp_slots:
             num_tokens_ori = sum(list(num_scheduled_tokens.values()))
             num_tokens_mtp = num_tokens_ori + self.num_reqs * (self.decode_threshold - 2)
             num_tokens_mtp_pad = num_tokens_mtp * self.pcp_world_size
