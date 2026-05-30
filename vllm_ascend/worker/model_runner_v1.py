@@ -1962,8 +1962,9 @@ class NPUModelRunner(GPUModelRunner):
             ) as kv_connector_output,
         ):
             if get_tensor_model_parallel_rank() == 0:
-                num_valid_input_ids = scheduler_output.total_num_scheduled_tokens
-                valid_input_ids = input_ids[:num_valid_input_ids]
+                num_valid_tokens = scheduler_output.total_num_scheduled_tokens
+                valid_input_ids = input_ids[:num_valid_tokens]
+                valid_positions = positions[:num_valid_tokens]
                 logger.info(
                     "[EAGLE_DEBUG] model forward input_ids(valid_shape=%s, num_tokens_padded=%s, values=%s)",
                     tuple(valid_input_ids.shape),
@@ -1971,13 +1972,54 @@ class NPUModelRunner(GPUModelRunner):
                     valid_input_ids.tolist(),
                 )
                 logger.info(
+                    "[EAGLE_DEBUG] model forward positions(valid_shape=%s, values=%s)",
+                    tuple(valid_positions.shape),
+                    valid_positions.tolist(),
+                )
+                logger.info(
                     "[EAGLE_DEBUG] model forward input_ids(full_shape=%s, values=%s)",
                     tuple(input_ids.shape),
                     input_ids.tolist(),
                 )
+                logger.info(
+                    "[EAGLE_DEBUG] model forward logits_indices(shape=%s, values=%s)",
+                    tuple(logits_indices.shape),
+                    logits_indices.tolist(),
+                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if get_tensor_model_parallel_rank() == 0 and isinstance(hidden_states, torch.Tensor):
+                num_valid_tokens = scheduler_output.total_num_scheduled_tokens
+                valid_hidden_states = hidden_states[:num_valid_tokens]
+                sample_hidden_states = hidden_states[logits_indices]
+                logger.info(
+                    "[EAGLE_DEBUG] model forward hidden_states(shape=%s, dtype=%s, "
+                    "num_valid=%s, num_padded=%s)",
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                    num_valid_tokens,
+                    num_tokens_padded,
+                )
+                if valid_hidden_states.numel() > 0:
+                    valid_hs_f = valid_hidden_states.float()
+                    logger.info(
+                        "[EAGLE_DEBUG] valid_hidden_states(global_mean=%.6f, global_std=%.6f, "
+                        "per_token_l2_norm=%s, first_token_head8=%s)",
+                        valid_hs_f.mean().item(),
+                        valid_hs_f.std().item(),
+                        valid_hs_f.norm(dim=-1).tolist(),
+                        valid_hidden_states[0, :8].tolist(),
+                    )
+                if sample_hidden_states.numel() > 0:
+                    sample_hs_f = sample_hidden_states.float()
+                    logger.info(
+                        "[EAGLE_DEBUG] sample_hidden_states(for_logits, shape=%s, "
+                        "per_row_l2_norm=%s, rows_head8=%s)",
+                        tuple(sample_hidden_states.shape),
+                        sample_hs_f.norm(dim=-1).tolist(),
+                        [sample_hidden_states[i, :8].tolist() for i in range(sample_hidden_states.shape[0])],
+                    )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
