@@ -1990,80 +1990,12 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
             if get_tensor_model_parallel_rank() == 0:
-                num_valid_tokens = scheduler_output.total_num_scheduled_tokens
-                if isinstance(hidden_states, tuple) and len(hidden_states) > 0:
-                    main_hs = hidden_states[0]
-                elif isinstance(hidden_states, torch.Tensor):
-                    main_hs = hidden_states
-                else:
-                    main_hs = None
-                if isinstance(main_hs, torch.Tensor) and main_hs.ndim == 2:
-                    valid_main_hs = main_hs[:num_valid_tokens]
-                    hidden_dim = valid_main_hs.shape[1]
-                    num_preview_tokens = min(2, valid_main_hs.shape[0])
-                    num_preview_dims = min(8, hidden_dim)
-                    preview_head = valid_main_hs[:num_preview_tokens, :num_preview_dims]
-                    spec_method = (
-                        self.speculative_config.method
-                        if self.speculative_config is not None
-                        else None
-                    )
-                    logger.info(
-                        "[TARGET_MAIN_HS_DEBUG] eagle3_aux=%s spec_method=%s "
-                        "output_type=%s main_hidden_states("
-                        "valid_shape=%s, padded_shape=%s, valid_sum=%.6f, "
-                        "per_token_sum=%s, preview_head=%s)",
-                        self.use_aux_hidden_state_outputs,
-                        spec_method,
-                        type(hidden_states).__name__,
-                        tuple(valid_main_hs.shape),
-                        tuple(main_hs.shape),
-                        torch.sum(valid_main_hs).item(),
-                        valid_main_hs.sum(dim=-1).tolist(),
-                        preview_head.tolist(),
-                    )
-                    if logits_indices.numel() > 0:
-                        if spec_decode_metadata is not None:
-                            spec_logits_indices = spec_decode_metadata.logits_indices
-                            num_active_logits = (
-                                spec_logits_indices.shape[0]
-                                if isinstance(spec_logits_indices, torch.Tensor)
-                                else len(spec_logits_indices)
-                            )
-                        elif lmhead_tp_enable():
-                            num_active_logits = self.input_batch.num_reqs
-                        else:
-                            num_active_logits = logits_indices.shape[0]
-                        logits_indices_active = logits_indices[:num_active_logits]
-                        max_idx = int(logits_indices_active.max().item())
-                        if max_idx >= main_hs.shape[0]:
-                            logger.warning(
-                                "[TARGET_MAIN_HS_DEBUG] logits_indices out of range: "
-                                "max_idx=%s, main_hs.shape[0]=%s, active_indices=%s",
-                                max_idx,
-                                main_hs.shape[0],
-                                logits_indices_active.tolist(),
-                            )
-                        else:
-                            sample_main_hs = main_hs[logits_indices_active]
-                            logger.info(
-                                "[TARGET_MAIN_HS_DEBUG] main_hidden_states@logits_indices("
-                                "num_active=%s, shape=%s, sum=%.6f, "
-                                "per_row_sum=%s, preview_head=%s)",
-                                num_active_logits,
-                                tuple(sample_main_hs.shape),
-                                torch.sum(sample_main_hs).item(),
-                                sample_main_hs.sum(dim=-1).tolist(),
-                                sample_main_hs[
-                                    : min(2, sample_main_hs.shape[0]), :num_preview_dims
-                                ].tolist(),
-                            )
-                elif main_hs is not None:
-                    logger.info(
-                        "[TARGET_MAIN_HS_DEBUG] skip: unexpected main_hs type=%s shape=%s",
-                        type(main_hs).__name__,
-                        getattr(main_hs, "shape", None),
-                    )
+                self._log_target_main_hidden_states_debug(
+                    hidden_states,
+                    scheduler_output.total_num_scheduled_tokens,
+                    logits_indices,
+                    spec_decode_metadata,
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2544,6 +2476,92 @@ class NPUModelRunner(GPUModelRunner):
                 NPUModelRunner._all_gather_hidden_states_list(hidden_states[1]),
             )
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
+
+    def _log_target_main_hidden_states_debug(
+        self,
+        model_output: torch.Tensor | tuple | IntermediateTensors,
+        num_valid_tokens: int,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        """Debug log for comparing target main hidden states (eagle3 on/off)."""
+        if isinstance(model_output, tuple) and len(model_output) > 0:
+            main_hs = model_output[0]
+        elif isinstance(model_output, torch.Tensor):
+            main_hs = model_output
+        else:
+            main_hs = None
+
+        if not isinstance(main_hs, torch.Tensor) or main_hs.ndim != 2:
+            if main_hs is not None:
+                logger.info(
+                    "[TARGET_MAIN_HS_DEBUG] skip: unexpected main_hs type=%s shape=%s",
+                    type(main_hs).__name__,
+                    getattr(main_hs, "shape", None),
+                )
+            return
+
+        valid_main_hs = main_hs[:num_valid_tokens]
+        hidden_dim = valid_main_hs.shape[1]
+        num_preview_tokens = min(2, valid_main_hs.shape[0])
+        num_preview_dims = min(8, hidden_dim)
+        preview_head = valid_main_hs[:num_preview_tokens, :num_preview_dims]
+        spec_method = (
+            self.speculative_config.method if self.speculative_config is not None else None
+        )
+        logger.info(
+            "[TARGET_MAIN_HS_DEBUG] eagle3_aux=%s spec_method=%s "
+            "output_type=%s main_hidden_states("
+            "valid_shape=%s, padded_shape=%s, valid_sum=%.6f, "
+            "per_token_sum=%s, preview_head=%s)",
+            self.use_aux_hidden_state_outputs,
+            spec_method,
+            type(model_output).__name__,
+            tuple(valid_main_hs.shape),
+            tuple(main_hs.shape),
+            torch.sum(valid_main_hs).item(),
+            valid_main_hs.sum(dim=-1).tolist(),
+            preview_head.tolist(),
+        )
+
+        if logits_indices.numel() == 0:
+            return
+
+        if spec_decode_metadata is not None:
+            spec_logits_indices = spec_decode_metadata.logits_indices
+            num_active_logits = (
+                spec_logits_indices.shape[0]
+                if isinstance(spec_logits_indices, torch.Tensor)
+                else len(spec_logits_indices)
+            )
+        elif lmhead_tp_enable():
+            num_active_logits = self.input_batch.num_reqs
+        else:
+            num_active_logits = logits_indices.shape[0]
+
+        logits_indices_active = logits_indices[:num_active_logits]
+        max_idx = int(logits_indices_active.max().item())
+        if max_idx >= main_hs.shape[0]:
+            logger.warning(
+                "[TARGET_MAIN_HS_DEBUG] logits_indices out of range: "
+                "max_idx=%s, main_hs.shape[0]=%s, active_indices=%s",
+                max_idx,
+                main_hs.shape[0],
+                logits_indices_active.tolist(),
+            )
+            return
+
+        sample_main_hs = main_hs[logits_indices_active]
+        logger.info(
+            "[TARGET_MAIN_HS_DEBUG] main_hidden_states@logits_indices("
+            "num_active=%s, shape=%s, sum=%.6f, "
+            "per_row_sum=%s, preview_head=%s)",
+            num_active_logits,
+            tuple(sample_main_hs.shape),
+            torch.sum(sample_main_hs).item(),
+            sample_main_hs.sum(dim=-1).tolist(),
+            sample_main_hs[: min(2, sample_main_hs.shape[0]), :num_preview_dims].tolist(),
+        )
 
     def _update_full_graph_params_if_needed(
         self,
