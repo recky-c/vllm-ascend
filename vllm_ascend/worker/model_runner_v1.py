@@ -1990,59 +1990,79 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
             if get_tensor_model_parallel_rank() == 0:
-                hs_for_debug, hs_source = self._extract_main_hidden_states_tensor(hidden_states)
-                logger.info(
-                    "[EAGLE_DEBUG] model forward output_type=%s, hs_source=%s",
-                    type(hidden_states).__name__,
-                    hs_source,
-                )
-                if isinstance(hidden_states, tuple) and len(hidden_states) > 1:
-                    aux_list = hidden_states[1]
-                    if isinstance(aux_list, list) and aux_list:
-                        logger.info(
-                            "[EAGLE_DEBUG] aux_hidden_states(num_layers=%s, shapes=%s)",
-                            len(aux_list),
-                            [tuple(t.shape) for t in aux_list if isinstance(t, torch.Tensor)],
-                        )
-                if hs_for_debug is not None:
-                    num_valid_tokens = scheduler_output.total_num_scheduled_tokens
-                    valid_hidden_states = hs_for_debug[:num_valid_tokens]
-                    sample_hidden_states = hs_for_debug[logits_indices]
-                    logger.info(
-                        "[EAGLE_DEBUG] model forward hidden_states(shape=%s, dtype=%s, "
-                        "num_valid=%s, num_padded=%s)",
-                        tuple(hs_for_debug.shape),
-                        hs_for_debug.dtype,
-                        num_valid_tokens,
-                        num_tokens_padded,
-                    )
-                    if valid_hidden_states.numel() > 0:
-                        valid_hs_f = valid_hidden_states.float()
-                        logger.info(
-                            "[EAGLE_DEBUG] valid_hidden_states(global_mean=%.6f, global_std=%.6f, "
-                            "per_token_l2_norm=%s, first_token_head8=%s)",
-                            valid_hs_f.mean().item(),
-                            valid_hs_f.std().item(),
-                            valid_hs_f.norm(dim=-1).tolist(),
-                            valid_hidden_states[0, :8].tolist(),
-                        )
-                    if sample_hidden_states.numel() > 0:
-                        sample_hs_f = sample_hidden_states.float()
-                        logger.info(
-                            "[EAGLE_DEBUG] sample_hidden_states(for_logits, shape=%s, "
-                            "per_row_l2_norm=%s, rows_head8=%s)",
-                            tuple(sample_hidden_states.shape),
-                            sample_hs_f.norm(dim=-1).tolist(),
-                            [
-                                sample_hidden_states[i, :8].tolist()
-                                for i in range(sample_hidden_states.shape[0])
-                            ],
-                        )
+                num_valid_tokens = scheduler_output.total_num_scheduled_tokens
+                if isinstance(hidden_states, tuple) and len(hidden_states) > 0:
+                    main_hs = hidden_states[0]
+                elif isinstance(hidden_states, torch.Tensor):
+                    main_hs = hidden_states
                 else:
+                    main_hs = None
+                if isinstance(main_hs, torch.Tensor) and main_hs.ndim == 2:
+                    valid_main_hs = main_hs[:num_valid_tokens]
+                    hidden_dim = valid_main_hs.shape[1]
+                    num_preview_tokens = min(2, valid_main_hs.shape[0])
+                    num_preview_dims = min(8, hidden_dim)
+                    preview_head = valid_main_hs[:num_preview_tokens, :num_preview_dims]
+                    spec_method = (
+                        self.speculative_config.method
+                        if self.speculative_config is not None
+                        else None
+                    )
                     logger.info(
-                        "[EAGLE_DEBUG] model forward hidden_states debug skipped: "
-                        "could not extract tensor from output_type=%s",
+                        "[TARGET_MAIN_HS_DEBUG] eagle3_aux=%s spec_method=%s "
+                        "output_type=%s main_hidden_states("
+                        "valid_shape=%s, padded_shape=%s, valid_sum=%.6f, "
+                        "per_token_sum=%s, preview_head=%s)",
+                        self.use_aux_hidden_state_outputs,
+                        spec_method,
                         type(hidden_states).__name__,
+                        tuple(valid_main_hs.shape),
+                        tuple(main_hs.shape),
+                        torch.sum(valid_main_hs).item(),
+                        valid_main_hs.sum(dim=-1).tolist(),
+                        preview_head.tolist(),
+                    )
+                    if logits_indices.numel() > 0:
+                        if spec_decode_metadata is not None:
+                            spec_logits_indices = spec_decode_metadata.logits_indices
+                            num_active_logits = (
+                                spec_logits_indices.shape[0]
+                                if isinstance(spec_logits_indices, torch.Tensor)
+                                else len(spec_logits_indices)
+                            )
+                        elif lmhead_tp_enable():
+                            num_active_logits = self.input_batch.num_reqs
+                        else:
+                            num_active_logits = logits_indices.shape[0]
+                        logits_indices_active = logits_indices[:num_active_logits]
+                        max_idx = int(logits_indices_active.max().item())
+                        if max_idx >= main_hs.shape[0]:
+                            logger.warning(
+                                "[TARGET_MAIN_HS_DEBUG] logits_indices out of range: "
+                                "max_idx=%s, main_hs.shape[0]=%s, active_indices=%s",
+                                max_idx,
+                                main_hs.shape[0],
+                                logits_indices_active.tolist(),
+                            )
+                        else:
+                            sample_main_hs = main_hs[logits_indices_active]
+                            logger.info(
+                                "[TARGET_MAIN_HS_DEBUG] main_hidden_states@logits_indices("
+                                "num_active=%s, shape=%s, sum=%.6f, "
+                                "per_row_sum=%s, preview_head=%s)",
+                                num_active_logits,
+                                tuple(sample_main_hs.shape),
+                                torch.sum(sample_main_hs).item(),
+                                sample_main_hs.sum(dim=-1).tolist(),
+                                sample_main_hs[
+                                    : min(2, sample_main_hs.shape[0]), :num_preview_dims
+                                ].tolist(),
+                            )
+                elif main_hs is not None:
+                    logger.info(
+                        "[TARGET_MAIN_HS_DEBUG] skip: unexpected main_hs type=%s shape=%s",
+                        type(main_hs).__name__,
+                        getattr(main_hs, "shape", None),
                     )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2524,27 +2544,6 @@ class NPUModelRunner(GPUModelRunner):
                 NPUModelRunner._all_gather_hidden_states_list(hidden_states[1]),
             )
         return NPUModelRunner._all_gather_hidden_states(hidden_states)
-
-    @staticmethod
-    def _extract_main_hidden_states_tensor(
-        model_output: torch.Tensor | tuple | IntermediateTensors,
-    ) -> tuple[torch.Tensor | None, str]:
-        """Normalize _model_forward return value for debug logging."""
-        if isinstance(model_output, torch.Tensor):
-            return model_output, "tensor"
-        if isinstance(model_output, tuple):
-            if len(model_output) > 0 and isinstance(model_output[0], torch.Tensor):
-                return model_output[0], f"tuple_main(len={len(model_output)})"
-            return None, f"tuple_non_tensor(len={len(model_output)})"
-        if isinstance(model_output, IntermediateTensors):
-            tensors = model_output.tensors
-            if "hidden_states" in tensors:
-                return tensors["hidden_states"], "IntermediateTensors.hidden_states"
-            if tensors:
-                key = next(iter(tensors))
-                return tensors[key], f"IntermediateTensors.{key}"
-            return None, "IntermediateTensors(empty)"
-        return None, type(model_output).__name__
 
     def _update_full_graph_params_if_needed(
         self,
