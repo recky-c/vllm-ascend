@@ -1008,6 +1008,23 @@ class NPUModelRunner(GPUModelRunner):
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+        if self.use_cp and self.pcp_size == 1 and self.use_async_spec_decode and self.decode_threshold > 2 and with_prefill:
+            base = self.num_computed_tokens[:num_reqs].cpu().numpy()
+            pos = np.empty_like(positions_np[:total_num_scheduled_tokens])
+            np.add(base[req_indices], self.query_pos.np[:total_num_scheduled_tokens], out=pos)
+            self.pcp_manager.generate_pcp_mtp_input(
+                total_num_scheduled_tokens,
+                scheduler_output.num_scheduled_tokens,
+                with_prefill,
+                self.input_batch,
+                self.arange_np,
+                req_indices,
+                pos,
+                cu_num_tokens,
+                self._draft_token_ids,
+                scheduler_output,
+                self.num_spec_tokens,
+            )        
 
         # In async spec decode mode, num_computed_tokens was corrected on GPU
         # by update_num_computed_tokens_for_batch_change, so seq_lens (GPU) is
@@ -2747,6 +2764,10 @@ class NPUModelRunner(GPUModelRunner):
         def _get_pcp_metadata(block_table_tensor):
             if not self.use_cp:
                 return None, block_table_tensor
+            if self.use_async_spec_decode:
+                fixed_decode_seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs].numpy()
+            else:
+                fixed_decode_seq_lens_cpu = None
             return self.pcp_manager.generate_pcp_metadata(
                 num_tokens,
                 self.query_lens,
@@ -2755,6 +2776,7 @@ class NPUModelRunner(GPUModelRunner):
                 block_table_tensor,
                 num_reqs_padded,
                 num_reqs,
+                fixed_decode_seq_lens_cpu,
             )
 
         def _get_block_table_and_slot_mapping(kv_cache_gid: int, total_num_scheduled_tokens_compressed_list: list[int]):
