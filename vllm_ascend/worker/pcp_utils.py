@@ -1040,6 +1040,7 @@ class PCPManager:
         block_table_tensor: torch.Tensor,
         num_reqs_padded: int,
         num_reqs: int,
+        fixed_decode_seq_lens_cpu: np.ndarray | None = None,
     ):
         from vllm_ascend.attention.utils import AscendPrefillContextParallelMetadata
 
@@ -1052,10 +1053,13 @@ class PCPManager:
         ori_query_lens_cpu = self.query_lens_pcp_full.cpu[:num_reqs_padded]
         if self.pcp_world_size * self.dcp_world_size > 1:
             assert num_scheduled_tokens is not None
-            decode_context_lens = (
-                input_batch.num_computed_tokens_cpu[: self.num_decode_reqs]
-                + num_scheduled_tokens[: self.num_decode_reqs]
-            )
+            if fixed_decode_seq_lens_cpu is not None:
+                decode_context_lens = fixed_decode_seq_lens_cpu[: self.num_decode_reqs]
+            else:
+                decode_context_lens = (
+                    input_batch.num_computed_tokens_cpu[: self.num_decode_reqs]
+                    + num_scheduled_tokens[: self.num_decode_reqs]
+                )
             prefill_context_lens = input_batch.num_computed_tokens_cpu[self.num_decode_reqs : self.num_reqs]
             context_lens = np.concatenate([decode_context_lens, prefill_context_lens])
             num_computed_tokens_of_pcp_dcp = torch.zeros(
