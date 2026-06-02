@@ -101,6 +101,22 @@ def _patch_forward(
 ) -> torch.Tensor:
     qkv, _ = self.qkv_proj(hidden_states)
     cos, sin = get_cos_and_sin_slice()
+    if cos is None or sin is None:
+        raise RuntimeError(
+            "MiniMaxM2Attention.forward requires precomputed RoPE cos/sin slices, "
+            "but got None. Ensure update_cos_sin(positions) is called before model forward."
+        )
+    if cos.shape != sin.shape:
+        raise RuntimeError(
+            "MiniMaxM2Attention.forward got mismatched RoPE slices: "
+            f"cos.shape={tuple(cos.shape)}, sin.shape={tuple(sin.shape)}"
+        )
+    num_tokens = hidden_states.shape[0]
+    if cos.shape[1] < num_tokens:
+        raise RuntimeError(
+            "MiniMaxM2Attention.forward got insufficient RoPE slice length: "
+            f"cos_tokens={cos.shape[1]}, required_tokens={num_tokens}"
+        )
     q, k, v = torch.ops.vllm.split_qkv_tp_rmsnorm_rope(
         input=qkv,
         q_weight=self.q_norm.weight,
@@ -240,11 +256,13 @@ def _patched_minimax_m2_forward(
         residual = intermediate_tensors["residual"]
 
     aux_hidden_states: list[torch.Tensor] = []
+    if 0 in aux_layers:
+        aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
+
     for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-        layer_idx = self.start_layer + idx
-        if layer_idx in aux_layers:
-            aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
         hidden_states, residual = layer(positions, hidden_states, residual)
+        if idx + 1 in aux_layers:
+            aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
 
     if not get_pp_group().is_last_rank:
         return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
