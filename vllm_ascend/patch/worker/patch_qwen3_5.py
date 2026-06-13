@@ -24,6 +24,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.pcp_fc1_debug import log_pcp_fc1
 from vllm_ascend.utils import is_310p, vllm_version_is
 
 if vllm_version_is("0.21.0"):
@@ -99,6 +100,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        _EXTRA_CTX.layer_idx = self.layer_idx
         if self.layer_idx == 0 and _EXTRA_CTX.flash_comm_v1_enabled:
             tp_size = get_tensor_model_parallel_world_size()
             n_out = (hidden_states.shape[0] + tp_size - 1) // tp_size
@@ -109,6 +111,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         else:
             self_attention_output = torch.empty_like(hidden_states)
 
+        hidden_in_rows = hidden_states.shape[0]
         if self.layer_type == "linear_attention":
             self.linear_attn(
                 hidden_states=hidden_states,
@@ -122,6 +125,15 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
             )
         else:
             raise ValueError("Invalid layer_type")
+        log_pcp_fc1(
+            "decoder_layer.after_attn",
+            _EXTRA_CTX,
+            layer_idx=self.layer_idx,
+            layer_type=self.layer_type,
+            hidden_in_rows=hidden_in_rows,
+            attn_out_rows=self_attention_output.shape[0],
+            flash_comm_v1=_EXTRA_CTX.flash_comm_v1_enabled,
+        )
         hidden_states = self_attention_output
 
         if self.layer_scale:
@@ -132,6 +144,13 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        log_pcp_fc1(
+            "decoder_layer.before_mlp",
+            _EXTRA_CTX,
+            layer_idx=self.layer_idx,
+            hidden_rows=hidden_states.shape[0],
+            residual_rows=residual.shape[0],
+        )
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:

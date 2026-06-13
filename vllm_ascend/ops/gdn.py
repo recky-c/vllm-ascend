@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.pcp_fc1_debug import log_pcp_fc1
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
@@ -328,6 +329,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.head_v_dim,
                 )
 
+        log_pcp_fc1(
+            "GDN.after_in_proj",
+            _EXTRA_CTX,
+            hidden_rows=num_tokens,
+            mixed_qkv_rows=mixed_qkv.shape[0],
+            prefix=self.prefix,
+        )
+
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
@@ -369,7 +378,22 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        log_pcp_fc1(
+            "GDN.out_proj_before",
+            _EXTRA_CTX,
+            core_attn_rows=core_attn_out.shape[0],
+            num_tokens=num_tokens,
+            output_buf_rows=output.shape[0],
+            prefix=self.prefix,
+        )
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+        log_pcp_fc1(
+            "GDN.out_proj_after",
+            _EXTRA_CTX,
+            out_proj_rows=output[:num_tokens].shape[0],
+            num_tokens=num_tokens,
+            prefix=self.prefix,
+        )
 
     def _forward_core(
         self,

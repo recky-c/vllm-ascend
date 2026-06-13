@@ -2228,20 +2228,6 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        # TODO: remove after PCP+FlashComm1+MC2 debug
-        if self.pcp_size > 1 or enable_sp(self.vllm_config):
-            print(
-                "[PCP-MC2-DEBUG][model_runner.execute_model] "
-                f"pcp_size={self.pcp_size}, pcp_rank={self.pcp_rank}, "
-                f"num_tokens_padded(local)={num_tokens_padded}, "
-                f"total_num_scheduled_tokens(global)="
-                f"{scheduler_output.total_num_scheduled_tokens}, "
-                f"max_num_tokens_across_pcp="
-                f"{0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp}, "
-                f"tp_size={self.vllm_config.parallel_config.tensor_parallel_size}, "
-                f"flash_comm_v1={enable_sp(self.vllm_config)}",
-                flush=True,
-            )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2253,6 +2239,7 @@ class NPUModelRunner(GPUModelRunner):
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 num_actual_tokens_pcp=num_tokens_unpadded if self.pcp_size > 1 else None,
+                pcp_activation_rows=total_num_scheduled_tokens if self.pcp_size > 1 else None,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
@@ -2721,10 +2708,21 @@ class NPUModelRunner(GPUModelRunner):
     # all-gather one hidden-states in sp scene
     @staticmethod
     def _all_gather_hidden_states(hidden_states):
+        from vllm_ascend.pcp_fc1_debug import log_pcp_fc1
+
+        in_rows = hidden_states.shape[0]
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
         pad_size = get_forward_context().pad_size
         if pad_size > 0:
             hidden_states = hidden_states[:-pad_size, :]
+        log_pcp_fc1(
+            "model_runner.all_gather_hidden_states",
+            get_forward_context(),
+            always=True,
+            in_rows=in_rows,
+            out_rows=hidden_states.shape[0],
+            removed_pad=pad_size,
+        )
 
         return hidden_states
 

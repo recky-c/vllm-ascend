@@ -61,6 +61,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.pcp_fc1_debug import log_pcp_fc1, sp_pad_size_for_tp
 from vllm_ascend.distributed.parallel_state import (
     get_flashcomm2_odp_group,
     get_flashcomm2_otp_group,
@@ -514,10 +515,25 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         pad_size = _EXTRA_CTX.pad_size
         dsa_cp_attn_out = enable_dsa_cp() and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)
+        world_size = self.layer.tp_size
+        in_rows = x.size(0)
+        computed_rs_pad = sp_pad_size_for_tp(in_rows, world_size)
         if pad_size > 0 and not dsa_cp_attn_out:
             x = F.pad(x, (0, 0, 0, pad_size))
+        in_rows_after_pad = x.size(0)
+        rs_unready = in_rows_after_pad % world_size
+        log_pcp_fc1(
+            "matmul_and_reduce.RS_BEFORE",
+            _EXTRA_CTX,
+            prefix=self.layer.prefix,
+            in_rows=in_rows,
+            context_pad_size=pad_size,
+            computed_rs_pad=computed_rs_pad,
+            in_rows_after_pad=in_rows_after_pad,
+            tp_size=world_size,
+            rs_unready=rs_unready,
+        )
 
-        world_size = self.layer.tp_size
         comm_mode = "aiv"
         hcom_name = get_tp_group().device_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.layer.tp_rank)
 
@@ -574,6 +590,12 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
 
+        log_pcp_fc1(
+            "matmul_and_reduce.RS_AFTER",
+            _EXTRA_CTX,
+            prefix=self.layer.prefix,
+            out_rows=output.size(0),
+        )
         return output
 
     def update_attrs(self):

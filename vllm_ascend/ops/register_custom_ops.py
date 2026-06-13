@@ -14,6 +14,7 @@ from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.pcp_fc1_debug import log_pcp_fc1, sp_pad_size_for_tp
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
@@ -27,10 +28,23 @@ def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch
         return residual
 
     if x.size(0) != residual.size(0):
-        pad_size = _EXTRA_CTX.pad_size
+        tp_size = get_tensor_model_parallel_world_size()
+        target_rows = x.size(0) * tp_size
+        dynamic_pad = target_rows - residual.size(0)
+        context_pad = _EXTRA_CTX.pad_size
+        log_pcp_fc1(
+            "maybe_chunk_residual",
+            _EXTRA_CTX,
+            x_rows=x.size(0),
+            residual_rows=residual.size(0),
+            tp_size=tp_size,
+            target_rows=target_rows,
+            dynamic_pad=dynamic_pad,
+            context_pad_size=context_pad,
+        )
+        pad_size = context_pad
         if pad_size > 0:
             residual = F.pad(residual, (0, 0, 0, pad_size))
-        tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         residual = torch.chunk(residual, tp_size, dim=0)[tp_rank]
 
@@ -47,10 +61,20 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
     if flash_comm_v1_enabled and label:
         dp_metadata = forward_context.dp_metadata
         if dp_metadata is None or not is_ep_comm:
+            in_rows = x.size(0)
             x = tensor_model_parallel_all_gather(x, 0)
             pad_size = _EXTRA_CTX.pad_size
             if pad_size > 0:
                 x = x[:-pad_size]
+            if in_rows != x.size(0) or pad_size > 0:
+                log_pcp_fc1(
+                    "maybe_all_gather_and_maybe_unpad",
+                    _EXTRA_CTX,
+                    label=label,
+                    in_rows=in_rows,
+                    out_rows=x.size(0),
+                    removed_pad=pad_size,
+                )
         else:
             x = get_ep_group().all_gather(x, 0)
             if enable_sp_by_pass():  # TODO: do unpad
@@ -85,10 +109,33 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
 
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None or not is_ep_comm:
-        pad_size = _EXTRA_CTX.pad_size
+        tp_size = get_tensor_model_parallel_world_size()
+        in_rows = x.size(0)
+        context_pad = _EXTRA_CTX.pad_size
+        computed_rs_pad = sp_pad_size_for_tp(in_rows, tp_size)
+        pad_size = context_pad
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))
-        return tensor_model_parallel_reduce_scatter(x, 0)
+        in_rows_after_pad = x.size(0)
+        rs_unready = in_rows_after_pad % tp_size
+        log_pcp_fc1(
+            "maybe_pad_and_reduce.RS_BEFORE",
+            _EXTRA_CTX,
+            in_rows=in_rows,
+            context_pad_size=context_pad,
+            computed_rs_pad=computed_rs_pad,
+            in_rows_after_pad=in_rows_after_pad,
+            tp_size=tp_size,
+            rs_unready=rs_unready,
+            is_ep_comm=is_ep_comm,
+        )
+        output = tensor_model_parallel_reduce_scatter(x, 0)
+        log_pcp_fc1(
+            "maybe_pad_and_reduce.RS_AFTER",
+            _EXTRA_CTX,
+            out_rows=output.size(0),
+        )
+        return output
     else:
         if enable_sp_by_pass():
             return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
