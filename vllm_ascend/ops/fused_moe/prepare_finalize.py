@@ -246,6 +246,15 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
+    def _should_pad_and_split_for_mc2(self, replace_allreduce: bool) -> bool:
+        if self.enable_shared_expert_dp:
+            return False
+        if not replace_allreduce:
+            return True
+        # FlashComm1 skips pad/split assuming hidden_states already match mc2_mask
+        # after TP reduce-scatter. PCP keeps MoE inputs PCP-local, so re-align here.
+        return _EXTRA_CTX.max_tokens_across_pcp > 0
+
     def prepare(
         self,
         hidden_states: torch.Tensor,
@@ -261,7 +270,8 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
           3. If TP > 1, split tensors along token dimension and select current TP rank's slice.
           4. Split and return corresponding `mc2_mask`.
 
-        Skips padding/slicing if `enable_shared_expert_dp` or `replace_allreduce` is True.
+        Skips padding/slicing if `enable_shared_expert_dp` is True, or if
+        `replace_allreduce` is True without PCP.
 
         Returns:
             MoEPrepareOutput, possibly sliced/padded.
@@ -275,19 +285,17 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             mc2_mask = split_mc2_mask[self.tp_rank]
 
         padded_hidden_states_shape = hidden_states.shape
-        if not self.replace_allreduce:
+        if self._should_pad_and_split_for_mc2(replace_allreduce):
             self.num_tokens, _ = hidden_states.shape
             target_pad_length = _EXTRA_CTX.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
 
-            # Pad if necessary (unless shared expert DP is enabled)
-            if pad_size > 0 and not self.enable_shared_expert_dp:
+            if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
                 padded_hidden_states_shape = hidden_states.shape
 
-            # Slice across TP ranks
-            if self.tp_size > 1 and not self.enable_shared_expert_dp:
+            if self.tp_size > 1:
                 split_hidden_states = torch.tensor_split(hidden_states, self.tp_size, dim=0)
                 split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
                 hidden_states = split_hidden_states[self.tp_rank]
@@ -326,14 +334,14 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self,
         input_ids,
     ):
-        if not self.replace_allreduce:
+        if self._should_pad_and_split_for_mc2(self.replace_allreduce):
             forward_context = get_forward_context()
             target_pad_length = forward_context.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
-            if pad_size > 0 and not self.enable_shared_expert_dp:
+            if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
 
-            if self.tp_size > 1 and not self.enable_shared_expert_dp:
+            if self.tp_size > 1:
                 input_ids = torch.tensor_split(input_ids, self.tp_size, dim=0)
                 input_ids = input_ids[self.tp_rank]
         return input_ids
