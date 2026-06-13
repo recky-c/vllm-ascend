@@ -53,6 +53,11 @@ def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
 
 
+def _mc2_tokens_per_tp_rank_after_sp(local_pcp_tokens: int, tp_world_size: int) -> int:
+    """MoE token rows per TP rank after FlashComm1 reduce-scatter on PCP-local activations."""
+    return (local_pcp_tokens + tp_world_size - 1) // tp_world_size
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -67,6 +72,7 @@ def set_ascend_forward_context(
     is_draft_model=False,
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
+    num_actual_tokens_pcp: int | None = None,
     draft_attn_metadatas=None,
     has_sinks=False,
     input_ids=None,
@@ -173,27 +179,50 @@ def set_ascend_forward_context(
 
         forward_context.max_tokens_across_dp = max_tokens_across_dp
         forward_context.max_tokens_across_pcp = max_tokens_across_pcp
+        forward_context.mc2_mask_tp_local = False
 
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
-            # NOTE: token num which need to pad to when mc2
-            forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()
+            use_pcp_local_mc2_mask = (
+                flash_comm_v1_enabled
+                and max_tokens_across_pcp > 0
+                and num_actual_tokens_pcp is not None
+            )
+            if use_pcp_local_mc2_mask:
+                # PCP + FlashComm1: MC2 mask follows PCP-local MoE rows after TP RS.
+                local_pcp_tokens = num_actual_tokens_pcp
+                mc2_tokens_per_tp_rank = _mc2_tokens_per_tp_rank_after_sp(
+                    local_pcp_tokens, tp_world_size
+                )
+                forward_context.padded_num_tokens = mc2_tokens_per_tp_rank
+                forward_context.mc2_mask_tp_local = True
+                if reserved_mc2_mask is not None:
+                    mc2_mask = reserved_mc2_mask[:mc2_tokens_per_tp_rank]
+                    mc2_mask.fill_(True)
+                    forward_context.mc2_mask = mc2_mask
+            else:
+                # NOTE: token num which need to pad to when mc2
+                forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+                if reserved_mc2_mask is not None:
+                    mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
+                    mc2_mask[:num_actual_tokens] = True
+                    mc2_mask[num_actual_tokens:] = False
+                    forward_context.mc2_mask = mc2_mask
             if reserved_mc2_mask is not None:
-                mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
-                mc2_mask[:num_actual_tokens] = True
-                mc2_mask[num_actual_tokens:] = False
-                forward_context.mc2_mask = mc2_mask
+                mc2_mask = forward_context.mc2_mask
                 # TODO: remove after PCP+FlashComm1+MC2 debug
                 print(
                     "[PCP-MC2-DEBUG][set_ascend_forward_context] "
                     f"num_tokens(local)={num_tokens}, "
                     f"num_actual_tokens(global)={num_actual_tokens}, "
+                    f"num_actual_tokens_pcp={num_actual_tokens_pcp}, "
                     f"max_tokens_across_dp={max_tokens_across_dp}, "
                     f"max_tokens_across_pcp={max_tokens_across_pcp}, "
                     f"tp_world_size={tp_world_size}, "
                     f"padded_num_tokens={forward_context.padded_num_tokens}, "
+                    f"mc2_mask_tp_local={forward_context.mc2_mask_tp_local}, "
                     f"mc2_mask.shape={tuple(mc2_mask.shape)}, "
                     f"mc2_mask.sum()={mc2_mask.sum().item()}, "
                     f"moe_comm_type={moe_comm_type}, "
@@ -357,6 +386,7 @@ class _ExtraForwardContextProxy:
         "layer_idx",
         "max_tokens_across_dp",
         "max_tokens_across_pcp",
+        "mc2_mask_tp_local",
         "num_accept_tokens",
         "in_profile_run",
         "padded_num_tokens",

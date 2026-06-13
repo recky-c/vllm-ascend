@@ -269,7 +269,8 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
-        if self.tp_size > 1:
+        mc2_mask_tp_local = getattr(_EXTRA_CTX, "mc2_mask_tp_local", False)
+        if mc2_mask is not None and self.tp_size > 1 and not mc2_mask_tp_local:
             # Also slice mc2_mask
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
             mc2_mask = split_mc2_mask[self.tp_rank]
@@ -293,6 +294,17 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
 
+        if (
+            mc2_mask is not None
+            and mc2_mask_tp_local
+            and hidden_states.shape[0] != mc2_mask.shape[0]
+        ):
+            mc2_mask = torch.ones(
+                hidden_states.shape[0],
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+
         # TODO: remove after PCP+FlashComm1+MC2 debug
         if mc2_mask is not None:
             hs_tokens = hidden_states.shape[0]
@@ -309,6 +321,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                     f"tp_size={self.tp_size}, tp_rank={self.tp_rank}, "
                     f"padded_num_tokens={_EXTRA_CTX.padded_num_tokens}, "
                     f"max_tokens_across_pcp={_EXTRA_CTX.max_tokens_across_pcp}, "
+                    f"mc2_mask_tp_local={mc2_mask_tp_local}, "
                     f"flash_comm_v1={_EXTRA_CTX.flash_comm_v1_enabled}, "
                     f"moe_comm_type={_EXTRA_CTX.moe_comm_type}",
                     flush=True,
