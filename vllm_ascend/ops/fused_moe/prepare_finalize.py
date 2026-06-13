@@ -293,6 +293,27 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
 
+        # TODO: remove after PCP+FlashComm1+MC2 debug
+        if mc2_mask is not None:
+            hs_tokens = hidden_states.shape[0]
+            mask_tokens = mc2_mask.shape[0]
+            if hs_tokens != mask_tokens:
+                mc2_mask_before_tp = _EXTRA_CTX.mc2_mask
+                print(
+                    "[PCP-MC2-DEBUG][PrepareAndFinalizeWithMC2.prepare] SHAPE MISMATCH: "
+                    f"hidden_states.shape[0]={hs_tokens} != mc2_mask.shape[0]={mask_tokens}, "
+                    f"mc2_mask_before_tp.shape="
+                    f"{None if mc2_mask_before_tp is None else tuple(mc2_mask_before_tp.shape)}, "
+                    f"replace_allreduce={replace_allreduce}, "
+                    f"enable_shared_expert_dp={enable_shared_expert_dp}, "
+                    f"tp_size={self.tp_size}, tp_rank={self.tp_rank}, "
+                    f"padded_num_tokens={_EXTRA_CTX.padded_num_tokens}, "
+                    f"max_tokens_across_pcp={_EXTRA_CTX.max_tokens_across_pcp}, "
+                    f"flash_comm_v1={_EXTRA_CTX.flash_comm_v1_enabled}, "
+                    f"moe_comm_type={_EXTRA_CTX.moe_comm_type}",
+                    flush=True,
+                )
+
         return MoEPrepareOutput(
             hidden_states=hidden_states,
             router_logits=router_logits,

@@ -2228,6 +2228,20 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        # TODO: remove after PCP+FlashComm1+MC2 debug
+        if self.pcp_size > 1 or enable_sp(self.vllm_config):
+            print(
+                "[PCP-MC2-DEBUG][model_runner.execute_model] "
+                f"pcp_size={self.pcp_size}, pcp_rank={self.pcp_rank}, "
+                f"num_tokens_padded(local)={num_tokens_padded}, "
+                f"total_num_scheduled_tokens(global)="
+                f"{scheduler_output.total_num_scheduled_tokens}, "
+                f"max_num_tokens_across_pcp="
+                f"{0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp}, "
+                f"tp_size={self.vllm_config.parallel_config.tensor_parallel_size}, "
+                f"flash_comm_v1={enable_sp(self.vllm_config)}",
+                flush=True,
+            )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(

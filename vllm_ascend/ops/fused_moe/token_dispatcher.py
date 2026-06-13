@@ -228,6 +228,19 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        # TODO: remove after PCP+FlashComm1+MC2 debug
+        x_active_mask = kwargs_mc2.get("x_active_mask")
+        x = kwargs_mc2["x"]
+        if x_active_mask is not None and x.shape[0] != x_active_mask.shape[0]:
+            print(
+                "[PCP-MC2-DEBUG][TokenDispatcherWithMC2.token_dispatch] "
+                "SHAPE MISMATCH before npu_moe_distribute_dispatch_v2: "
+                f"x.shape[0]={x.shape[0]} != x_active_mask.shape[0]={x_active_mask.shape[0]}, "
+                f"global_bs={self.global_bs}, ep_rank_id={self.ep_rank_id}, "
+                f"ep_world_size={self.ep_world_size}, "
+                f"expert_ids.shape={tuple(token_dispatch_input.topk_ids.shape)}",
+                flush=True,
+            )
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2

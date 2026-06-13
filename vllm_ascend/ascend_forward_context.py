@@ -185,6 +185,21 @@ def set_ascend_forward_context(
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
+                # TODO: remove after PCP+FlashComm1+MC2 debug
+                print(
+                    "[PCP-MC2-DEBUG][set_ascend_forward_context] "
+                    f"num_tokens(local)={num_tokens}, "
+                    f"num_actual_tokens(global)={num_actual_tokens}, "
+                    f"max_tokens_across_dp={max_tokens_across_dp}, "
+                    f"max_tokens_across_pcp={max_tokens_across_pcp}, "
+                    f"tp_world_size={tp_world_size}, "
+                    f"padded_num_tokens={forward_context.padded_num_tokens}, "
+                    f"mc2_mask.shape={tuple(mc2_mask.shape)}, "
+                    f"mc2_mask.sum()={mc2_mask.sum().item()}, "
+                    f"moe_comm_type={moe_comm_type}, "
+                    f"flash_comm_v1_enabled={flash_comm_v1_enabled}",
+                    flush=True,
+                )
         try:
             yield
         finally:
