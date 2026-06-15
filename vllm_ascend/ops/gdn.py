@@ -250,6 +250,30 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
     return fallback_meta.chunk
 
 
+def build_pcp_local_query_start_loc(query_start_loc: torch.Tensor, num_decodes: int) -> torch.Tensor:
+    pcp_group = get_pcp_group()
+    if pcp_group.world_size <= 1:
+        return query_start_loc
+
+    seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+    local_seq_lens = seq_lens.clone()
+    if seq_lens.numel() > num_decodes:
+        prefill_seq_lens = seq_lens[num_decodes:]
+        base = torch.div(prefill_seq_lens, pcp_group.world_size, rounding_mode="floor")
+        rank_offsets = torch.full_like(prefill_seq_lens, pcp_group.rank_in_group)
+        remainder = torch.clamp(
+            prefill_seq_lens - base * pcp_group.world_size - rank_offsets,
+            min=0,
+            max=1,
+        )
+        local_seq_lens[num_decodes:] = base + remainder
+
+    local_query_start_loc = torch.empty_like(query_start_loc)
+    local_query_start_loc[0] = 0
+    torch.cumsum(local_seq_lens, dim=0, out=local_query_start_loc[1:])
+    return local_query_start_loc
+
+
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
@@ -394,6 +418,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+        pcp_non_spec_query_start_loc = non_spec_query_start_loc
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
@@ -506,6 +531,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     has_initial_state = attn_metadata.has_initial_state
                     non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
                     conv_state = self_kv_cache[0].transpose(-1, -2)
+                    pcp_non_spec_query_start_loc = build_pcp_local_query_start_loc(
+                        non_spec_query_start_loc,
+                        attn_metadata.num_decodes,
+                    )
                     mixed_qkv_non_spec = causal_conv1d_fn(
                         mixed_qkv_non_spec_T,
                         conv_weights,
@@ -514,7 +543,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         conv_states=conv_state,
                         has_initial_state=has_initial_state,
                         cache_indices=non_spec_state_indices_tensor,
-                        query_start_loc=non_spec_query_start_loc,
+                        query_start_loc=pcp_non_spec_query_start_loc,
                         metadata=attn_metadata,
                     ).transpose(0, 1)
                 else:
@@ -674,8 +703,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta=beta_non_spec,
                 initial_state=initial_state,
                 output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                prebuilt_meta=get_non_spec_chunked_prefill_meta(attn_metadata),
+                cu_seqlens=pcp_non_spec_query_start_loc,
+                prebuilt_meta=(
+                    None
+                    if pcp_non_spec_query_start_loc is not non_spec_query_start_loc
+                    else get_non_spec_chunked_prefill_meta(attn_metadata)
+                ),
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
