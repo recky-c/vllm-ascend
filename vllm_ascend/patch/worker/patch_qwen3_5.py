@@ -132,13 +132,19 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
+        is_pcp_local_linear_attn = (
+            self.layer_type == "linear_attention"
+            and bool(max_tokens_across_pcp)
+            and hidden_states.shape[0] <= max_tokens_across_pcp
+        )
         print(
             "[MC2_SHAPE_DEBUG][qwen3_5_moe_in] "
             f"layer={self.layer_idx} type={self.layer_type} "
             f"pcp_local_linear={is_pcp_local_linear_attn} "
             f"fc1={_EXTRA_CTX.flash_comm_v1_enabled} "
             f"hidden={tuple(hidden_states.shape)} "
-            f"max_tokens_across_pcp={_EXTRA_CTX.max_tokens_across_pcp} "
+            f"max_tokens_across_pcp={max_tokens_across_pcp} "
             f"ctx_mc2_mask={tuple(_EXTRA_CTX.mc2_mask.shape) if _EXTRA_CTX.mc2_mask is not None else None}",
             flush=True,
         )
