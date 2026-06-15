@@ -256,6 +256,13 @@ def _round_up(x: int, align: int):
     return (x + align - 1) // align * align
 
 
+def sp_pad_size_for_tp(num_tokens: int, tp_world_size: int) -> int:
+    """Rows to append so num_tokens is divisible by tp_world_size (RS input)."""
+    if tp_world_size <= 1:
+        return 0
+    return (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
+
+
 def _prepend_env_path(env_name: str, path: str) -> None:
     current_value = os.environ.get(env_name, "")
     path_entries = [entry for entry in current_value.split(":") if entry]

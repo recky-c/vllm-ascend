@@ -73,7 +73,6 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     num_actual_tokens_pcp: int | None = None,
-    pcp_activation_rows: int | None = None,
     draft_attn_metadatas=None,
     has_sinks=False,
     input_ids=None,
@@ -211,30 +210,53 @@ def set_ascend_forward_context(
                     mc2_mask[:num_actual_tokens] = True
                     mc2_mask[num_actual_tokens:] = False
                     forward_context.mc2_mask = mc2_mask
-            from vllm_ascend.pcp_fc1_debug import log_pcp_fc1, sp_pad_size_for_tp
+            if reserved_mc2_mask is not None:
+                mc2_mask = forward_context.mc2_mask
+                # TODO: remove after PCP+FlashComm1+MC2 debug
+                print(
+                    "[PCP-MC2-DEBUG][set_ascend_forward_context] "
+                    f"num_tokens(local)={num_tokens}, "
+                    f"num_actual_tokens(global)={num_actual_tokens}, "
+                    f"num_actual_tokens_pcp={num_actual_tokens_pcp}, "
+                    f"max_tokens_across_dp={max_tokens_across_dp}, "
+                    f"max_tokens_across_pcp={max_tokens_across_pcp}, "
+                    f"tp_world_size={tp_world_size}, "
+                    f"padded_num_tokens={forward_context.padded_num_tokens}, "
+                    f"mc2_mask_tp_local={forward_context.mc2_mask_tp_local}, "
+                    f"mc2_mask.shape={tuple(mc2_mask.shape)}, "
+                    f"mc2_mask.sum()={mc2_mask.sum().item()}, "
+                    f"moe_comm_type={moe_comm_type}, "
+                    f"flash_comm_v1_enabled={flash_comm_v1_enabled}",
+                    flush=True,
+                )
+            try:
+                from vllm_ascend.pcp_token_debug import log_pcp_token, pcp_token_debug_enabled
+                from vllm_ascend.utils import sp_pad_size_for_tp
 
-            local_rows = pcp_activation_rows
-            if local_rows is None:
-                local_rows = num_actual_tokens_pcp
-            rs_pad_needed = (
-                sp_pad_size_for_tp(local_rows, tp_world_size)
-                if local_rows is not None
-                else None
-            )
-            log_pcp_fc1(
-                "set_ascend_forward_context",
-                forward_context,
-                always=True,
-                num_tokens=num_tokens,
-                num_actual_tokens_global=num_actual_tokens,
-                num_actual_tokens_pcp=num_actual_tokens_pcp,
-                pcp_activation_rows=pcp_activation_rows,
-                rs_pad_needed=rs_pad_needed,
-                max_tokens_across_dp=max_tokens_across_dp,
-                max_tokens_across_pcp=max_tokens_across_pcp,
-                tp_world_size=tp_world_size,
-                flash_comm_v1_enabled=flash_comm_v1_enabled,
-            )
+                if pcp_token_debug_enabled(
+                    flash_comm_v1=flash_comm_v1_enabled,
+                    max_tokens_across_pcp=max_tokens_across_pcp,
+                ):
+                    forward_rows = int(input_ids.shape[0]) if input_ids is not None else None
+                    rs_pad_needed = (
+                        sp_pad_size_for_tp(forward_rows, tp_world_size)
+                        if forward_rows is not None
+                        else None
+                    )
+                    log_pcp_token(
+                        "set_ascend_forward_context",
+                        forward_context,
+                        always=True,
+                        num_actual_tokens_global=num_actual_tokens,
+                        num_actual_tokens_pcp=num_actual_tokens_pcp,
+                        max_tokens_across_pcp=max_tokens_across_pcp,
+                        tp_world_size=tp_world_size,
+                        forward_rows=forward_rows,
+                        rs_pad_needed=rs_pad_needed,
+                        note="batch_pad_size is for column-parallel AG; RS uses live tensor rs_pad",
+                    )
+            except Exception:
+                pass
         try:
             yield
         finally:

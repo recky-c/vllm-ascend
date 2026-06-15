@@ -2228,6 +2228,53 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        forward_preprocess_tokens = (
+            num_tokens_padded
+            if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+            else total_num_scheduled_tokens
+        )
+        try:
+            from vllm_ascend.pcp_token_debug import log_pcp_token, pcp_token_debug_enabled
+
+            if pcp_token_debug_enabled(
+                flash_comm_v1=enable_sp(self.vllm_config),
+                pcp_size=self.pcp_size,
+                max_tokens_across_pcp=(
+                    0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp
+                ),
+            ):
+                pcp_mgr = self.pcp_manager
+                num_scheduled_tokens_padded_sum = None
+                pcp_tokens_sum = None
+                if self.pcp_size > 1:
+                    if pcp_mgr.num_scheduled_tokens_padded is not None:
+                        num_scheduled_tokens_padded_sum = int(
+                            pcp_mgr.num_scheduled_tokens_padded.sum()
+                        )
+                    if pcp_mgr.pcp_tokens is not None:
+                        pcp_tokens_sum = int(pcp_mgr.pcp_tokens[:num_reqs].sum())
+                log_pcp_token(
+                    "model_runner.execute_model",
+                    always=True,
+                    global_scheduler_tokens=scheduler_output.total_num_scheduled_tokens,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    sp_batch_num_tokens_padded=num_tokens_padded,
+                    local_total_num_scheduled_tokens=total_num_scheduled_tokens,
+                    forward_preprocess_tokens=forward_preprocess_tokens,
+                    model_forward_num_tokens_arg=num_tokens_padded,
+                    total_num_sampled_tokens_pcp=(
+                        pcp_mgr.total_num_sampled_tokens_pcp if self.pcp_size > 1 else None
+                    ),
+                    num_scheduled_tokens_padded_sum=num_scheduled_tokens_padded_sum,
+                    pcp_tokens_sum=pcp_tokens_sum,
+                    hybrid_attn=pcp_mgr.pcp_use_hybrid_attn if self.pcp_size > 1 else False,
+                    input_ids_len=(
+                        int(input_ids.shape[0]) if input_ids is not None else None
+                    ),
+                    tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+                )
+        except Exception:
+            pass
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2239,7 +2286,6 @@ class NPUModelRunner(GPUModelRunner):
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 num_actual_tokens_pcp=num_tokens_unpadded if self.pcp_size > 1 else None,
-                pcp_activation_rows=total_num_scheduled_tokens if self.pcp_size > 1 else None,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
@@ -2708,21 +2754,10 @@ class NPUModelRunner(GPUModelRunner):
     # all-gather one hidden-states in sp scene
     @staticmethod
     def _all_gather_hidden_states(hidden_states):
-        from vllm_ascend.pcp_fc1_debug import log_pcp_fc1
-
-        in_rows = hidden_states.shape[0]
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
         pad_size = get_forward_context().pad_size
         if pad_size > 0:
             hidden_states = hidden_states[:-pad_size, :]
-        log_pcp_fc1(
-            "model_runner.all_gather_hidden_states",
-            get_forward_context(),
-            always=True,
-            in_rows=in_rows,
-            out_rows=hidden_states.shape[0],
-            removed_pad=pad_size,
-        )
 
         return hidden_states
 
