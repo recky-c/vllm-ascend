@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_ascend.utils import sp_pad_size_for_tp
-
 PCP_TOKEN_DEBUG_MAX_LAYER = 8
 
 

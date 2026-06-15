@@ -17,7 +17,8 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
-from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream
+from vllm_ascend.pcp_token_debug import log_pcp_token
+from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream, sp_pad_size_for_tp
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -27,12 +28,28 @@ def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch
         return residual
 
     if x.size(0) != residual.size(0):
-        pad_size = _EXTRA_CTX.pad_size
-        if pad_size > 0:
-            residual = F.pad(residual, (0, 0, 0, pad_size))
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
+        x_rows = x.size(0)
+        residual_in_rows = residual.size(0)
+        batch_pad_size = _EXTRA_CTX.pad_size
+        rs_pad = sp_pad_size_for_tp(residual_in_rows, tp_size)
+        if rs_pad > 0:
+            residual = F.pad(residual, (0, 0, 0, rs_pad))
+        residual_after_pad = residual.size(0)
         residual = torch.chunk(residual, tp_size, dim=0)[tp_rank]
+        log_pcp_token(
+            "maybe_chunk_residual",
+            _EXTRA_CTX,
+            x_rows=x_rows,
+            residual_in_rows=residual_in_rows,
+            rs_pad=rs_pad,
+            residual_after_pad=residual_after_pad,
+            residual_out_rows=residual.size(0),
+            tp_size=tp_size,
+            batch_pad_size=batch_pad_size,
+            aligned=x_rows == residual.size(0),
+        )
 
     return residual
 
