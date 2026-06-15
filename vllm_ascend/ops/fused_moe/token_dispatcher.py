@@ -180,8 +180,18 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             "global_bs": self.global_bs,
             "expert_token_nums_type": expert_token_nums_type,
         }
+        mc2_mask = token_dispatch_input.routing.mc2_mask
         if self.global_bs == 0:
-            kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
+            kwargs_mc2["x_active_mask"] = mc2_mask
+
+        mc2_mask_shape = tuple(mc2_mask.shape) if mc2_mask is not None else None
+        print(
+            "[MC2_SHAPE_DEBUG][mc2_dispatch] "
+            f"global_bs={self.global_bs} "
+            f"x={tuple(hidden_states.shape)} mc2_mask={mc2_mask_shape} "
+            f"match={mc2_mask_shape is not None and mc2_mask_shape[0] == hidden_states.shape[0]}",
+            flush=True,
+        )
 
         stage1_kwargs = {
             "scales": None,

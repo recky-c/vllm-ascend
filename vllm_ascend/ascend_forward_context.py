@@ -185,6 +185,17 @@ def set_ascend_forward_context(
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
+                print(
+                    "[MC2_SHAPE_DEBUG][forward_context] "
+                    f"fc1={forward_context.flash_comm_v1_enabled} "
+                    f"num_tokens={num_tokens} num_actual_tokens={num_actual_tokens} "
+                    f"max_tokens_across_dp={max_tokens_across_dp} "
+                    f"max_tokens_across_pcp={max_tokens_across_pcp} "
+                    f"padded_num_tokens={forward_context.padded_num_tokens} "
+                    f"mc2_mask={tuple(mc2_mask.shape)} "
+                    f"mc2_mask_true={int(mc2_mask.sum().item())}",
+                    flush=True,
+                )
         try:
             yield
         finally:
