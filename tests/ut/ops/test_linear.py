@@ -13,6 +13,7 @@ from vllm_ascend.ops.linear import (
     AscendRowParallelLinear,
     AscendUnquantizedLinearMethod,
 )
+from vllm_ascend.ops.linear_op import SequenceRowParallelOp
 
 
 class BaseLinearTest(unittest.TestCase):
@@ -135,6 +136,50 @@ class TestAscendRowParallelLinear(BaseLinearTest):
 
         input_tensor = torch.randn(16, 8)
         linear(input_tensor)
+
+    @patch("vllm_ascend.ops.linear_op.tensor_model_parallel_reduce_scatter")
+    @patch("vllm_ascend.ops.linear_op.tensor_model_parallel_all_reduce")
+    @patch("vllm_ascend.ops.linear_op._EXTRA_CTX")
+    def test_pcp_linear_attn_out_proj_uses_all_reduce(
+        self,
+        mock_extra_ctx,
+        mock_all_reduce,
+        mock_reduce_scatter,
+    ):
+        mock_extra_ctx.flash_comm_v1_enabled = True
+        mock_extra_ctx.mmrs_fusion = False
+        mock_extra_ctx.max_tokens_across_pcp = 3
+        mock_extra_ctx.pad_size = 0
+
+        layer = MagicMock()
+        layer.prefix = "model.layers.0.linear_attn.out_proj"
+        layer.input_is_parallel = True
+        layer.reduce_results = True
+        layer.skip_bias_add = False
+        layer.return_bias = True
+        layer.bias = None
+        layer.unique_prefix = "model.layers.0.linear_attn.out_proj"
+        layer.quant_method.apply.side_effect = lambda layer_, x, bias=None: torch.randn(x.shape[0], 8)
+
+        op = SequenceRowParallelOp(layer)
+        op.update_attrs()
+        mock_all_reduce.side_effect = lambda x: x
+        mock_reduce_scatter.side_effect = lambda x, dim: x
+
+        output = op.matmul_and_reduce(torch.randn(3, 4), None)
+
+        self.assertEqual(output.shape[0], 3)
+        mock_all_reduce.assert_called_once()
+        mock_reduce_scatter.assert_not_called()
+
+        mock_all_reduce.reset_mock()
+        mock_reduce_scatter.reset_mock()
+
+        output = op.matmul_and_reduce(torch.randn(6, 4), None)
+
+        self.assertEqual(output.shape[0], 6)
+        mock_all_reduce.assert_not_called()
+        mock_reduce_scatter.assert_called_once()
 
 
 class TestAscendMergedColumnParallelLinear(BaseLinearTest):

@@ -293,6 +293,13 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
 
+        if mc2_mask is not None and mc2_mask.shape[0] != hidden_states.shape[0]:
+            mask_pad_size = hidden_states.shape[0] - mc2_mask.shape[0]
+            if mask_pad_size > 0:
+                mc2_mask = nn.functional.pad(mc2_mask, (0, mask_pad_size), value=False)
+            else:
+                mc2_mask = mc2_mask[: hidden_states.shape[0]]
+
         return MoEPrepareOutput(
             hidden_states=hidden_states,
             router_logits=router_logits,

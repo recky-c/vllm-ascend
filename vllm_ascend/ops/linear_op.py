@@ -478,6 +478,15 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         super().__init__(layer)
         self.unique_prefix = None
 
+    def _use_all_reduce_for_local_sequence(self, input_parallel: torch.Tensor) -> bool:
+        max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
+        return bool(
+            max_tokens_across_pcp
+            and input_parallel.shape[0] <= max_tokens_across_pcp
+            and "linear_attn" in self.layer.prefix
+            and "out_proj" in self.layer.prefix
+        )
+
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         """Linear layer with column parallelism.
 
@@ -508,7 +517,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         x = input_parallel
 
-        if not flash_comm_v1_enabled:
+        if not flash_comm_v1_enabled or self._use_all_reduce_for_local_sequence(x):
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             return tensor_model_parallel_all_reduce(output_parallel)
 
