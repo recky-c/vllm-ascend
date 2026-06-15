@@ -99,7 +99,13 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if self.layer_idx == 0 and _EXTRA_CTX.flash_comm_v1_enabled:
+        max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
+        is_pcp_local_linear_attn = (
+            self.layer_type == "linear_attention"
+            and max_tokens_across_pcp
+            and hidden_states.shape[0] <= max_tokens_across_pcp
+        )
+        if self.layer_idx == 0 and _EXTRA_CTX.flash_comm_v1_enabled and not is_pcp_local_linear_attn:
             tp_size = get_tensor_model_parallel_world_size()
             n_out = (hidden_states.shape[0] + tp_size - 1) // tp_size
             hidden_dim = hidden_states.shape[-1]
