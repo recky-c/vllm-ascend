@@ -540,11 +540,17 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
         if (
             getattr(_EXTRA_CTX, "mc2_mask_tp_local", False)
-            and hasattr(self, "num_tokens")
-            and self.num_tokens is not None
-            and hidden_states.shape[0] > self.num_tokens
+            and hidden_states.shape[0] > 0
         ):
-            hidden_states = hidden_states[: self.num_tokens]
+            active_tokens = getattr(self, "num_tokens", None)
+            mc2_mask = _EXTRA_CTX.mc2_mask
+            if mc2_mask is not None:
+                mask_active = int(mc2_mask.sum().item())
+                active_tokens = (
+                    mask_active if active_tokens is None else min(active_tokens, mask_active)
+                )
+            if active_tokens is not None and hidden_states.shape[0] > active_tokens:
+                hidden_states = hidden_states[:active_tokens]
 
         return hidden_states
 
@@ -558,7 +564,9 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         2 Reduce_results is True usually happens when model has no shared experts. We still do reduce scatter
         here, then skip allreudce in FusedMoe.
         """
-        hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
+        # PCP + FlashComm1 MC2 keeps per-TP-rank MoE rows; use TP RS, not EP RS.
+        use_ep_rs = not getattr(_EXTRA_CTX, "mc2_mask_tp_local", False)
+        hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, use_ep_rs)
 
         return hidden_states
 
