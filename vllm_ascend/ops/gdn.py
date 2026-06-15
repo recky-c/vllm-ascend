@@ -250,23 +250,33 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
     return fallback_meta.chunk
 
 
-def build_pcp_local_query_start_loc(query_start_loc: torch.Tensor, num_decodes: int) -> torch.Tensor:
-    pcp_group = get_pcp_group()
-    if pcp_group.world_size <= 1:
+def build_pcp_local_query_start_loc(
+    query_start_loc: torch.Tensor,
+    num_decodes: int,
+    local_num_tokens: int,
+) -> torch.Tensor:
+    if get_pcp_group().world_size <= 1:
+        return query_start_loc
+
+    if int(query_start_loc[-1].item()) == local_num_tokens:
         return query_start_loc
 
     seq_lens = query_start_loc[1:] - query_start_loc[:-1]
     local_seq_lens = seq_lens.clone()
     if seq_lens.numel() > num_decodes:
         prefill_seq_lens = seq_lens[num_decodes:]
-        base = torch.div(prefill_seq_lens, pcp_group.world_size, rounding_mode="floor")
-        rank_offsets = torch.full_like(prefill_seq_lens, pcp_group.rank_in_group)
-        remainder = torch.clamp(
-            prefill_seq_lens - base * pcp_group.world_size - rank_offsets,
-            min=0,
-            max=1,
-        )
-        local_seq_lens[num_decodes:] = base + remainder
+        decode_tokens = int(query_start_loc[num_decodes].item())
+        local_prefill_tokens = max(local_num_tokens - decode_tokens, 0)
+        if prefill_seq_lens.numel() == 1:
+            local_seq_lens[num_decodes:] = local_prefill_tokens
+        else:
+            scaled_prefill_lens = torch.div(
+                prefill_seq_lens * local_prefill_tokens,
+                prefill_seq_lens.sum(),
+                rounding_mode="floor",
+            )
+            scaled_prefill_lens[-1] += local_prefill_tokens - int(scaled_prefill_lens.sum().item())
+            local_seq_lens[num_decodes:] = scaled_prefill_lens
 
     local_query_start_loc = torch.empty_like(query_start_loc)
     local_query_start_loc[0] = 0
@@ -534,6 +544,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     pcp_non_spec_query_start_loc = build_pcp_local_query_start_loc(
                         non_spec_query_start_loc,
                         attn_metadata.num_decodes,
+                        mixed_qkv_non_spec_T.shape[-1],
                     )
                     mixed_qkv_non_spec = causal_conv1d_fn(
                         mixed_qkv_non_spec_T,
