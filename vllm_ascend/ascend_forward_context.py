@@ -192,15 +192,21 @@ def set_ascend_forward_context(
             )
             if use_pcp_local_mc2_mask:
                 # PCP + FlashComm1: MC2 mask follows PCP-local MoE rows after TP RS.
+                # EP ranks must share the same x dim0 for MC2 collectives, so pad
+                # to the max post-RS rows across PCP and mark inactive rows in mc2_mask.
                 local_pcp_tokens = num_actual_tokens_pcp
-                mc2_tokens_per_tp_rank = _mc2_tokens_per_tp_rank_after_sp(
+                local_mc2_tokens = _mc2_tokens_per_tp_rank_after_sp(
                     local_pcp_tokens, tp_world_size
                 )
-                forward_context.padded_num_tokens = mc2_tokens_per_tp_rank
+                max_mc2_tokens_across_pcp = _mc2_tokens_per_tp_rank_after_sp(
+                    max_tokens_across_pcp, tp_world_size
+                )
+                forward_context.padded_num_tokens = max_mc2_tokens_across_pcp
                 forward_context.mc2_mask_tp_local = True
                 if reserved_mc2_mask is not None:
-                    mc2_mask = reserved_mc2_mask[:mc2_tokens_per_tp_rank]
-                    mc2_mask.fill_(True)
+                    mc2_mask = reserved_mc2_mask[:max_mc2_tokens_across_pcp]
+                    mc2_mask.fill_(False)
+                    mc2_mask[:local_mc2_tokens] = True
                     forward_context.mc2_mask = mc2_mask
             else:
                 # NOTE: token num which need to pad to when mc2

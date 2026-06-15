@@ -293,16 +293,23 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
+        elif mc2_mask_tp_local and mc2_mask is not None:
+            self.num_tokens = hidden_states.shape[0]
+            target_pad_length = mc2_mask.shape[0]
+            pad_size = target_pad_length - self.num_tokens
+            if pad_size > 0:
+                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
+                router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
+                padded_hidden_states_shape = hidden_states.shape
 
         if (
             mc2_mask is not None
             and mc2_mask_tp_local
             and hidden_states.shape[0] != mc2_mask.shape[0]
         ):
-            mc2_mask = torch.ones(
-                hidden_states.shape[0],
-                dtype=torch.bool,
-                device=hidden_states.device,
+            raise RuntimeError(
+                "PCP MC2 prepare: hidden_states rows "
+                f"{hidden_states.shape[0]} != mc2_mask rows {mc2_mask.shape[0]}"
             )
 
         # TODO: remove after PCP+FlashComm1+MC2 debug
@@ -527,9 +534,19 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             Tensor with shape [local_num_tokens, hidden_size]
         """
         if enable_sp() or enable_sp_by_pass():
-            return self._finalize_with_ep_group(hidden_states)
+            hidden_states = self._finalize_with_ep_group(hidden_states)
+        else:
+            hidden_states = self._finalize_with_dp_group(hidden_states, reduce_results)
 
-        return self._finalize_with_dp_group(hidden_states, reduce_results)
+        if (
+            getattr(_EXTRA_CTX, "mc2_mask_tp_local", False)
+            and hasattr(self, "num_tokens")
+            and self.num_tokens is not None
+            and hidden_states.shape[0] > self.num_tokens
+        ):
+            hidden_states = hidden_states[: self.num_tokens]
+
+        return hidden_states
 
     def _finalize_with_ep_group(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
