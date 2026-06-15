@@ -2285,7 +2285,11 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                num_actual_tokens_pcp=num_tokens_unpadded if self.pcp_size > 1 else None,
+                num_actual_tokens_pcp=(
+                    total_num_scheduled_tokens
+                    if self.pcp_size > 1 and self.pcp_manager.pcp_use_hybrid_attn
+                    else (num_tokens_padded if self.pcp_size > 1 else None)
+                ),
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,

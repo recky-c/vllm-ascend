@@ -231,6 +231,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # TODO: remove after PCP+FlashComm1+MC2 debug
         x_active_mask = kwargs_mc2.get("x_active_mask")
         x = kwargs_mc2["x"]
+        if x_active_mask is not None:
+            print(
+                "[PCP-MC2-DEBUG][TokenDispatcherWithMC2.token_dispatch] "
+                f"x.shape[0]={x.shape[0]}, x_active_mask.shape={tuple(x_active_mask.shape)}, "
+                f"x_active_mask.sum()={x_active_mask.sum().item()}, "
+                f"global_bs={self.global_bs}, ep_rank_id={self.ep_rank_id}",
+                flush=True,
+            )
         if x_active_mask is not None and x.shape[0] != x_active_mask.shape[0]:
             print(
                 "[PCP-MC2-DEBUG][TokenDispatcherWithMC2.token_dispatch] "

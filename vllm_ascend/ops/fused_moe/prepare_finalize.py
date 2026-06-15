@@ -306,6 +306,18 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             )
 
         # TODO: remove after PCP+FlashComm1+MC2 debug
+        if mc2_mask is not None and mc2_mask_tp_local:
+            print(
+                "[PCP-MC2-DEBUG][PrepareAndFinalizeWithMC2.prepare] "
+                f"hidden_states.shape[0]={hidden_states.shape[0]}, "
+                f"mc2_mask.shape={tuple(mc2_mask.shape)}, "
+                f"mc2_mask.sum()={mc2_mask.sum().item()}, "
+                f"padded_num_tokens={_EXTRA_CTX.padded_num_tokens}, "
+                f"tp_rank={self.tp_rank}, replace_allreduce={replace_allreduce}",
+                flush=True,
+            )
+
+        # TODO: remove after PCP+FlashComm1+MC2 debug
         if mc2_mask is not None:
             hs_tokens = hidden_states.shape[0]
             mask_tokens = mc2_mask.shape[0]
