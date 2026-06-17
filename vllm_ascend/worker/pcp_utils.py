@@ -143,7 +143,7 @@ class PCPManager:
 
         self.pcp_pads_logits_hybrid_attn = torch.ones(self.max_num_reqs, dtype=torch.int32) * (self.pcp_world_size - 1)
         self.pcp_padded_tokens_fla = 0
-        self.pcp_padded_tokens_length = 0
+        self.total_num_pcp_padded_tokens = 0
         self.num_scheduled_tokens_padded: np.ndarray | None = None
         self.max_num_tokens_across_pcp = 0
         self.pcp_tokens_padded = None
@@ -556,9 +556,8 @@ class PCPManager:
 
         # DualChunkSwap requires alignment to a multiple of (2 * pcp_world_size).
         # We first pad each request's token count up to that multiple.
-        num_padded_scheduled_tokens = np.ceil(num_scheduled_tokens / (2 * self.pcp_world_size)).astype(np.int32) * (
-            2 * self.pcp_world_size
-        )
+        pcp_align = 2 * self.pcp_world_size
+        num_padded_scheduled_tokens = (num_scheduled_tokens + pcp_align - 1) // pcp_align * pcp_align
 
         # PCP does not split decode requests. For decode requests, we instead
         # duplicate the scheduled tokens across the pcp_world_size ranks.
@@ -569,24 +568,27 @@ class PCPManager:
         # Record how many pads were added per request (padded - original).
         self.num_pcp_pads_cpu[: self.num_reqs] = num_padded_scheduled_tokens - num_scheduled_tokens
 
-        # cu_padded_tokens: cumulative sum of padded token counts,
+        # cu_num_padded_tokens: cumulative sum of padded token counts,
         # pcp_padded_arange: per-request arange flattened for padded tokens.
-        cu_padded_tokens, pcp_padded_arange = self._get_cumsum_and_arange(num_padded_scheduled_tokens, arange_np)
-        self.pcp_padded_tokens_length = pcp_padded_arange.shape[0]
+        cu_num_padded_tokens, pcp_padded_arange = self._get_cumsum_and_arange(
+            num_padded_scheduled_tokens, arange_np
+        )
+        self.total_num_pcp_padded_tokens = int(cu_num_padded_tokens[-1])
         # Build the mask that marks which positions in the padded allgather buffer
         # correspond to real (unpadded) tokens.
-        self.pcp_unpad_mask_cpu[: self.pcp_padded_tokens_length] = pcp_padded_arange < np.repeat(
+        self.pcp_unpad_mask_cpu[: self.total_num_pcp_padded_tokens] = pcp_padded_arange < np.repeat(
             num_scheduled_tokens, num_padded_scheduled_tokens
         )
+        
         unpad_mask_decode = self.pcp_unpad_mask_cpu[: self.num_decode_tokens * self.pcp_world_size]
         unpad_mask_decode = unpad_mask_decode.reshape([-1, self.pcp_world_size])
         unpad_mask_decode[:, 0] = True
         unpad_mask_decode[:, 1:] = False
-        pcp_tokens = num_padded_scheduled_tokens // self.pcp_world_size
 
         # Compute per-request "chunk sizes" for the head/tail splitting.
         # For prefill requests, we further split the pcp_tokens into two chunks
         # (head and tail). For decode requests, the chunk equals pcp_tokens.
+        pcp_tokens = num_padded_scheduled_tokens // self.pcp_world_size
         pcp_chunk_sizes = (pcp_tokens // 2).clip(min=1)
         pcp_chunk_sizes[: self.num_decode_reqs] = pcp_tokens[: self.num_decode_reqs]
 
@@ -626,17 +628,18 @@ class PCPManager:
             return positions
 
         positions = get_current_rank_positions(0, self.pcp_world_rank)
-        padded_pos_start_loc = np.roll(cu_padded_tokens, 1)
-        padded_pos_start_loc[0] = 0
 
         # Decode tokens are duplicated only after AG. But their positions are
         # same without prefill context parallel.
         if self.num_decode_reqs > 0:
-            positions[: self.num_decode_tokens] = self._get_cumsum_and_arange(
+            _, decode_token_arange = self._get_cumsum_and_arange(
                 num_scheduled_tokens[: self.num_decode_reqs], arange_np
-            )[1]
+            )
+            positions[: self.num_decode_tokens] = decode_token_arange
 
         # Build the restore index used after allgather.
+        padded_pos_start_loc = np.roll(cu_num_padded_tokens, 1)
+        padded_pos_start_loc[0] = 0
         all_positions_lst = [
             get_current_rank_positions(padded_pos_start_loc, rank_i) for rank_i in range(self.pcp_world_size)
         ]
@@ -726,9 +729,8 @@ class PCPManager:
                 # [0,1,2], [4,4,4] -> [0,0,0,0,1,1,1,1,2,2,2,2]
                 num_decode_pcp_size = np.ones(self.num_decode_reqs, dtype=np.int64) * self.pcp_world_size
                 decode_reqs_offset = np.repeat(np.arange(self.num_decode_reqs, dtype=np.int64), num_decode_pcp_size)
-                decode_ranks_offset = (
-                    self._get_cumsum_and_arange(num_decode_pcp_size, arange_np)[1] * max_scheduled_tokens
-                )
+                _, decode_rank_arange = self._get_cumsum_and_arange(num_decode_pcp_size, arange_np)
+                decode_ranks_offset = decode_rank_arange * max_scheduled_tokens
                 enter_fa_decode_restore_idx = np.add(decode_reqs_offset, decode_ranks_offset)
 
             if enter_fa_decode_restore_idx is not None and enter_fa_prefill_restore_idx is not None:
@@ -752,7 +754,7 @@ class PCPManager:
                 ]
                 all_positions_prefill_tensor = torch.from_numpy(np.concatenate(all_positions_prefill))
                 all_exit_fa_restore_idx = all_positions_prefill_tensor.float().argsort()
-                unpad_mask_prefill = self.pcp_unpad_mask_cpu[: self.pcp_padded_tokens_length][
+                unpad_mask_prefill = self.pcp_unpad_mask_cpu[: self.total_num_pcp_padded_tokens][
                     self.num_decode_reqs * self.pcp_world_size :
                 ]
                 # [0] | [0,7]
@@ -1102,7 +1104,7 @@ class PCPManager:
                 self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
             )
 
-            pcp_unpad_mask = self.pcp_unpad_mask_cpu[: self.pcp_padded_tokens_length]
+            pcp_unpad_mask = self.pcp_unpad_mask_cpu[: self.total_num_pcp_padded_tokens]
             long_seq_metadata = AscendPrefillContextParallelMetadata(
                 pcp_use_hybrid_attn=self.pcp_use_hybrid_attn,
                 num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
