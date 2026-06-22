@@ -120,21 +120,34 @@ def causal_conv1d_fn(
 
     out_ref = []
     out_ref_b = []
-    seqlens = query_start_loc[1:] - query_start_loc[:-1]
-    seqlens = seqlens.tolist()
+    seqlens_tensor = query_start_loc[1:] - query_start_loc[:-1]
+    seqlens = seqlens_tensor.tolist()
     splits = torch.split(x, seqlens, dim=-1)
     width = weight.shape[1]
-    last_width_prefill_x = extract_last_width(x, query_start_loc[num_decodes:], conv_states.shape[-1])
+    all_last_width_prefill_x = None
+    valid_prefill_cache_indices = None
 
     if get_pcp_group().world_size > 1:
-        all_last_width_prefill_x = get_pcp_group().all_gather(last_width_prefill_x.unsqueeze(0).contiguous(), 0)
-        pcp_rank = get_pcp_group().rank_in_group
-        if pcp_rank > 0:
-            conv_states[cache_indices[num_decodes:]] = all_last_width_prefill_x[pcp_rank - 1, ...]
+        prefill_seqlens = seqlens_tensor[num_decodes:]
+        prefill_cache_indices = cache_indices[num_decodes:]
+        valid_prefill_mask = (prefill_seqlens > 0) & (prefill_cache_indices != pad_slot_id)
+        if bool(valid_prefill_mask.any()):
+            prefill_end_locs = query_start_loc[num_decodes + 1 :][valid_prefill_mask]
+            last_width_prefill_x = extract_last_width_by_end(
+                x,
+                prefill_end_locs,
+                conv_states.shape[-1],
+            )
+            valid_prefill_cache_indices = prefill_cache_indices[valid_prefill_mask]
+            all_last_width_prefill_x = get_pcp_group().all_gather(
+                last_width_prefill_x.unsqueeze(0).contiguous(), 0)
+            pcp_rank = get_pcp_group().rank_in_group
+            if pcp_rank > 0:
+                conv_states[valid_prefill_cache_indices] = all_last_width_prefill_x[pcp_rank - 1, ...]
 
     for i in range(len(seqlens)):
         x_s = splits[i]
-        if cache_indices[i] == PAD_SLOT_ID:
+        if seqlens[i] == 0 or cache_indices[i] == pad_slot_id:
             continue
         out_ref_b.append(
             causal_conv1d_ref(
@@ -148,8 +161,10 @@ def causal_conv1d_fn(
             )
         )
 
-    if get_pcp_group().world_size > 1:
-        conv_states[cache_indices[num_decodes:]] = all_last_width_prefill_x[-1, ...]
+    if get_pcp_group().world_size > 1 and valid_prefill_cache_indices is not None:
+        conv_states[valid_prefill_cache_indices] = all_last_width_prefill_x[-1, ...]
+    if not out_ref_b:
+        return x[:, :0]
     out_ref.append(torch.cat([t[0] for t in out_ref_b], dim=-1))
     out_ref_tensor = torch.cat(out_ref, dim=0)
     return out_ref_tensor
@@ -157,6 +172,10 @@ def causal_conv1d_fn(
 
 def extract_last_width(x, start_loc, width):
     end_loc = start_loc[1:]
+    return extract_last_width_by_end(x, end_loc, width)
+
+
+def extract_last_width_by_end(x, end_loc, width):
     offsets = torch.arange(width, device=x.device)
     indices = end_loc.unsqueeze(1) - width + offsets.unsqueeze(0)  # (num_seqs, width)
 
