@@ -439,6 +439,16 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
             split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
         )
+        logger.info(
+            "[PCP-DPDEBUG] MLAMetadataBuilder.build: "
+            "treat_short_extends_as_decodes=DEFAULT(no param) decode_threshold=%s "
+            "num_decodes=%s num_prefills=%s num_decode_tokens=%s num_prefill_tokens=%s",
+            self.decode_threshold,
+            self.num_decodes,
+            self.num_prefills,
+            self.num_decode_tokens,
+            self.num_prefill_tokens,
+        )
         self.set_num_actual_tokens(common_attn_metadata)
         assert self.num_decodes + self.num_prefills == num_reqs
         assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens

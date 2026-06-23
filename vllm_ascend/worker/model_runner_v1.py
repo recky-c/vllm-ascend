@@ -3056,6 +3056,24 @@ class NPUModelRunner(GPUModelRunner):
         ]
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
         is_prefilling[num_reqs:] = False
+        if self.pcp_size > 1:
+            query_lens_cpu_dbg = (
+                self.query_start_loc.cpu[1 : num_reqs + 1] - self.query_start_loc.cpu[:num_reqs]
+            ).tolist()
+            logger.info(
+                "[PCP-DPDEBUG] build_attn_metadata: num_reqs=%s num_tokens=%s max_query_len=%s "
+                "is_prefilling=%s query_lens_cpu=%s "
+                "num_computed_tokens=%s num_prompt_tokens=%s",
+                num_reqs,
+                num_tokens,
+                max_query_len,
+                is_prefilling[:num_reqs].tolist(),
+                query_lens_cpu_dbg,
+                num_computed_tokens_cpu[:num_reqs].tolist()
+                if num_computed_tokens_cpu is not None
+                else None,
+                num_prompt_tokens_cpu[:num_reqs].tolist(),
+            )
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.

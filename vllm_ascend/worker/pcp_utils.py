@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.logger import logger
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.utils import CpuGpuBuffer
 
@@ -193,6 +194,22 @@ class PCPManager:
         self.num_prefill_reqs = num_reqs - self.num_decode_reqs
         self.num_decode_tokens = num_scheduled_tokens[: self.num_decode_reqs].sum()
         self.num_scheduled_tokens_padded = num_scheduled_tokens  # for graph compiling in hybrid_attn
+
+        scheduled = num_scheduled_tokens[:num_reqs]
+        logger.info(
+            "[PCP-DPDEBUG] PCPManager.init_batch_info: num_reqs=%s decode_threshold=%s "
+            "is_prefill_by_threshold=%s first_prefill=%s num_decode_reqs=%s num_prefill_reqs=%s "
+            "num_decode_tokens(front_slice_sum)=%s scheduled=%s "
+            "(baseline: threshold-only, no decode_req_mask)",
+            num_reqs,
+            self.decode_threshold,
+            (scheduled > self.decode_threshold).tolist(),
+            first_prefill,
+            self.num_decode_reqs,
+            self.num_prefill_reqs,
+            int(self.num_decode_tokens),
+            scheduled.tolist(),
+        )
 
         self.query_lens_pcp_full.cpu[: self.num_reqs] = torch.from_numpy(num_scheduled_tokens)
         self.query_lens_pcp_full.cpu[self.num_reqs :].fill_(0)

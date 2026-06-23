@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -977,6 +978,26 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
                 m,
                 decode_threshold=1,
+            )
+            is_prefilling_dbg = None
+            if getattr(m, "is_prefilling", None) is not None:
+                is_prefilling_dbg = m.is_prefilling[: m.num_reqs].tolist()
+            logger.info(
+                "[PCP-DPDEBUG] GDNMetadataBuilder.build(non-spec): "
+                "num_decodes=%s num_prefills=%s num_decode_tokens=%s num_prefill_tokens=%s "
+                "treat_short_extends_as_decodes=DEFAULT(no param) decode_threshold=1 "
+                "num_reqs=%s num_actual_tokens=%s max_query_len=%s "
+                "has_pcp_meta=%s is_prefilling=%s query_start_loc_cpu=%s",
+                num_decodes,
+                num_prefills,
+                num_decode_tokens,
+                num_prefill_tokens,
+                m.num_reqs,
+                m.num_actual_tokens,
+                m.max_query_len,
+                getattr(m, "prefill_context_parallel_metadata", None) is not None,
+                is_prefilling_dbg,
+                m.query_start_loc_cpu[: m.num_reqs + 1].tolist(),
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None

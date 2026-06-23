@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
@@ -300,11 +301,31 @@ def split_decodes_and_prefills(
     query_start_loc = common_attn_metadata.query_start_loc_cpu
 
     if max_query_len <= decode_threshold:
+        logger.info(
+            "[PCP-DPDEBUG] split_decodes_and_prefills fast-path(all_decode): "
+            "num_reqs=%s num_tokens=%s max_query_len=%s decode_threshold=%s "
+            "has_pcp_meta=%s (baseline: no treat_short_extends_as_decodes)",
+            num_reqs,
+            num_tokens,
+            max_query_len,
+            decode_threshold,
+            long_seq_metadata is not None,
+        )
         return num_reqs, 0, num_tokens, 0
 
-    query_lens = (query_start_loc[1:] - query_start_loc[:-1]) if query_lens_pcp_full is None else query_lens_pcp_full
+    query_lens_sharded = query_start_loc[1:] - query_start_loc[:-1]
+    query_lens = query_lens_sharded if query_lens_pcp_full is None else query_lens_pcp_full
     is_prefill = query_lens > decode_threshold
     if not torch.any(is_prefill):
+        logger.info(
+            "[PCP-DPDEBUG] split_decodes_and_prefills all-decode (no is_prefill): "
+            "num_reqs=%s num_tokens=%s query_lens=%s decode_threshold=%s "
+            "(baseline: no treat_short_extends_as_decodes)",
+            num_reqs,
+            num_tokens,
+            query_lens[:num_reqs].tolist(),
+            decode_threshold,
+        )
         return num_reqs, 0, num_tokens, 0
 
     first_prefill = is_prefill.int().argmax(dim=-1).item()
@@ -312,6 +333,28 @@ def split_decodes_and_prefills(
     num_prefills = num_reqs - num_decodes
     num_decode_tokens = query_start_loc[first_prefill].item()
     num_prefill_tokens = num_tokens - num_decode_tokens
+    is_prefilling_dbg = None
+    if common_attn_metadata.is_prefilling is not None:
+        is_prefilling_dbg = common_attn_metadata.is_prefilling[:num_reqs].tolist()
+    logger.info(
+        "[PCP-DPDEBUG] split_decodes_and_prefills: "
+        "num_decodes=%s num_prefills=%s num_decode_tokens=%s num_prefill_tokens=%s "
+        "decode_threshold=%s max_query_len=%s max_query_len_pcp_full=%s has_pcp_meta=%s "
+        "query_lens_sharded=%s query_lens_full=%s is_prefilling=%s first_prefill=%s "
+        "(baseline: no treat_short_extends_as_decodes)",
+        num_decodes,
+        num_prefills,
+        num_decode_tokens,
+        num_prefill_tokens,
+        decode_threshold,
+        common_attn_metadata.max_query_len,
+        max_query_len_pcp_full,
+        long_seq_metadata is not None,
+        query_lens_sharded[:num_reqs].tolist(),
+        query_lens[:num_reqs].tolist() if query_lens_pcp_full is not None else None,
+        is_prefilling_dbg,
+        first_prefill,
+    )
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 

@@ -20,6 +20,7 @@ import torch_npu
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
@@ -514,6 +515,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
                 if get_pcp_group().world_size > 1:
+                    non_spec_qsl_cpu_dbg = None
+                    if non_spec_query_start_loc is not None:
+                        non_spec_qsl_cpu_dbg = (
+                            non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]
+                        ).tolist()
+                    logger.info(
+                        "[PCP-DPDEBUG] GDN._forward_core prefill+PCP: "
+                        "prefix=%s num_decodes=%s num_prefills=%s num_actual_tokens=%s "
+                        "mixed_qkv_non_spec.shape=%s non_spec_query_lens=%s "
+                        "has_initial_state=%s",
+                        self.prefix,
+                        attn_metadata.num_decodes,
+                        attn_metadata.num_prefills,
+                        num_actual_tokens,
+                        tuple(mixed_qkv_non_spec.shape),
+                        non_spec_qsl_cpu_dbg,
+                        has_initial_state.tolist()
+                        if has_initial_state is not None and hasattr(has_initial_state, "tolist")
+                        else has_initial_state,
+                    )
                     mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
                     has_initial_state = attn_metadata.has_initial_state
                     non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
@@ -554,6 +575,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
+            logger.info(
+                "[PCP-DPDEBUG] GDN._forward_core decode-only: "
+                "prefix=%s num_decodes=%s num_prefills=%s num_actual_tokens=%s "
+                "mixed_qkv_non_spec.shape=%s",
+                self.prefix,
+                attn_metadata.num_decodes,
+                attn_metadata.num_prefills,
+                num_actual_tokens,
+                tuple(mixed_qkv_non_spec.shape) if mixed_qkv_non_spec is not None else None,
+            )
             conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
             non_spec_qsl_host, non_spec_ci_host = get_causal_conv1d_update_host_args(attn_metadata)

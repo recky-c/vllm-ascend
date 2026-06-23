@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 
@@ -127,6 +128,17 @@ def causal_conv1d_fn(
     splits = torch.split(x, seqlens, dim=-1)
     width = weight.shape[1]
     state_len = width - 1
+    if get_pcp_group().world_size > 1:
+        logger.info(
+            "[PCP-DPDEBUG] causal_conv1d_fn(PCP): num_decodes=%s seqlens=%s "
+            "x.shape=%s width=%s cache_indices=%s query_start_loc=%s",
+            num_decodes,
+            seqlens,
+            tuple(x.shape),
+            width,
+            cache_indices.tolist() if cache_indices is not None else None,
+            query_start_loc.tolist() if query_start_loc is not None else None,
+        )
     last_width_prefill_x = extract_last_width(x, query_start_loc[num_decodes:], state_len)
 
     if get_pcp_group().world_size > 1:
