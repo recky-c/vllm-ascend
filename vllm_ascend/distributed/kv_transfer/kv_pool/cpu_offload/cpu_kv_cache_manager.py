@@ -10,6 +10,7 @@ from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
+from vllm_ascend.kv_debug import kv_debug_log, kv_ids_summary
 
 
 class CPUCacheStats:
@@ -88,6 +89,14 @@ class CPUKVCacheManager:
         self.cpu_cache_stats = CPUCacheStats(enable_prefix_caching=True, log_stats=True)
         # Record request that will be free after finish sending
         self.req_to_free: defaultdict[str, Request] = defaultdict(Request)
+        kv_debug_log(
+            logger,
+            "CPUKVCacheManager.__init__: block_size=%s num_cpu_blocks=%s "
+            "max_model_len=%s",
+            self.block_size,
+            self.num_cpu_blocks,
+            max_model_len,
+        )
 
     def get_matched_num_and_touch(self, request: Request) -> tuple[int, bool]:
         # When the request requires prompt logprobs, we skip prefix caching.
@@ -121,6 +130,16 @@ class CPUKVCacheManager:
         self.cpu_cache_stats.set_cache_stats(request.num_tokens, num_computed_tokens)
         self.cpu_cache_stats.cpu_prefix_cache_metrics.observe(self.cpu_cache_stats.prefix_cache_stats)
         self.cpu_cache_stats.log()
+        kv_debug_log(
+            logger,
+            "CPUKVCacheManager.get_matched_num_and_touch: req_id=%s "
+            "num_tokens=%s hit_tokens=%s hit_blocks=%s free_blocks=%s",
+            request_id,
+            request.num_tokens,
+            num_computed_tokens,
+            kv_ids_summary(computed_blocks[0]),
+            self.block_pool.get_num_free_blocks(),
+        )
 
         return num_computed_tokens, False
 
@@ -149,6 +168,15 @@ class CPUKVCacheManager:
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 self._release_ahead_touch(request_id)
                 self.req_failed_to_allocate[request_id] = True
+                kv_debug_log(
+                    logger,
+                    "CPUKVCacheManager.allocate_slots:fail req_id=%s "
+                    "num_tokens=%s need_blocks=%s free_blocks=%s",
+                    request_id,
+                    num_tokens,
+                    num_blocks_to_allocate,
+                    self.block_pool.get_num_free_blocks(),
+                )
                 continue
             # Append the new computed blocks to the request blocks until now to
             # avoid the case where the new blocks cannot be allocated.
@@ -168,11 +196,30 @@ class CPUKVCacheManager:
             # No need to release ref_cnt because we use officially.
             self.req_to_computed_blocks.pop(request_id, None)
             req_to_new_blocks[request_id] = [block.block_id for block in new_computed_blocks + new_blocks]
+            kv_debug_log(
+                logger,
+                "CPUKVCacheManager.allocate_slots:allocated req_id=%s "
+                "num_tokens=%s computed_blocks=%s new_blocks=%s all_blocks=%s "
+                "free_blocks=%s",
+                request_id,
+                num_tokens,
+                kv_ids_summary(new_computed_blocks),
+                kv_ids_summary(new_blocks),
+                req_to_new_blocks[request_id],
+                self.block_pool.get_num_free_blocks(),
+            )
         return req_to_new_blocks
 
     def record_request_cache_and_free_slots(self, request: Request):
         logger.debug("record_request_cache_and_free_slots for request %s in cpu_kv_cache_manager", request.request_id)
         self.req_to_free[request.request_id] = request
+        kv_debug_log(
+            logger,
+            "CPUKVCacheManager.record_request_cache_and_free_slots: req_id=%s "
+            "num_tokens=%s",
+            request.request_id,
+            request.num_tokens,
+        )
 
     def cache_and_free_slots(self, request_id: str):
         logger.debug("Cache and free slots for request %s in cpu_kv_cache_manager", request_id)
@@ -185,12 +232,24 @@ class CPUKVCacheManager:
                 request,
                 self.req_to_num_tokens[request_id],
             )
+            kv_debug_log(
+                logger,
+                "CPUKVCacheManager.cache_and_free_slots:cached req_id=%s "
+                "num_tokens=%s",
+                request_id,
+                self.req_to_num_tokens[request_id],
+            )
         self._free_slots(request_id)
         logger.debug("delete request %s in cpu_kv_cache_manager req_to_free", request_id)
         del self.req_to_free[request_id]
 
     def _free_slots(self, request_id: str):
         # This function is designed to be reentrant.
+        kv_debug_log(
+            logger,
+            "CPUKVCacheManager._free_slots: req_id=%s",
+            request_id,
+        )
         self._release_ahead_touch(request_id)
         self.single_type_manager.free(request_id)
         self.req_to_block_hashes.pop(request_id, None)

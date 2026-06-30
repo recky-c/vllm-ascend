@@ -12,6 +12,9 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
+from vllm.logger import logger
+
+from vllm_ascend.kv_debug import kv_debug_log, kv_ids_summary
 
 # Direction codes shared with csrc/torch_binding.cpp::swap_blocks_batch.
 DIRECTION_H2D = 0
@@ -91,6 +94,19 @@ def copy_blocks(
     src_all = (params.src_bases[:, None] + src_ids[None, :] * bpb_col).ravel()
     dst_all = (params.dst_bases[:, None] + dst_ids[None, :] * bpb_col).ravel()
     sz_all = np.broadcast_to(bpb_col, (params.num_sub_tensors, n)).ravel().copy()
+    kv_debug_log(
+        logger,
+        "simple_kv_offload.copy_blocks: direction=%s src_blocks=%s "
+        "dst_blocks=%s num_block_pairs=%s num_sub_tensors=%s "
+        "total_copies=%s bytes_per_sub_tensor=%s",
+        "CPU->NPU" if params.direction == DIRECTION_H2D else "NPU->CPU",
+        kv_ids_summary(src_block_ids),
+        kv_ids_summary(dst_block_ids),
+        n,
+        params.num_sub_tensors,
+        len(sz_all),
+        params.bpb.tolist(),
+    )
 
     batch_src = torch.from_numpy(src_all)
     batch_dst = torch.from_numpy(dst_all)

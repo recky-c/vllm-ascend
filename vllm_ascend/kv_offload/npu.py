@@ -2,6 +2,7 @@ from collections.abc import Iterator
 
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionBackend  # type: ignore
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
@@ -11,6 +12,7 @@ from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 from vllm_ascend.kv_offload.cpu_npu import CpuNpuOffloadingHandler
+from vllm_ascend.kv_debug import kv_debug_log
 
 
 class NPUOffloadingSpec(OffloadingSpec):
@@ -21,6 +23,14 @@ class NPUOffloadingSpec(OffloadingSpec):
         if not num_cpu_blocks:
             raise Exception("num_cpu_blocks must be specified in kv_connector_extra_config")
         self.num_cpu_blocks: int = num_cpu_blocks
+        kv_debug_log(
+            logger,
+            "NPUOffloadingSpec.__init__: num_cpu_blocks=%s "
+            "block_size_factor=%s extra_config=%s",
+            self.num_cpu_blocks,
+            self.block_size_factor,
+            self.extra_config,
+        )
 
         # scheduler-side
         self._manager: OffloadingManager | None = None
@@ -35,6 +45,15 @@ class NPUOffloadingSpec(OffloadingSpec):
             assert len(self.gpu_block_size) == 1
             gpu_block_size = self.gpu_block_size[0]
             offloaded_block_size = gpu_block_size * self.block_size_factor
+            kv_debug_log(
+                logger,
+                "NPUOffloadingSpec.get_manager: gpu_block_size=%s "
+                "offloaded_block_size=%s num_cpu_blocks=%s enable_events=%s",
+                gpu_block_size,
+                offloaded_block_size,
+                self.num_cpu_blocks,
+                enable_events,
+            )
             self._manager = CPUOffloadingManager(
                 block_size=offloaded_block_size,
                 num_blocks=self.num_cpu_blocks,
@@ -50,6 +69,15 @@ class NPUOffloadingSpec(OffloadingSpec):
         if not self._handler:
             assert len(self.gpu_block_size) == 1
             gpu_block_size = self.gpu_block_size[0]
+            kv_debug_log(
+                logger,
+                "NPUOffloadingSpec.get_handlers: gpu_block_size=%s "
+                "cpu_block_size=%s num_cpu_blocks=%s kv_cache_layers=%s",
+                gpu_block_size,
+                gpu_block_size * self.block_size_factor,
+                self.num_cpu_blocks,
+                list(kv_caches.keys()),
+            )
             self._handler = CpuNpuOffloadingHandler(
                 attn_backends=attn_backends,
                 gpu_block_size=gpu_block_size,

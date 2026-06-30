@@ -8,6 +8,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionBackend  # type: ignore
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler, TransferResult, TransferSpec
+from vllm_ascend.kv_debug import kv_debug_log, kv_ids_summary, kv_tensor_summary
 
 
 @dataclass
@@ -62,6 +63,17 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
     ):
         assert cpu_block_size % gpu_block_size == 0
         self.block_size_factor = cpu_block_size // gpu_block_size
+        kv_debug_log(
+            logger,
+            "CpuNpuOffloadingHandler.__init__: gpu_block_size=%s "
+            "cpu_block_size=%s block_size_factor=%s num_cpu_blocks=%s "
+            "num_gpu_cache_layers=%s",
+            gpu_block_size,
+            cpu_block_size,
+            self.block_size_factor,
+            num_cpu_blocks,
+            len(gpu_caches),
+        )
 
         # npu streams for npu->cpu and cpu->npu
         self.d2h_stream = torch.npu.Stream()
@@ -106,6 +118,16 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
                     ),
                 )
             )
+            kv_debug_log(
+                logger,
+                "CpuNpuOffloadingHandler.__init__: layer=%s npu_k=%s "
+                "npu_v=%s cpu_shape=%s pin_memory=%s",
+                layer_name,
+                kv_tensor_summary(gpu_tensor[0]),
+                kv_tensor_summary(gpu_tensor[1]),
+                cpu_shape,
+                pin_memory,
+            )
 
         # Pre-compute base pointers and block sizes for batch copies.
         # In vllm-ascend, each layer's KV cache is stored as a tuple
@@ -130,6 +152,14 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         self._block_size_in_bytes_arr = np.array(block_sizes_in_bytes, dtype=np.int64)
         # Total bytes per block across all sub-tensors (for transfer stats)
         self._total_bytes_per_block = int(self._block_size_in_bytes_arr.sum())
+        kv_debug_log(
+            logger,
+            "CpuNpuOffloadingHandler.__init__: num_sub_tensors=%s "
+            "block_sizes_in_bytes=%s total_bytes_per_block=%s",
+            len(self._block_size_in_bytes_arr),
+            self._block_size_in_bytes_arr.tolist(),
+            self._total_bytes_per_block,
+        )
 
     def _get_event(self) -> torch.npu.Event:
         if self._event_pool:
@@ -165,6 +195,18 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         dst_blocks = dst_spec.block_ids
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
+        kv_debug_log(
+            logger,
+            "CpuNpuOffloadingHandler.transfer_async:start job_id=%s "
+            "direction=%s src_blocks=%s dst_blocks=%s src_factor=%s "
+            "dst_factor=%s",
+            job_id,
+            "NPU->CPU" if is_d2h else "CPU->NPU",
+            kv_ids_summary(src_blocks),
+            kv_ids_summary(dst_blocks),
+            src_block_size_factor,
+            dst_block_size_factor,
+        )
 
         dst_sub_blocks_to_skip = -src_blocks.size % dst_block_size_factor
         src_sub_block_count = src_blocks.size * src_block_size_factor
@@ -180,6 +222,17 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
             dst_block_size_factor,
             dst_block_ids,
             skip_count=dst_sub_blocks_to_skip,
+        )
+        kv_debug_log(
+            logger,
+            "CpuNpuOffloadingHandler.transfer_async:expanded job_id=%s "
+            "direction=%s src_sub_blocks=%s dst_sub_blocks=%s "
+            "dst_sub_blocks_to_skip=%s",
+            job_id,
+            "NPU->CPU" if is_d2h else "CPU->NPU",
+            kv_ids_summary(src_block_ids),
+            kv_ids_summary(dst_block_ids),
+            dst_sub_blocks_to_skip,
         )
 
         # Build flat pointer arrays for all sub-tensors × all block pairs.
@@ -226,6 +279,20 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
                 num_bytes=src_sub_block_count * self._total_bytes_per_block,
             )
         )
+        kv_debug_log(
+            logger,
+            "CpuNpuOffloadingHandler.transfer_async:queued job_id=%s "
+            "direction=%s num_pairs=%s num_sub_tensors=%s total_copies=%s "
+            "num_bytes=%s pending_d2h=%s pending_h2d=%s",
+            job_id,
+            "NPU->CPU" if is_d2h else "CPU->NPU",
+            num_pairs,
+            num_sub_tensors,
+            total,
+            src_sub_block_count * self._total_bytes_per_block,
+            len(self._d2h_transfers),
+            len(self._h2d_transfers),
+        )
 
         return True
 
@@ -247,6 +314,16 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
                         transfer_type=transfer_type,
                     )
                 )
+                kv_debug_log(
+                    logger,
+                    "CpuNpuOffloadingHandler.get_finished: job_id=%s "
+                    "direction=%s->%s bytes=%s time_sec=%.6f",
+                    transfer.job_id,
+                    transfer_type[0],
+                    transfer_type[1],
+                    transfer.num_bytes,
+                    transfer_time,
+                )
                 self._recycle_event(transfer.start_event)
                 self._recycle_event(transfer.end_event)
         return results
@@ -258,4 +335,9 @@ class CpuNpuOffloadingHandler(OffloadingHandler):
         for transfers in (self._d2h_transfers, self._h2d_transfers):
             for transfer in transfers:
                 if transfer.job_id in job_ids:
+                    kv_debug_log(
+                        logger,
+                        "CpuNpuOffloadingHandler.wait: job_id=%s",
+                        transfer.job_id,
+                    )
                     transfer.end_event.synchronize()

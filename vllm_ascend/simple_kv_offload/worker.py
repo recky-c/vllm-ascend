@@ -30,6 +30,7 @@ from vllm.logger import logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.simple_kv_offload.worker import SimpleCPUOffloadWorker
 
+from vllm_ascend.kv_debug import kv_debug_log, kv_tensor_summary
 from vllm_ascend.simple_kv_offload.copy_backend import NPUDmaCopyBackend
 
 if TYPE_CHECKING:
@@ -89,6 +90,14 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
 
         first_tensor = _flatten_kv_value(next(iter(kv_caches.values())))[0]
         self.device = first_tensor.device
+        kv_debug_log(
+            logger,
+            "SimpleCPUOffloadNPUWorker.register_kv_caches:start "
+            "layers=%s first_tensor=%s cpu_capacity_bytes=%s",
+            list(kv_caches.keys()),
+            kv_tensor_summary(first_tensor),
+            self.cpu_capacity_bytes,
+        )
 
         assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
@@ -110,6 +119,14 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
 
                 key = layer_name if sub_idx == 0 else f"{layer_name}.{sub_idx}"
                 unique_caches.update(self._build_block_views(key, tensor, num_blocks))
+                kv_debug_log(
+                    logger,
+                    "SimpleCPUOffloadNPUWorker.register_kv_caches:unique "
+                    "key=%s ptr=%s tensor=%s",
+                    key,
+                    ptr,
+                    kv_tensor_summary(tensor),
+                )
 
         per_tensor_bpb = [t.stride(0) * t.element_size() for t in unique_caches.values()]
         total_bytes_per_block = sum(per_tensor_bpb)
@@ -135,6 +152,17 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
             )
             for name, t in unique_caches.items()
         }
+        kv_debug_log(
+            logger,
+            "SimpleCPUOffloadNPUWorker.register_kv_caches:allocated "
+            "num_cpu_blocks=%s total_bytes_per_block=%s cpu_caches=%s",
+            self.num_cpu_blocks,
+            total_bytes_per_block,
+            {
+                name: kv_tensor_summary(tensor)
+                for name, tensor in self.cpu_kv_caches.items()
+            },
+        )
 
         # Upstream creates these with the lowest CUDA priority so KV I/O
         # yields to compute on the default stream. ``torch.npu`` does
@@ -193,7 +221,16 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
             raw = torch.empty(0, dtype=torch.int8, device=tensor.device).set_(
                 storage, storage_offset_bytes, (data_bytes,)
             )
-            return {key: raw.view(num_blocks, page_size_bytes)}
+            result = {key: raw.view(num_blocks, page_size_bytes)}
+            kv_debug_log(
+                logger,
+                "SimpleCPUOffloadNPUWorker._build_block_views:single "
+                "key=%s page_size_bytes=%s view=%s",
+                key,
+                page_size_bytes,
+                kv_tensor_summary(result[key]),
+            )
+            return result
 
         # Multi-segment: ``(N, num_blocks, ...)`` is the only NPU layout
         # observed (N=2 for K|V stacked). We assume a single outer
@@ -221,4 +258,13 @@ class SimpleCPUOffloadNPUWorker(SimpleCPUOffloadWorker):
             start = idx * seg_stride_bytes
             chunk = raw[start : start + seg_data_bytes]
             segs[f"{key}.{idx}"] = chunk.view(num_blocks, seg_page_size_bytes)
+        kv_debug_log(
+            logger,
+            "SimpleCPUOffloadNPUWorker._build_block_views:multi key=%s "
+            "n_segments=%s seg_page_size_bytes=%s views=%s",
+            key,
+            n_segments,
+            seg_page_size_bytes,
+            {name: kv_tensor_summary(tensor) for name, tensor in segs.items()},
+        )
         return segs
