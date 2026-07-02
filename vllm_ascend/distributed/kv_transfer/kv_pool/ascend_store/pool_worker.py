@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import importlib
 import math
-import os
 import threading
-from typing import Optional
 from collections.abc import Generator
+from typing import Any
 
-import numpy as np
 import torch
-from torch.utils.cpp_extension import load
-import torch_npu
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pcp_group,
@@ -19,7 +16,6 @@ from vllm.distributed import (
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -27,115 +23,62 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.utils import CpuGpuBuffer
-from zbal import zbal_init, zbal_uninit, empty_tensor, batch_copy, zbal_h2d_init
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
+    backend_map,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
     ChunkedTokenDatabase,
     KeyMetadata,
+    LayerBlockRange,
+    LayerLoadTask,
     LayerMultiBlockReqMeta,
+    LayerTransferTask,
     ReqMeta,
     get_block_hashes,
     get_cache_family_granularity,
     infer_group_cache_families,
-    PoolKey,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    KVCacheStoreKeyLayerRecvingThread,
+    KVCacheStoreKeyLayerSendingThread,
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
+    _circular_shift,
     record_failed_blocks,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layer_load_start_block,
+    get_layerwise_config,
 )
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
-
-backend_map = {
-    "mooncake": {
-        "name": "MooncakeBackend",
-        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend",
-    },
-    "memcache": {
-        "name": "MemcacheBackend",
-        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend",
-    },
-    "yuanrong": {
-        "name": "YuanrongBackend",
-        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend",
-    },
-}
-
-_SUBSCRIBED_COMPUTE_STREAMS = set()
-def get_subscribed_compute_streams() -> set:
-    return _SUBSCRIBED_COMPUTE_STREAMS
-
-
-def _is_current_stream_capturing() -> bool:
-    for npu_runtime in (getattr(torch_npu, "npu", None), getattr(torch, "npu", None)):
-        if npu_runtime is None:
-            continue
-        for attr_name in ("is_current_stream_capturing", "_is_current_stream_capturing"):
-            capture_state = getattr(npu_runtime, attr_name, None)
-            if not callable(capture_state):
-                continue
-            try:
-                if bool(capture_state()):
-                    return True
-            except Exception:
-                continue
-    return False
-
-
-# cpu sparse attn kernel related
-# TODO maybe implement this in vllm custom op framework
-os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
-# cache_dir = "/root/.cache/torch_extensions/py311_cpu/cpu_sparse_attn"
-# if os.path.exists(cache_dir):
-#     shutil.rmtree(cache_dir)
-#     print(f"已清理缓存目录: {cache_dir}")
-ascend_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
-npu_include_path = os.path.join(ascend_home, "include")
-npu_lib_path = os.path.join(ascend_home, "lib64")
-if not os.path.exists(npu_lib_path):
-    npu_lib_path = os.path.join(ascend_home, "lib")
-torch_npu_path = os.path.dirname(torch_npu.__file__)
-torch_npu_include = os.path.join(torch_npu_path, "include")
-torch_npu_lib_path = os.path.join(torch_npu_path, "lib")
-os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
-os.environ['CXX'] = 'clang++'
-os.environ['CC'] = 'clang'
-abs_path = os.path.dirname(os.path.abspath(__file__))
-src_path = os.path.join(abs_path, "cpu_sparse_attn.cpp")
-logger.info(f'>>>>> load cpu_sparse_attn from src: {src_path}')
-cpu_sparse_attn = None
-cpu_sparse_attn = load(
-    name="cpu_sparse_attn",
-    sources=[src_path],
-    extra_cflags=[
-        "-O3",
-        "-std=c++20",
-        "-fopenmp",
-        "-march=armv8.2-a+sve+fp16+bf16",
-        # "-march=native",
-        "-fPIC",
-        f"-I{npu_include_path}",
-        f"-I{torch_npu_include}",
-    ],
-    extra_ldflags=[
-        "-fopenmp",
-        f"-L{npu_lib_path}",
-        "-lascendcl",
-        f"-L{torch_npu_lib_path}",
-        "-ltorch_npu",
-    ],
-    verbose=True,  # 添加 verbose 查看编译过程
+from vllm_ascend.memcache_comm_fence import (
+    get_attention_compute_start_gate,
+    reset_attention_compute_start_gate,
 )
+
+# Shared per-layer transfer-finished events. Created by the mooncake
+# PD-disaggregation send thread (when it runs) and consumed by the ascend_store
+# save thread to wait for each layer's PD transfer to finish. When mooncake is
+# not running, these stay None and the save thread skips the PD wait.
+_shared_layer_transfer_events: list[threading.Event] | None = None
+
+
+def get_shared_layer_transfer_events() -> list[threading.Event] | None:
+    return _shared_layer_transfer_events
+
+
+def set_shared_layer_transfer_events(events: list[threading.Event] | None) -> None:
+    global _shared_layer_transfer_events
+    _shared_layer_transfer_events = events
 
 
 class KVPoolWorker:
@@ -144,11 +87,12 @@ class KVPoolWorker:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        use_layerwize: bool,
+        use_layerwise: bool,
         kv_cache_config: KVCacheConfig | None = None,
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.kv_cache_config = kv_cache_config
         hf_text_config = getattr(model_config, "hf_text_config", None)
         hf_config = getattr(model_config, "hf_config", hf_text_config)
@@ -158,11 +102,24 @@ class KVPoolWorker:
             self.compress_ratios = getattr(hf_config, "compress_ratios", None)
         self.use_compress = self.compress_ratios is not None
         self.dp_rank = parallel_config.data_parallel_rank
+
+        self._init_parallelism_info(model_config, parallel_config)
+        self._init_kv_transfer_config(vllm_config, extra_config, use_layerwise, kv_cache_config)
+        self._init_key_head_config(model_config, parallel_config)
+        self._init_metadata(model_config, vllm_config, extra_config)
+        self._init_backend(parallel_config, extra_config)
+        self._init_kv_events(vllm_config)
+        self._init_state_vars()
+        self._init_layerwise_config()
+
+    def _init_parallelism_info(self, model_config, parallel_config) -> None:
+        self.local_rank = envs.LOCAL_RANK
+
         self.use_mla = False
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
             self.use_mla = True
         self.use_sparse = hasattr(model_config.hf_text_config, "index_topk")
-        self.use_layerwise = use_layerwize
+
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -172,17 +129,18 @@ class KVPoolWorker:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
-        ascend_config = get_ascend_config()
-        self.use_offload = ascend_config.use_offload
 
+    def _init_kv_transfer_config(self, vllm_config, extra_config, use_layerwise, kv_cache_config) -> None:
+        self._extra_config = extra_config
+        self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
+        self.load_async = extra_config.get("load_async", False)
         self._invalid_block_ids: set[int] = set()
         self._invalid_block_ids_lock = threading.Lock()
-        self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "consumer_is_to_put", False
-        )
-        self.backend = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
+        self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
+        self.backend = extra_config.get("backend", "mooncake")
+        self.backend_name = self.backend.lower()
+        self.use_gva_layerwise = self.use_layerwise and self.backend_name == "memcache"
         self.use_hybrid = self._uses_hybrid_kv_cache(vllm_config, kv_cache_config)
         self.use_mamba = self._uses_mamba_kv_cache(self.use_hybrid, kv_cache_config)
         self.original_block_size = self._infer_group_block_sizes(vllm_config, kv_cache_config)
@@ -196,14 +154,17 @@ class KVPoolWorker:
         ) * cp_scale
         for group_block_size in self.grouped_block_size:
             assert group_block_size % self.hash_block_size == 0, "block_size must be divisible by hash_block_size"
-        self.block_size = self.grouped_block_size[0] if not self.use_offload else self.grouped_block_size[-1]
+        self.block_size = self.grouped_block_size[0]
         self.lcm_block_size = math.lcm(*self.grouped_block_size)
         self.num_kv_cache_groups = len(self.grouped_block_size)
         self.kv_cache_group_families = self._infer_group_families()
         self.group_uses_align_state = self._infer_group_uses_align_state()
         self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
-        if self.use_layerwise and self.num_kv_cache_groups > 1 and not self.use_offload:
+        if self.use_layerwise and self.num_kv_cache_groups > 1:
             raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
+        self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
+        self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
+        self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -213,8 +174,9 @@ class KVPoolWorker:
             self.hash_block_size,
             self.lcm_block_size,
         )
+
+    def _init_key_head_config(self, model_config, parallel_config) -> None:
         self.current_layer = 0
-        self.current_layer_load = 0
         self.num_layers = model_config.get_num_layers(parallel_config)
 
         if self.use_mla:
@@ -228,14 +190,19 @@ class KVPoolWorker:
         else:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
+        self.my_key_index = (
+            self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step)
+            + self.dcp_rank * (self.tp_size // self.put_step)
+            + self.head_or_tp_rank
+        )
+        self.num_ranks_per_layer = self.pcp_size * self.dcp_size * (self.tp_size // self.put_step)
 
+    def _init_metadata(self, model_config, vllm_config, extra_config) -> None:
         partitions = None
         if self.kv_role == "kv_consumer" and self.consumer_is_to_put:
             num_hidden_layers = model_config.hf_text_config.num_hidden_layers
-            partition_list_str = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-                "prefill_pp_layer_partition", None
-            )
-            prefill_pp_size = int(vllm_config.kv_transfer_config.kv_connector_extra_config.get("prefill_pp_size", 1))
+            partition_list_str = extra_config.get("prefill_pp_layer_partition", None)
+            prefill_pp_size = int(extra_config.get("prefill_pp_size", 1))
 
             if partition_list_str is not None:
                 try:
@@ -273,6 +240,7 @@ class KVPoolWorker:
             self.metadata, self.grouped_block_size, partitions, self.use_hybrid, self.hash_block_size
         )
 
+    def _init_backend(self, parallel_config, extra_config) -> None:
         backend = backend_map.get(self.backend.lower())
         assert backend is not None
         backend_path = backend.get("path")
@@ -281,58 +249,168 @@ class KVPoolWorker:
         backend_module = importlib.import_module(backend_path)
         real_backend = getattr(backend_module, backend_name)
 
-        backend_kwargs = {}
-        if self.backend.lower() in {"mooncake", "memcache"}:
-            # DSV4 exposes compress_ratios; only use lazy store init for this
-            # compressed-model path.
-            backend_kwargs["lazy_init"] = self.use_compress
-        self.m_store = real_backend(  # type: ignore[misc]
-            parallel_config,
-            **backend_kwargs,
-        )
+        if self.backend.lower() == "memcache":
+            self.m_store = real_backend(  # type: ignore[misc]
+                parallel_config,
+                lazy_init=True,
+            )
+        else:
+            backend_kwargs = {}
+            if self.backend.lower() == "mooncake":
+                backend_kwargs["lazy_init"] = self.use_compress
+            self.m_store = real_backend(  # type: ignore[misc]
+                parallel_config,
+                **backend_kwargs,
+            )
+
+    def _init_kv_events(self, vllm_config) -> None:
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = False
         if kv_event_config and kv_event_config.enable_kv_cache_events:
             self.enable_kv_events = True
 
+    def _init_state_vars(self) -> None:
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
+        self._transfer_threads_started = False
 
-        self.finished_store_req: set[str] = set()
+    def _init_layerwise_config(self) -> None:
+        self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
+        self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
+        self.layer_load_finished_events: list[threading.Event] | None = None
+        self.layer_save_finished_events: list[threading.Event] | None = None
+        self.layer_transfer_finished_events: list[threading.Event] | None = None
 
-        # dsa offload related
-        self.layer_save_tasks = [[] for _ in range(self.num_layers)]
-        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
-        lru_resident_config = ascend_config.lru_resident_cache_config
-        self.lru_resident_enabled = self.use_offload and lru_resident_config.enabled
-        self.sfa_sparse_topk = lru_resident_config.topk
-        self.lru_resident_capacity = (
-            lru_resident_config.buffer_size if self.lru_resident_enabled else self.sfa_sparse_topk
+        layerwise_config = get_layerwise_config(
+            self.num_layers,
+            self._extra_config,
         )
-        self.topk = self.lru_resident_capacity
-        head_num = 1
-        head_dim_k = 512
-        head_dim_v = 64
-        dtype = torch.bfloat16
-        self.token_size_bytes_k = head_num * head_dim_k * dtype.itemsize
-        self.token_size_bytes_v = head_num * head_dim_v * dtype.itemsize
-        max_model_len = vllm_config.model_config.max_model_len
-        self.max_model_len = max_model_len
-        max_block_num = cdiv(max_model_len, self.block_size)
-        self.cpu_block_table = CpuGpuBuffer(self.max_num_reqs, max_block_num, dtype=torch.int32, device='npu', pin_memory=True)
-        self.cpu_block_table_host_buffer = torch.zeros([self.max_num_reqs, max_block_num], dtype=torch.int32, device='cpu', pin_memory=True)
-        self.actual_seq_len_q = torch.arange(self.max_num_reqs, dtype=torch.int32, device='cpu', pin_memory=True) + 1
-        self.req_ids = []
+        self.layerwise_offload = layerwise_config.has_layer_reuse
+        self.num_prefetch_layers = layerwise_config.num_prefetch_layers
+        self.independent_layers = layerwise_config.independent_layers
+        self.prefetch_layer_map = layerwise_config.prefetch_layer_map
 
-        self.cpu_sparse_attn = cpu_sparse_attn
+        self.next_layer_to_submit = 0
+        self.sync_save_events: list[torch.npu.Event] | None = None
 
-        self.load_stream = None
-        self.load_stream = torch_npu.npu.Stream()
-        self.save_stream = None
-        self.side_compute_stream = torch_npu.npu.Stream()
-        self.kv_cache_config.num_blocks
-        allocate_dram_size = 32 * 1024 * 1024 * 1024 # 32GB, TODO get from config
-        zbal_h2d_init(allocate_dram_size, self.max_num_reqs * self.topk * 2)
+    def _start_kv_transfer_threads(self) -> None:
+        if self._transfer_threads_started:
+            return
+
+        if self.use_layerwise:
+            self.get_event = threading.Event()
+            self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
+            self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
+            self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
+            if self.use_gva_layerwise and self.kv_role in ["kv_producer", "kv_both"]:
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = KVCacheStoreLayerSendingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.put_step,
+                    self.my_key_index,
+                    self.num_ranks_per_layer,
+                    self.page_size_bytes,
+                    ready_event_sending,
+                    self.num_layers,
+                    self.layer_save_finished_events,
+                    self.sync_save_events,
+                    self.layerwise_max_transfer_blocks,
+                    self.layerwise_max_transfer_bytes,
+                    layer_transfer_finished_events=get_shared_layer_transfer_events(),
+                )
+                self.kv_send_thread.start()
+                ready_event_sending.wait()
+            elif self.kv_role in ["kv_producer", "kv_both"]:
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = KVCacheStoreKeyLayerSendingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.put_step,
+                    ready_event_sending,
+                    self.num_layers,
+                    self.layer_save_finished_events,
+                    self.sync_save_events,
+                )
+                self.kv_send_thread.start()
+                ready_event_sending.wait()
+            ready_event = threading.Event()
+            if self.use_gva_layerwise:
+                self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.my_key_index,
+                    self.num_ranks_per_layer,
+                    self.page_size_bytes,
+                    ready_event,
+                    self.get_event,
+                    self.layer_load_finished_events,
+                    self.layer_save_finished_events,
+                    self.num_layers,
+                    self.h2d_stagger_us,
+                    self.layerwise_max_transfer_blocks,
+                    self.layerwise_max_transfer_bytes,
+                )
+            else:
+                self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    ready_event,
+                    self.get_event,
+                    self.layer_load_finished_events,
+                    self.layer_save_finished_events,
+                    self.num_layers,
+                )
+            self.kv_recv_thread.start()
+            ready_event.wait()
+        else:
+            if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put:
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = KVCacheStoreSendingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.put_step,
+                    self.kv_role,
+                    ready_event_sending,
+                    self.group_uses_align_state,
+                    self.enable_kv_events,
+                )
+                self.kv_send_thread.start()
+                ready_event_sending.wait()
+            if self.load_async:
+                ready_event = threading.Event()
+                self.kv_recv_thread = KVCacheStoreRecvingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    ready_event,
+                )
+                self.kv_recv_thread.start()
+                ready_event.wait()
+        self._transfer_threads_started = True
 
     def _infer_group_families(self) -> list[str]:
         kv_cache_groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
@@ -451,25 +529,6 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_num_layers[group_id] = len(layer_names)
 
-    def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
-        """
-        In hybrid scenario, where a KVCacheTensor is shared by multiple layers,
-        but sometimes, layers cannot be evenly distributed among multiple groups,
-        the layers sharing the KVCacheTensor may not completely occupy all the space of the KVCacheTensor.
-        This results in the calculated start address not being the previously aligned address.
-        Therefore, we down-align the start address to meet the 2MB alignment requirement.
-        """
-        if not self.use_hybrid:
-            return
-        alignment = 2 * 1024 * 1024
-        for storage_key in registered_regions:
-            start, end = registered_regions[storage_key]
-            new_start = start // alignment * alignment
-            # Because the addresses of raw tensors are aligned to 2MB,
-            # all shared sub-tensors, when aligned downwards, should theoretically not exceed the address bounds.
-            assert new_start >= storage_key, "invalid kv cache tensor, raw tensor ptr must be align to 2MB"
-            registered_regions[storage_key] = (new_start, end)
-
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
@@ -479,6 +538,14 @@ class KVPoolWorker:
             self.kv_cache_config.num_blocks if self.kv_cache_config is not None else first_kv_cache.shape[0]
         )
         logger.info("num_blocks: %s", self.num_blocks)
+        self.block_len = []
+        self.block_stride = []
+        for cache in first_kv_cache_tuple:
+            block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+            logger.info("block_shape: %s", cache.shape[1:])
+            self.block_len.append(block_len)
+            self.block_stride.append(block_stride)
+
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
@@ -496,8 +563,8 @@ class KVPoolWorker:
             first_kv_cache.shape,
         )
 
-        """
-        # Not used for DSA offload, TODO move to a new dsa offload connector/scheduler/worker
+        self.kv_caches_base_addr = []
+
         registered_regions: dict[int, tuple[int, int]] = {}
         for cache_or_caches in kv_caches.values():
             for cache in self._as_cache_tuple(cache_or_caches):
@@ -505,6 +572,7 @@ class KVPoolWorker:
                 _, _, region_len, _ = self._get_cache_block_metadata(cache)
                 if not isinstance(region_len, int):
                     region_len = 0
+                self.kv_caches_base_addr.append(base_addr)
                 storage_key = self._get_storage_key(cache)
                 start = base_addr
                 end = base_addr + region_len
@@ -514,7 +582,6 @@ class KVPoolWorker:
                 else:
                     registered_regions[storage_key] = (start, end)
 
-        self._align_kv_ptrs(registered_regions)
         ptrs = [start for start, _ in registered_regions.values()]
         lengths = [end - start for start, end in registered_regions.values()]
 
@@ -524,7 +591,7 @@ class KVPoolWorker:
         else:
             self._infer_cache_group_metadata(0, list(kv_caches.keys()))
 
-        self.m_store.register_buffer(ptrs, lengths)
+        self.page_size_bytes = sum(self.block_len)
         self.token_database.set_group_buffers(
             self.group_kv_caches_base_addr,
             self.group_block_len,
@@ -533,210 +600,25 @@ class KVPoolWorker:
             group_cache_families=self.group_kv_cache_families,
             group_num_layers=self.group_num_layers,
         )
-        """
-
-        if self.use_layerwise:
-            self.get_event = threading.Event()
-            self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
-            if self.kv_role in ["kv_producer", "kv_both"]:
-                ready_event_sending = threading.Event()
-                self.kv_send_thread = KVCacheStoreLayerSendingThread(
-                    self.m_store,
-                    self.token_database,
-                    self.grouped_block_size,
-                    self.tp_rank,
-                    self.dcp_size,
-                    self.put_step,
-                    ready_event_sending,
-                    self.num_layers,
-                    self.enable_kv_events,
-                    self.layer_save_finished_events,
-                )
-                self.kv_send_thread.start()
-            ready_event = threading.Event()
-            self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
-                self.m_store,
-                self.token_database,
-                self.grouped_block_size,
-                self.tp_rank,
-                self.dcp_size,
-                ready_event,
-                self.get_event,
-                self._invalid_block_ids,
-                self._invalid_block_ids_lock,
-            )
-            self.kv_recv_thread.start()
-            ready_event.wait()
-        else:
-            if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put:
-                ready_event_sending = threading.Event()
-                self.kv_send_thread = KVCacheStoreSendingThread(
-                    self.m_store,
-                    self.token_database,
-                    self.grouped_block_size,
-                    self.tp_rank,
-                    self.dcp_size,
-                    self.put_step,
-                    self.kv_role,
-                    ready_event_sending,
-                    self.group_uses_align_state,
-                    self.enable_kv_events,
-                )
-                self.kv_send_thread.start()
-            if self.load_async:
-                ready_event = threading.Event()
-                self.kv_recv_thread = KVCacheStoreRecvingThread(
-                    self.m_store,
-                    self.token_database,
-                    self.grouped_block_size,
-                    self.tp_rank,
-                    self.dcp_size,
-                    ready_event,
-                    self._invalid_block_ids,
-                    self._invalid_block_ids_lock,
-                )
-                self.kv_recv_thread.start()
-                ready_event.wait()
-
-        if self.use_sparse and self.use_offload:
-            self.k_caches_npu: list[torch.Tensor] = []
-            self.v_caches_npu: list[torch.Tensor] = []
-            self.topk_buffers_k: list[torch.Tensor] = []
-            self.topk_buffers_v: list[torch.Tensor] = []
-            for cache_or_caches in kv_caches.values():
-                assert len(cache_or_caches) == 5
-                self.k_caches_npu.append(cache_or_caches[0])
-                self.v_caches_npu.append(cache_or_caches[1])
-                self.topk_buffers_k.append(cache_or_caches[3])
-                self.topk_buffers_v.append(cache_or_caches[4])
-            self.topk_indices_buffer_cpu = torch.empty([self.max_num_reqs, self.topk], dtype=torch.int32, device='cpu', pin_memory=True)
-            self.onload_topk_buffer_k_npu = torch.empty([self.max_num_reqs, self.topk, 1, 512], dtype=torch.bfloat16, device='npu')
-            self.onload_topk_buffer_v_npu = torch.empty([self.max_num_reqs, self.topk, 1, 64], dtype=torch.bfloat16, device='npu')
-            self.onload_topk_buffer_k_cpu = torch.empty([self.max_num_reqs, self.topk, 1, 512], dtype=torch.bfloat16, device='cpu', pin_memory=True)
-            self.onload_topk_buffer_v_cpu = torch.empty([self.max_num_reqs, self.topk, 1, 64], dtype=torch.bfloat16, device='cpu', pin_memory=True)
-
-            npu_block_num = self.num_blocks
-            # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
-            # but you may want to set this to 1 in debug case in case of allocating to much dram
-            # TODO remove this and directly compute from model config before merge
-            cpu_block_num_multiple = 4
-            cpu_block_num = npu_block_num * cpu_block_num_multiple
-            cpu_cache_size_single_card = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
-            logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size_single_card / 1024 / 1024 / 1024} GB per rank')
-            self.k_caches_cpu: list[torch.Tensor] = [empty_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
-            self.v_caches_cpu: list[torch.Tensor] = [empty_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
-
-            # sparse h2d
-            self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
-            self.addr_v_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_v]
-            self.gvas_k_bases: list[int] = [t.data_ptr() for t in self.k_caches_cpu]
-            self.gvas_v_bases: list[int] = [t.data_ptr() for t in self.v_caches_cpu]
-            self.gvas_buffer = torch.zeros([self.max_num_reqs * self.topk * 2], dtype=torch.int64, device='cpu')
-            self.addr_buffer = torch.zeros([self.max_num_reqs * self.topk * 2], dtype=torch.int64, device='cpu')
-            self.size_buffer = torch.zeros([self.max_num_reqs * self.topk * 2], dtype=torch.int32, device='cpu')
-            self.lru_workspace_threads = 8
-            self.lru_topk_indices_cpu = torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_slot_to_token_cpu = torch.empty(
-                [self.max_num_reqs, self.lru_resident_capacity],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_slots_cpu = torch.empty(
-                [self.max_num_reqs, self.lru_resident_capacity],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_current_slots_cpu = torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_miss_count_cpu = torch.empty(
-                [self.max_num_reqs],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_miss_tokens_cpu = torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_miss_slots_cpu = torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_req_ids_cpu = torch.empty([self.max_num_reqs], dtype=torch.int64, device='cpu', pin_memory=True)
-            self.lru_last_req_ids_cpu = torch.empty(
-                [self.max_num_reqs],
-                dtype=torch.int64,
-                device='cpu',
-                pin_memory=True,
-            )
-            self.lru_token_mark_workspace = torch.zeros(
-                [self.lru_workspace_threads, self.max_model_len],
-                dtype=torch.int32,
-                device='cpu',
-            )
-            self.lru_token_pos_workspace = torch.full(
-                [self.lru_workspace_threads, self.max_model_len],
-                -1,
-                dtype=torch.int32,
-                device='cpu',
-            )
-            self.lru_slot_workspace = torch.empty(
-                [self.lru_workspace_threads, self.lru_resident_capacity * 3],
-                dtype=torch.int32,
-                device='cpu',
-            )
-            self.lru_miss_position_workspace = torch.empty(
-                [self.lru_workspace_threads, self.sfa_sparse_topk],
-                dtype=torch.int32,
-                device='cpu',
-            )
-            self.lru_epochs = torch.zeros([self.lru_workspace_threads], dtype=torch.int32, device='cpu')
+        # Initialize store, register buffers, and start transfer threads
+        # directly here (like main) — no separate init_backend handshake.
+        if hasattr(self.m_store, "init_store"):
+            self.m_store.init_store()
+        self.m_store.register_buffer(ptrs, lengths)
+        self._start_kv_transfer_threads()
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
-        # return
         self.current_layer = 0
-        self.current_layer_load = 0
-        req_id_to_block_ids: dict[str, list[int]] = {}
-        for layer_save_task in self.layer_save_tasks:
-            layer_save_task.clear()
-        for request in metadata.requests:
-            req_id_to_block_ids[request.req_id] = request.block_ids_cpu
-            if not request.need_save:
-                continue # no new blocks to save
-            self.process_layer_data(request)
-        self.num_save_tasks = len(self.layer_save_tasks[0])
-        if self.tp_rank == 0:
-            logger.info(f'>>>>> start load kv, reqs num: {len(metadata.requests)}, save task num = {len(self.layer_save_tasks[0])}')
-
-        # generate block_table for load
-        # NOTE reqs in self.req_ids and metadata.requests may not be in same order,
-        # use reqs from self.req_ids (order of actual batch) to compute block_table.
-        num_reqs = len(self.req_ids)
-        cpu_block_table_np = self.cpu_block_table.np[:num_reqs]
-        cpu_block_table_np.fill(0)
-        for i, req_id in enumerate(self.req_ids[:num_reqs]):
-            cpu_block_ids = req_id_to_block_ids[req_id]
-            cpu_block_table_np[i][:len(cpu_block_ids)] = np.array([cpu_block_ids], dtype=np.int32)
-        self.cpu_block_table.copy_to_gpu(num_reqs)
-        return
-        self.current_layer = 0
-        self.layerwise_retrievers = []
+        self.layerwise_retrievers: list[Any] = []
+        if self.use_layerwise:
+            self.next_layer_to_submit = 0
+            reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
+        if len(metadata.requests) == 0:
+            return
+        if self.use_layerwise:
+            self.process_layer_data(metadata.requests)
+            return
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
@@ -752,10 +634,10 @@ class KVPoolWorker:
             if (load_spec.kvpool_cached_tokens % self.cache_transfer_granularity != 0) and (
                 load_spec.kvpool_cached_tokens == token_len - 1
             ):
-                token_len = request.load_spec.kvpool_cached_tokens + 1
+                token_len = load_spec.kvpool_cached_tokens + 1
             else:
-                token_len = request.load_spec.kvpool_cached_tokens
-            request.load_spec.token_len = token_len
+                token_len = load_spec.kvpool_cached_tokens
+            load_spec.token_len = token_len
             logger.debug(
                 "KV pool worker prepare get req=%s token_len_chunk=%d get_token_len=%d "
                 "vllm_cached=%d kvpool_cached=%d groups=%s load_async=%s",
@@ -767,113 +649,236 @@ class KVPoolWorker:
                 load_group_ids,
                 self.load_async,
             )
-            if self.use_layerwise:
-                layerwise_retriever = self.retrieve_layer(request)
-                next(layerwise_retriever)  # first layer load
-                self.layerwise_retrievers.append(layerwise_retriever)
+            if self.load_async:
+                self.kv_recv_thread.add_request(  # type: ignore[union-attr]
+                    request,
+                )
+                continue
+
+            addr_list = []
+            size_list = []
+            key_list = []
+            block_id_list: list[int] = []
+            for group_id in load_group_ids:
+                block_ids = request.block_ids_by_group[group_id]
+                group_block_size = self.grouped_block_size[group_id]
+                mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
+                skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
+                for start, end, key, _ in self.token_database.process_tokens_with_block_ids(
+                    token_len,
+                    request.block_hashes,
+                    block_ids,
+                    mask_num,
+                    kv_cache_group_id=group_id,
+                    skip_null_blocks=skip_null,
+                ):
+                    addr, size, block_id = self.token_database.prepare_value(
+                        start,
+                        end,
+                        block_ids,
+                        kv_cache_group_id=group_id,
+                    )
+                    key_list.append(key.to_string())
+                    addr_list.append(addr)
+                    size_list.append(size)
+                    block_id_list.append(block_id)
+            if not key_list:
+                continue
+            key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
+            addr_list_c = _circular_shift(addr_list, self.tp_rank % len(addr_list))
+            size_list_c = _circular_shift(size_list, self.tp_rank % len(size_list))
+            block_id_list_c = _circular_shift(block_id_list, self.tp_rank % len(block_id_list))
+            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if ret is not None and any(r != 0 for r in ret):
+                missing_block_ids = record_failed_blocks(block_id_list_c, ret)
+                self._invalid_block_ids.update(missing_block_ids)
+            elif ret is None:
+                missing_block_ids = record_failed_blocks(block_id_list_c, [1] * len(block_id_list_c))
+                self._invalid_block_ids.update(missing_block_ids)
+
+    def _process_save_for_layer_batch(
+        self,
+        requests: list[ReqMeta],
+        layer_id: int,
+    ) -> None:
+        request_block_ranges = []
+        for request in requests:
+            if request.can_save is None or not request.can_save:
+                continue
+            save_start_block = request.save_start_token // self.block_size
+            save_end_block = request.save_end_token // self.block_size
+            if save_start_block >= save_end_block and request.partial_block_index is None:
+                continue
+            partial_block_index = request.partial_block_index
+            request_block_ranges.append(
+                LayerBlockRange(
+                    request=request,
+                    start_block=save_start_block,
+                    end_block=save_end_block,
+                    partial_block_index=partial_block_index,
+                )
+            )
+        if request_block_ranges:
+            self.layer_save_tasks[layer_id].append(
+                LayerTransferTask(
+                    layer_id=layer_id,
+                    block_ranges=request_block_ranges,
+                )
+            )
+
+    def _process_load_for_layer_batch(
+        self,
+        requests: list[ReqMeta],
+        layer_id: int,
+    ) -> None:
+        request_block_ranges = []
+        for request in requests:
+            if request.load_spec is None or not request.load_spec.can_load:
+                continue
+            cached_tokens = request.load_spec.kvpool_cached_tokens
+            load_start_block = get_layer_load_start_block(
+                layer_id,
+                self.independent_layers,
+                request.load_spec.vllm_cached_tokens,
+                self.block_size,
+                self.layerwise_offload,
+            )
+            cached_full_blocks = cached_tokens // self.block_size
+            full_blocks = min(cached_full_blocks, len(request.block_hashes))
+            needs_last_block_at_boundary = (
+                cached_tokens > 0 and cached_tokens % self.block_size == 0 and full_blocks < cached_full_blocks
+            )
+            if request.last_block_gva is not None and (
+                cached_tokens % self.block_size != 0 or needs_last_block_at_boundary
+            ):
+                partial_block_index = (
+                    cached_full_blocks if cached_tokens % self.block_size != 0 else cached_full_blocks - 1
+                )
             else:
-                if self.load_async:
-                    self.kv_recv_thread.add_request(  # type: ignore[union-attr]
-                        request,
-                    )
-                else:
-                    addr_list = []
-                    size_list = []
-                    key_list = []
-                    block_id_list: list[int] = []
-                    for group_id in load_group_ids:
-                        block_ids = request.block_ids_by_group[group_id]
-                        group_block_size = self.grouped_block_size[group_id]
-                        mask_num = request.load_spec.vllm_cached_tokens // group_block_size * group_block_size
-                        skip_null = (
-                            group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
-                        )
-                        for start, end, key, _ in self.token_database.process_tokens_with_block_ids(
-                            token_len,
-                            request.block_hashes,
-                            block_ids,
-                            mask_num,
-                            kv_cache_group_id=group_id,
-                            skip_null_blocks=skip_null,
-                        ):
-                            addr, size, block_id = self.token_database.prepare_value(
-                                start,
-                                end,
-                                block_ids,
-                                kv_cache_group_id=group_id,
-                            )
-                            key_list.append(key.to_string())
-                            addr_list.append(addr)
-                            size_list.append(size)
-                            block_id_list.append(block_id)
-                    if not key_list:
-                        continue
-                    key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
-                    addr_list_c = (
-                        addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
-                    )
-                    size_list_c = (
-                        size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
-                    )
-                    block_id_list_c = (
-                        block_id_list[self.tp_rank % len(block_id_list) :]
-                        + block_id_list[: self.tp_rank % len(block_id_list)]
-                    )
-                    logger.debug(
-                        "KV pool worker calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
-                        request.req_id,
-                        token_len,
-                        load_group_ids,
-                        len(key_list_c),
-                        key_list_c[:3],
-                    )
-                    ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
-                    if ret is not None and any(r != 0 for r in ret):
-                        missing_block_ids = record_failed_blocks(
-                            block_id_list_c,
-                            ret,
-                        )
-                        if len(request.block_ids_by_group) == 1:
-                            self._invalid_block_ids.update(missing_block_ids)
-                        elif missing_block_ids:
-                            logger.error(
-                                "KV load failed for hybrid request %s. "
-                                "Skip invalid-block fallback to avoid scheduler crash. "
-                                "failed_blocks=%s",
-                                request.req_id,
-                                missing_block_ids,
-                            )
-                    elif ret is None:
-                        missing_block_ids = record_failed_blocks(
-                            block_id_list_c,
-                            [1] * len(block_id_list_c),
-                        )
-                        if len(request.block_ids_by_group) == 1:
-                            self._invalid_block_ids.update(missing_block_ids)
-                        elif missing_block_ids:
-                            logger.error(
-                                "KV load failed for hybrid request %s. "
-                                "Skip invalid-block fallback to avoid scheduler crash. "
-                                "failed_blocks=%s",
-                                request.req_id,
-                                missing_block_ids,
-                            )
-                    logger.debug(
-                        "KV pool worker backend get returned request=%s token_len=%d groups=%s keys=%d",
-                        request.req_id,
-                        token_len,
-                        load_group_ids,
-                        len(key_list_c),
-                    )
+                partial_block_index = None
+            if partial_block_index is not None and partial_block_index < load_start_block:
+                partial_block_index = None
+            if load_start_block >= full_blocks and partial_block_index is None:
+                continue
+            request_block_ranges.append(
+                LayerBlockRange(
+                    request=request,
+                    start_block=load_start_block,
+                    end_block=full_blocks,
+                    partial_block_index=partial_block_index,
+                )
+            )
+        if request_block_ranges:
+            self.layer_load_tasks[layer_id].append(
+                LayerTransferTask(
+                    layer_id=layer_id,
+                    block_ranges=request_block_ranges,
+                )
+            )
+
+    def _build_shared_save_data(self) -> None:
+        """Build shared block data once and attach to all layer save tasks.
+
+        For GVA path (KVCacheStoreLayerSendingThread): pre-computes
+        SharedBlockData via LayerBatchBuilder.build_shared().
+
+        For Key path (KVCacheStoreKeyLayerSendingThread): pre-computes
+        cached process_tokens via build_cached_process_tokens().
+        """
+        # Find the first non-empty layer task (all have identical block_ranges)
+        first_task = None
+        for layer_id in range(self.num_layers):
+            if self.layer_save_tasks[layer_id]:
+                first_task = self.layer_save_tasks[layer_id][0]
+                break
+        if first_task is None:
+            return
+
+        if isinstance(self.kv_send_thread, KVCacheStoreLayerSendingThread):
+            shared = self.kv_send_thread.build_shared_data(first_task)
+            if shared is not None:
+                for layer_id in range(self.num_layers):
+                    for task in self.layer_save_tasks[layer_id]:
+                        task.shared_block_data = shared
+        elif isinstance(self.kv_send_thread, KVCacheStoreKeyLayerSendingThread):
+            cached = self.kv_send_thread.build_cached_process_tokens(first_task)
+            if cached is not None:
+                for layer_id in range(self.num_layers):
+                    for task in self.layer_save_tasks[layer_id]:
+                        task.cached_process_tokens = cached
+
+    def _build_shared_load_data(self) -> None:
+        """Build shared block data and attach to layer load tasks.
+
+        Block ranges may differ across layers under layer reuse (independent
+        layers load only the part beyond HBM, shared layers load from block
+        0), so build one SharedBlockData per distinct block-range shape and
+        reuse it, instead of forcing every layer through a single range.
+        """
+        if not isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread):
+            return
+        shared_by_range: dict = {}
+        for layer_id in range(self.num_layers):
+            for task in self.layer_load_tasks[layer_id]:
+                if not task.block_ranges:
+                    continue
+                key = tuple((br.start_block, br.end_block) for br in task.block_ranges)
+                if key not in shared_by_range:
+                    shared_by_range[key] = self.kv_recv_thread.build_shared_data(task)
+                task.shared_block_data = shared_by_range[key]
+
+    def process_layer_data(self, requests: list[ReqMeta]) -> None:
+        if not requests:
+            return
+        for layer_id in range(self.num_layers):
+            self._process_save_for_layer_batch(requests, layer_id)
+        self._build_shared_save_data()
+        for layer_id in range(self.num_layers):
+            self._process_load_for_layer_batch(requests, layer_id)
+        self._build_shared_load_data()
+
+    def _submit_ready_layer_loads(self) -> None:
+        assert self.kv_recv_thread is not None
+        recv_thread = self.kv_recv_thread
+
+        def submit_layer_load(layer_id: int) -> bool:
+            if not self.layer_load_tasks[layer_id]:
+                return False
+            wait_for_save_layer = None
+            attention_start_gate = None
+            if layer_id != self.current_layer:
+                attention_start_gate = get_attention_compute_start_gate()
+            recv_thread.add_request(
+                LayerLoadTask(  # type: ignore[arg-type]
+                    wait_for_save_layer=wait_for_save_layer,
+                    transfer_tasks=self.layer_load_tasks[layer_id],
+                    layer_id=layer_id,
+                    attention_start_gate=attention_start_gate,
+                )
+            )
+            return True
+
+        submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
+        submitted_layers = 0
+        while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
+            layer_id = self.next_layer_to_submit
+            self.next_layer_to_submit += 1
+            if submit_layer_load(layer_id):
+                submitted_layers += 1
 
     def wait_for_layer_load(self) -> None:
-        return
-        for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
-            if self.current_layer == self.num_layers - 1:
-                assert ret_token_mask is not None
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.debug("Retrieved %s tokens", num_retrieved_tokens)
+        assert self.layer_load_finished_events is not None
+        reset_attention_compute_start_gate()
+        self._submit_ready_layer_loads()
+        should_wait = bool(self.layer_load_tasks[self.current_layer])
+        if not should_wait:
+            self.layer_load_finished_events[self.current_layer].clear()
+            return
+        is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
+        if not is_finish:
+            logger.info("Layerwise %d load wait timed out", self.current_layer)
+        logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)
+        self.layer_load_finished_events[self.current_layer].clear()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:
@@ -881,75 +886,30 @@ class KVPoolWorker:
             self._invalid_block_ids.clear()
         return invalid_blocks
 
-    def save_cpu(self, args):
-        self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer])
-        self.current_layer += 1
-        if self.current_layer == self.num_layers:
-            self.current_layer = 0
-
-    def save_kv_offload(
-        self,
-        layer_name: str,
-        capturing: bool = False,
-    ):
-        current_compute_stream = torch_npu.npu.current_stream()
-        subscribed_compute_streams = get_subscribed_compute_streams()
-        if current_compute_stream not in subscribed_compute_streams:
-            torch_npu.npu._subscribe_report(current_compute_stream)
-            subscribed_compute_streams.add(current_compute_stream)
-
-        args = ()
-        if capturing:
-            torch_npu.npu._launch_host_func(
-                current_compute_stream,
-                self.save_cpu,
-                args,
-            )
-        else:
-            self.save_cpu(args)
-
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
-        if self.current_layer == 0:
-            self.layerwise_storers = []
-            current_event = None
-            for request in connector_metadata.requests:
-                can_save = request.can_save
-                if can_save is None or not can_save:
-                    continue
-                current_event = torch.npu.Event()
-                current_event.record()
-                break
-            for request in connector_metadata.requests:
-                can_save = request.can_save
-                if can_save is None or not can_save:
-                    continue
+        assert self.sync_save_events is not None
+        assert self.layer_save_finished_events is not None
+        assert self.kv_send_thread is not None
+        send_thread = self.kv_send_thread
+        self.sync_save_events[self.current_layer].record()
+        if self.layer_save_tasks[self.current_layer]:
+            for block_range in self.layer_save_tasks[self.current_layer][0].block_ranges:
+                send_thread.add_stored_request(block_range.request.req_id)
+            send_thread.add_request(self.layer_save_tasks[self.current_layer])  # type: ignore[arg-type]
+        else:
+            self.layer_save_finished_events[self.current_layer].set()
+        if self.current_layer == self.num_layers - 1:
+            is_finish = self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10)
+            if not is_finish:
+                logger.info("Layerwise %d save wait timed out", self.current_layer)
+            for layer_id in range(self.num_layers):
+                if self.layer_save_finished_events[layer_id].is_set():
+                    logger.debug(">>>>>>>>>>>>>>>>>>>> clear save layer %d", layer_id)
+                    self.layer_save_finished_events[layer_id].clear()
 
-                request.current_event = current_event
-                self.kv_send_thread.add_stored_request(  # type: ignore[union-attr]
-                    request.req_id
-                )
-                layerwise_storer = self.store_layer(request, current_event)
-                self.layerwise_storers.append(layerwise_storer)
-        for layerwise_storer in self.layerwise_storers:
-            try:
-                next(layerwise_storer)
-            except Exception:
-                raise
         self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
-        # return
-        if self.use_sparse and self.use_offload:
-            assert self.use_layerwise
-            if self.num_save_tasks == 0:
-                # no save tasks, no need to wait
-                return
-            for layer_id, event in enumerate(self.layer_save_finished_events):
-                is_finish = event.wait(timeout=1)
-                if not is_finish:
-                    logger.info(f'>>>>> layer {layer_id} wait for save timeout')
-                event.clear()
-            return
         current_event = None
         has_save_request = False
         for request in connector_metadata.requests:
@@ -1118,440 +1078,29 @@ class KVPoolWorker:
         else:
             for layer_id in range(self.num_layers):
                 yield
- 
-    def set_req_ids(self, req_ids: list):
-        self.req_ids = req_ids
-
-    def load_cpu_compact(self, args):
-        (
-            k_cache_cpu,
-            v_cache_cpu,
-            token_indices_cpu,
-            actual_seq_len_q,
-            cpu_block_table,
-            onload_topk_buffer_k_cpu,
-            onload_topk_buffer_v_cpu,
-            thread_num,
-        ) = args
-        self.cpu_sparse_attn.get_kv_topk(
-            k_cache_cpu.data_ptr(),
-            v_cache_cpu.data_ptr(),
-            token_indices_cpu.data_ptr(),
-            actual_seq_len_q.data_ptr(),
-            cpu_block_table.data_ptr(),
-            onload_topk_buffer_k_cpu.data_ptr(),
-            onload_topk_buffer_v_cpu.data_ptr(),
-            k_cache_cpu.shape,
-            v_cache_cpu.shape,
-            token_indices_cpu.shape,
-            actual_seq_len_q.shape,
-            cpu_block_table.shape,
-            onload_topk_buffer_k_cpu.shape,
-            onload_topk_buffer_v_cpu.shape,
-            thread_num,
-        )
-
-    def load_kv_token_wise_compact(
-        self,
-        layer_name: str,
-        num_reqs: int,
-        token_indices_npu: torch.tensor,
-        cpu_mask: torch.tensor,
-        capturing: bool = False,
-    ):
-        thread_num = 8
-        token_indices_cpu = self.topk_indices_buffer_cpu[:num_reqs]
-        # sparse_mask = torch.rand_like(token_indices_npu, dtype=torch.bfloat16) < 0.9
-        # token_indices_npu = torch.where(sparse_mask, -1, token_indices_npu)
-        token_indices_cpu.copy_(token_indices_npu, non_blocking=capturing)
-        if not capturing and self.current_layer_load == 0 and self.tp_rank == 0:
-            num_tokens_to_load = (token_indices_cpu != -1).sum().item()
-            logger.info(f'>>>>> load kv tokenwise, num_tokens_to_load = {num_tokens_to_load}')
-        k_cache_cpu = self.k_caches_cpu[self.current_layer_load]
-        v_cache_cpu = self.v_caches_cpu[self.current_layer_load]
-        token_indices_cpu = token_indices_cpu.unsqueeze(1)
-        actual_seq_len_q = self.actual_seq_len_q[:num_reqs]
-        cpu_block_table = self.cpu_block_table_host_buffer[:num_reqs]
-        cpu_block_table.copy_(self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing)
-        onload_topk_buffer_k_cpu = self.onload_topk_buffer_k_cpu[:num_reqs]
-        onload_topk_buffer_v_cpu = self.onload_topk_buffer_v_cpu[:num_reqs]
-        args = (
-            k_cache_cpu,
-            v_cache_cpu,
-            token_indices_cpu,
-            actual_seq_len_q,
-            cpu_block_table,
-            onload_topk_buffer_k_cpu,
-            onload_topk_buffer_v_cpu,
-            thread_num,
-        )
-        # with torch_npu.npu.stream(self.side_compute_stream):
-        #     tmp = token_indices_npu // 128
-        #     for _ in range(100):
-        #         tmp += 100
-        #         tmp = tmp // 128
-        if capturing:
-            current_compute_stream = torch_npu.npu.current_stream()
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
-            torch_npu.npu._launch_host_func(
-                current_compute_stream,
-                self.load_cpu_compact,
-                args,
-            )
-        else:
-            self.load_cpu_compact(args)
-        # self.side_compute_stream.synchronize()
-        # current_compute_stream.wait_stream(self.side_compute_stream)
-
-        # load gpu & cpu kv and compute one sfa, need to combine cpu/npu kv here
-        # cpu_mask = cpu_mask.unsqueeze(-1).unsqueeze(-1)
-        # onload_topk_buffer_k_npu = self.onload_topk_buffer_k_npu[:num_reqs]
-        # onload_topk_buffer_v_npu = self.onload_topk_buffer_v_npu[:num_reqs]
-        # onload_topk_buffer_k_npu.copy_(onload_topk_buffer_k_cpu, non_blocking=capturing)
-        # onload_topk_buffer_v_npu.copy_(onload_topk_buffer_v_cpu, non_blocking=capturing)
-        # topk_buffer_k = self.topk_buffers_k[self.current_layer_load][:num_reqs]
-        # topk_buffer_v = self.topk_buffers_v[self.current_layer_load][:num_reqs]
-        # topk_buffer_k[...] = torch.where(cpu_mask, onload_topk_buffer_k_npu, topk_buffer_k)
-        # topk_buffer_v[...] = torch.where(cpu_mask, onload_topk_buffer_v_npu, topk_buffer_v)
-
-        # compute gpu attn direcly, no need to combine cpu/gpu kv, directly copy to topk_buffer
-        topk_buffer_k = self.topk_buffers_k[self.current_layer_load][:num_reqs]
-        topk_buffer_v = self.topk_buffers_v[self.current_layer_load][:num_reqs]
-        topk_buffer_k.copy_(onload_topk_buffer_k_cpu, non_blocking=capturing)
-        topk_buffer_v.copy_(onload_topk_buffer_v_cpu, non_blocking=capturing)
-
-        self.current_layer_load += 1
-        if self.current_layer_load == self.num_layers:
-            self.current_layer_load = 0
-
-    def load_cpu(self, args):
-        (
-            token_indices,
-            block_table,
-            block_size,
-            token_size_bytes_k,
-            token_size_bytes_v,
-            gvas_k_bases,
-            gvas_v_bases,
-            addr_k_bases,
-            addr_v_bases,
-            max_num_threads,
-            gvas_buffer,
-            addr_buffer,
-            size_buffer,
-        ) = args
-        num_tokens_to_load = cpu_sparse_attn.compute_addrs(
-            token_indices,
-            block_table,
-            block_size,
-            token_size_bytes_k,
-            token_size_bytes_v,
-            gvas_k_bases,
-            gvas_v_bases,
-            addr_k_bases,
-            addr_v_bases,
-            max_num_threads,
-            gvas_buffer,
-            addr_buffer,
-            size_buffer,
-        )
-        gvas = gvas_buffer[:num_tokens_to_load * 2]
-        addr = addr_buffer[:num_tokens_to_load * 2]
-        size = size_buffer[:num_tokens_to_load * 2]
-        # TODO maybe move batch_copy into main stream after adapt with graph mode itself
-        with self.load_stream:
-            batch_copy(gvas, addr, size, self.topk_buffers_k[0].dtype, self.topk_buffers_k[0].device)
-        self.load_stream.synchronize()
-        # if self.current_layer_load == 0 and self.tp_rank == 0:
-        #     logger.info(f'>>>>> load_kv_token_wise, num_tokens_to_load={num_tokens_to_load}')
-
-    def prepare_lru_resident_and_load_cpu(self, args):
-        (
-            req_ids,
-            last_req_ids,
-            topk_indices,
-            slot_to_token,
-            lru_slots,
-            current_slots,
-            miss_count,
-            miss_tokens,
-            miss_slots,
-            block_table,
-            block_size,
-            token_size_bytes_k,
-            token_size_bytes_v,
-            gvas_k_bases,
-            gvas_v_bases,
-            addr_k_bases,
-            addr_v_bases,
-            resident_capacity,
-            max_token,
-            workspace_threads,
-            requested_threads,
-            token_mark_workspace,
-            token_pos_workspace,
-            slot_workspace,
-            miss_position_workspace,
-            epochs,
-            gvas_buffer,
-            addr_buffer,
-            size_buffer,
-        ) = args
-        num_reqs = topk_indices.shape[0]
-        topk = topk_indices.shape[1]
-        cpu_sparse_attn.lru_resident_compact(
-            req_ids.data_ptr(),
-            last_req_ids.data_ptr(),
-            topk_indices.data_ptr(),
-            slot_to_token.data_ptr(),
-            lru_slots.data_ptr(),
-            current_slots.data_ptr(),
-            miss_count.data_ptr(),
-            miss_tokens.data_ptr(),
-            miss_slots.data_ptr(),
-            token_mark_workspace.data_ptr(),
-            token_pos_workspace.data_ptr(),
-            slot_workspace.data_ptr(),
-            miss_position_workspace.data_ptr(),
-            epochs.data_ptr(),
-            num_reqs,
-            topk,
-            resident_capacity,
-            max_token,
-            workspace_threads,
-            requested_threads,
-        )
-        num_tokens_to_load = cpu_sparse_attn.compute_lru_resident_addrs(
-            miss_count,
-            miss_tokens,
-            miss_slots,
-            block_table,
-            block_size,
-            token_size_bytes_k,
-            token_size_bytes_v,
-            gvas_k_bases,
-            gvas_v_bases,
-            addr_k_bases,
-            addr_v_bases,
-            resident_capacity,
-            requested_threads,
-            gvas_buffer,
-            addr_buffer,
-            size_buffer,
-        )
-        if num_tokens_to_load <= 0:
-            return
-        gvas = gvas_buffer[:num_tokens_to_load * 2]
-        addr = addr_buffer[:num_tokens_to_load * 2]
-        size = size_buffer[:num_tokens_to_load * 2]
-        with self.load_stream:
-            batch_copy(gvas, addr, size, self.topk_buffers_k[0].dtype, self.topk_buffers_k[0].device)
-        self.load_stream.synchronize()
-
-    def prepare_lru_resident_and_load(
-        self,
-        layer_name: str,
-        num_reqs: int,
-        topk_indices_npu: torch.Tensor,
-        slot_to_token_npu: torch.Tensor,
-        lru_slots_npu: torch.Tensor,
-        current_slots_npu: torch.Tensor,
-        miss_count_npu: torch.Tensor,
-        miss_tokens_npu: torch.Tensor,
-        miss_slots_npu: torch.Tensor,
-        req_ids_npu: torch.Tensor,
-        last_req_ids_npu: torch.Tensor,
-        max_token: int,
-        capturing: bool = False,
-    ) -> bool:
-        if not self.lru_resident_enabled:
-            return False
-        capturing = capturing or _is_current_stream_capturing()
-        topk = topk_indices_npu.shape[1]
-        capacity = slot_to_token_npu.shape[1]
-        if topk > self.sfa_sparse_topk or capacity > self.lru_resident_capacity:
-            raise ValueError(
-                "LRU resident tensors exceed configured workspace, "
-                f"topk={topk}, capacity={capacity}, "
-                f"configured_topk={self.sfa_sparse_topk}, "
-                f"configured_capacity={self.lru_resident_capacity}"
-            )
-        topk_indices_cpu = self.lru_topk_indices_cpu[:num_reqs, :topk]
-        slot_to_token_cpu = self.lru_slot_to_token_cpu[:num_reqs, :capacity]
-        lru_slots_cpu = self.lru_slots_cpu[:num_reqs, :capacity]
-        current_slots_cpu = self.lru_current_slots_cpu[:num_reqs, :topk]
-        miss_count_cpu = self.lru_miss_count_cpu[:num_reqs]
-        miss_tokens_cpu = self.lru_miss_tokens_cpu[:num_reqs, :topk]
-        miss_slots_cpu = self.lru_miss_slots_cpu[:num_reqs, :topk]
-        req_ids_cpu = self.lru_req_ids_cpu[:num_reqs]
-        last_req_ids_cpu = self.lru_last_req_ids_cpu[:num_reqs]
-        cpu_block_table = self.cpu_block_table_host_buffer[:num_reqs]
-
-        topk_indices_cpu.copy_(topk_indices_npu[:num_reqs, :topk].to(torch.int32), non_blocking=capturing)
-        slot_to_token_cpu.copy_(slot_to_token_npu[:num_reqs, :capacity], non_blocking=capturing)
-        lru_slots_cpu.copy_(lru_slots_npu[:num_reqs, :capacity], non_blocking=capturing)
-        req_ids_cpu.copy_(req_ids_npu[:num_reqs], non_blocking=capturing)
-        last_req_ids_cpu.copy_(last_req_ids_npu[:num_reqs], non_blocking=capturing)
-        cpu_block_table.copy_(self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing)
-
-        requested_threads = self.lru_workspace_threads
-        args = (
-            req_ids_cpu,
-            last_req_ids_cpu,
-            topk_indices_cpu,
-            slot_to_token_cpu,
-            lru_slots_cpu,
-            current_slots_cpu,
-            miss_count_cpu,
-            miss_tokens_cpu,
-            miss_slots_cpu,
-            cpu_block_table,
-            self.block_size,
-            self.token_size_bytes_k,
-            self.token_size_bytes_v,
-            self.gvas_k_bases[self.current_layer_load],
-            self.gvas_v_bases[self.current_layer_load],
-            self.addr_k_bases[self.current_layer_load],
-            self.addr_v_bases[self.current_layer_load],
-            capacity,
-            max_token,
-            self.lru_workspace_threads,
-            requested_threads,
-            self.lru_token_mark_workspace,
-            self.lru_token_pos_workspace,
-            self.lru_slot_workspace,
-            self.lru_miss_position_workspace,
-            self.lru_epochs,
-            self.gvas_buffer,
-            self.addr_buffer,
-            self.size_buffer,
-        )
-
-        if capturing:
-            current_compute_stream = torch_npu.npu.current_stream()
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
-            torch_npu.npu._launch_host_func(
-                current_compute_stream,
-                self.prepare_lru_resident_and_load_cpu,
-                args,
-            )
-        else:
-            self.prepare_lru_resident_and_load_cpu(args)
-
-        current_slots_npu[:num_reqs, :topk].copy_(current_slots_cpu, non_blocking=capturing)
-        miss_count_npu[:num_reqs].copy_(miss_count_cpu, non_blocking=capturing)
-        miss_tokens_npu[:num_reqs, :topk].copy_(miss_tokens_cpu, non_blocking=capturing)
-        miss_slots_npu[:num_reqs, :topk].copy_(miss_slots_cpu, non_blocking=capturing)
-        slot_to_token_npu[:num_reqs, :capacity].copy_(slot_to_token_cpu, non_blocking=capturing)
-        lru_slots_npu[:num_reqs, :capacity].copy_(lru_slots_cpu, non_blocking=capturing)
-        last_req_ids_npu[:num_reqs].copy_(last_req_ids_cpu, non_blocking=capturing)
-
-        self.current_layer_load += 1
-        if self.current_layer_load == self.num_layers:
-            self.current_layer_load = 0
-        return True
-
-    def load_kv_token_wise(
-        self,
-        layer_name: str,
-        num_reqs: int,
-        token_indices_npu: torch.tensor,
-        cpu_mask: torch.tensor,
-        capturing: bool = False,
-    ):
-        # sparse_mask = torch.rand_like(token_indices_npu, dtype=torch.bfloat16) < 0.9
-        # token_indices_npu = torch.where(sparse_mask, -1, token_indices_npu)
-        token_indices_cpu = self.topk_indices_buffer_cpu[:num_reqs]
-        token_indices_cpu.copy_(token_indices_npu, non_blocking=capturing)
-        cpu_block_table = self.cpu_block_table_host_buffer[:num_reqs]
-        cpu_block_table.copy_(self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing)
-
-        max_num_threads = 8
-        args = (
-            token_indices_cpu,
-            cpu_block_table,
-            self.block_size,
-            self.token_size_bytes_k,
-            self.token_size_bytes_v,
-            self.gvas_k_bases[self.current_layer_load],
-            self.gvas_v_bases[self.current_layer_load],
-            self.addr_k_bases[self.current_layer_load],
-            self.addr_v_bases[self.current_layer_load],
-            max_num_threads,
-            self.gvas_buffer,
-            self.addr_buffer,
-            self.size_buffer,
-        )
-
-        if capturing:
-            current_compute_stream = torch_npu.npu.current_stream()
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
-            torch_npu.npu._launch_host_func(
-                current_compute_stream,
-                self.load_cpu,
-                args,
-            )
-        else:
-            self.load_cpu(args)
-
-        self.current_layer_load += 1
-        if self.current_layer_load == self.num_layers:
-            self.current_layer_load = 0
-
-    def process_layer_data(self, request: ReqMeta) -> Generator[
-        Optional[torch.Tensor], None, None]:
-        """
-        A more efficient version of the layer-wise KV cache retrieval or storage.
-        Implements incremental computation: only processes new blocks when they appear.
-
-        :param request: The request containing meta information about the tokens and blocks.
-
-        :return: A generator that yields either None (for store) or a tensor (for retrieve).
-        """
-        num_new_offload_blocks = request.num_new_offload_blocks
-        block_ids_npu = request.block_ids
-        block_ids_cpu = request.block_ids_cpu
-        if len(block_ids_npu) > len(block_ids_cpu):
-            # in most cases block_ids_npu has one more unfull block, remove it
-            block_ids_npu = block_ids_npu[:-1]
-        assert len(block_ids_npu) == len(block_ids_cpu)
-        block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
-        block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
-
-        for layer_id in range(self.num_layers):
-            req_meta_save = LayerMultiBlockReqMeta(
-                request.req_id, [], [], [],
-                request.block_ids, layer_id, request.is_last_chunk,
-                block_ids_npu=block_ids_npu,
-                block_ids_cpu=block_ids_cpu,
-                cache_npu=(self.k_caches_npu[layer_id], self.v_caches_npu[layer_id]),
-                cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),
-            )
-            self.layer_save_tasks[layer_id].append(req_meta_save)
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
-        done_sending = (
-            self.kv_send_thread.get_and_clear_finished_requests(
-            )
-            if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
-            else set()
-        )
+        if self.kv_send_thread is not None:
+            send_thread = self.kv_send_thread
+            for req_id in meta.preempted_req_ids:
+                if isinstance(send_thread, (KVCacheStoreSendingThread, KVCacheStoreLayerSendingThread)):
+                    send_thread.delete_finished_stored_request(req_id)
+            self.kv_send_thread.discard_finished_requests(meta.preempted_req_ids)
+            if self.use_layerwise:
+                self.kv_send_thread.get_and_clear_finished_requests()
+                done_sending = set()
+            else:
+                stale_finished_req_ids = finished_req_ids - meta.delayed_free_req_ids
+                self.kv_send_thread.discard_finished_requests(stale_finished_req_ids)
+                done_sending = self.kv_send_thread.get_and_clear_finished_requests(meta.delayed_free_req_ids)
+        else:
+            done_sending = set()
 
-        done_recving = (
-            self.kv_recv_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
-            )
-            if self.load_async
-            else set()
-        )
+        done_recving = set()
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.discard_finished_requests(meta.preempted_req_ids)
+            if self.load_async:
+                done_recving = self.kv_recv_thread.get_and_clear_finished_requests(meta.loading_req_ids)
 
         logger.debug(
             "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",
@@ -1560,41 +1109,6 @@ class KVPoolWorker:
             self.tp_rank,
         )
         return done_sending, done_recving
-
-    def get_and_clear_finished_requests(self, finished_req_ids, meta: AscendConnectorMetadata) -> set[str]:
-        finished_sending = set()
-        for req_id in meta.preempted_req_ids:
-            self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
-                req_id
-            )
-        for req_id in self.kv_send_thread.stored_requests.copy(  # type: ignore[union-attr]
-        ):
-            if (
-                self.kv_send_thread.stored_requests[  # type: ignore[union-attr]
-                    req_id
-                ]
-                == 0
-                and req_id in self.finished_store_req
-            ):
-                self.finished_store_req.remove(req_id)
-                finished_sending.add(req_id)
-                self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
-                    req_id
-                )
-
-        for req_id in finished_req_ids:
-            req_remain_jobs = self.kv_send_thread.stored_requests.get(  # type: ignore[union-attr]
-                req_id
-            )
-            if req_remain_jobs == 0:
-                finished_sending.add(req_id)
-                self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
-                    req_id
-                )
-            elif req_remain_jobs is not None:
-                self.finished_store_req.add(req_id)
-
-        return finished_sending
 
     def lookup(
         self,
