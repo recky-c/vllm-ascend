@@ -212,7 +212,7 @@ class SFAKVOffloadWorker:
         self.load_stream = torch_npu.npu.Stream()
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
-        self.allocate_dram_size = 64 * 1024 * 1024 * 1024  # TODO get from config
+        self.allocate_dram_size = 64 * 1024 * 1024 * 1024 # TODO get from config
         zbal_h2d_init(self.allocate_dram_size, self.max_num_topk_rows * self.sfa_sparse_topk * 2)
 
     def _infer_group_block_sizes(
@@ -359,12 +359,6 @@ class SFAKVOffloadWorker:
                 device='cpu',
                 pin_memory=True,
             )
-            self.lru_tokens_per_req_cpu = torch.empty(
-                [self.max_num_reqs],
-                dtype=torch.int32,
-                device='cpu',
-                pin_memory=True,
-            )
             self.lru_slot_to_token_cpu_list = [torch.full(
                 [self.max_num_topk_rows, self.lru_resident_capacity],
                 -1,
@@ -445,7 +439,6 @@ class SFAKVOffloadWorker:
             self.lru_last_req_ids_ptrs = [lru_last_req_ids_cpu.data_ptr() for lru_last_req_ids_cpu in self.lru_last_req_ids_cpu_list]
             self.lru_topk_indices_ptr = self.lru_topk_indices_cpu.data_ptr()
             self.lru_token_to_req_ptr = self.lru_token_to_req_cpu.data_ptr()
-            self.lru_tokens_per_req_ptr = self.lru_tokens_per_req_cpu.data_ptr()
             self.lru_slot_to_token_ptrs = [lru_slot_to_token_cpu.data_ptr() for lru_slot_to_token_cpu in self.lru_slot_to_token_cpu_list]
             self.lru_slots_ptrs = [lru_slots_cpu.data_ptr() for lru_slots_cpu in self.lru_slots_cpu_list]
             self.lru_current_slots_ptr = self.lru_current_slots_cpu.data_ptr()
@@ -573,7 +566,6 @@ class SFAKVOffloadWorker:
     def prepare_lru_resident_and_load_cpu(self, args):
         (
             num_reqs,
-            lru_topk,
             miss_count,
             miss_tokens,
             miss_slots,
@@ -622,7 +614,7 @@ class SFAKVOffloadWorker:
             lru_miss_position_workspace_ptr,
             lru_epochs_ptr,
             num_reqs,
-            lru_topk,
+            self.sfa_sparse_topk,
             self.lru_resident_capacity,
             self.max_model_len,
             self.lru_workspace_threads,
@@ -665,7 +657,6 @@ class SFAKVOffloadWorker:
         current_slots_npu: torch.Tensor,
         req_ids_npu: torch.Tensor,
         token_to_req_npu: torch.Tensor | None = None,
-        tokens_per_req_npu: torch.Tensor | None = None,
         capturing: bool = False,
     ) -> bool:
         capturing = capturing or _is_current_stream_capturing()
@@ -702,10 +693,9 @@ class SFAKVOffloadWorker:
 
         args = (
             num_tokens,
-            topk,
             self.lru_miss_count_cpu_list[layer_id][:num_tokens],
-            self.lru_miss_tokens_cpu_list[layer_id][:num_tokens, :topk],
-            self.lru_miss_slots_cpu_list[layer_id][:num_tokens, :topk],
+            self.lru_miss_tokens_cpu_list[layer_id][:num_tokens],
+            self.lru_miss_slots_cpu_list[layer_id][:num_tokens],
             self.lru_req_ids_ptr,
             self.lru_last_req_ids_ptrs[layer_id],
             self.lru_topk_indices_ptr,
@@ -761,8 +751,8 @@ class SFAKVOffloadWorker:
             self.topk_buffers_k[0].device,
         )
 
-        current_slots_cpu = self.lru_current_slots_cpu[:num_tokens, :topk]
-        current_slots_npu[:num_tokens, :topk].copy_(current_slots_cpu, non_blocking=capturing)
+        current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
+        current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
         return True
 
     def process_layer_data(self, request: ReqMeta) -> Generator[
