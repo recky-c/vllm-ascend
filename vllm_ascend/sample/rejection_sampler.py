@@ -31,6 +31,12 @@ from vllm_ascend.ops.triton.reject_sample import (
 )
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+from vllm_ascend.spec_decode.debug import (
+    spec_debug_max_items,
+    spec_debug_trace_enabled,
+    split_flat_token_preview,
+    tensor_debug_preview,
+)
 
 
 class AscendRejectionSampler(RejectionSampler):
@@ -334,6 +340,51 @@ def apply_sampling_constraints(
         return apply_top_k_top_p(logits, k, p)
 
 
+def _log_rejection_sample_debug(
+    output_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: list[int],
+    cu_num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    target_argmax: torch.Tensor | None = None,
+    recovered_token_ids: torch.Tensor | None = None,
+) -> None:
+    if not spec_debug_trace_enabled():
+        return
+
+    max_items = spec_debug_max_items()
+    valid_sampled_tokens_count = (output_token_ids != PLACEHOLDER_TOKEN_ID).sum(dim=1)
+    draft_counts = torch.tensor(
+        num_draft_tokens,
+        dtype=valid_sampled_tokens_count.dtype,
+        device=valid_sampled_tokens_count.device,
+    )
+    accepted_draft_counts = torch.clamp(valid_sampled_tokens_count - 1, min=0)
+    accepted_draft_counts = torch.minimum(accepted_draft_counts, draft_counts)
+    rejected_draft_counts = torch.clamp(draft_counts - accepted_draft_counts, min=0)
+
+    logger.info(
+        "[spec_decode/debug] rejection_sample output: "
+        "num_draft_tokens=%s, cu_num_draft_tokens=%s, "
+        "draft_token_ids_by_req=%s, target_argmax_by_req=%s, "
+        "recovered_token_ids_by_req=%s, bonus_token_ids=%s, "
+        "sampled_token_ids=%s, valid_sampled_tokens_count=%s, "
+        "accepted_draft_counts=%s, rejected_draft_counts=%s",
+        num_draft_tokens[:max_items],
+        tensor_debug_preview(cu_num_draft_tokens, max_items),
+        split_flat_token_preview(draft_token_ids, num_draft_tokens, max_items),
+        split_flat_token_preview(target_argmax, num_draft_tokens, max_items) if target_argmax is not None else None,
+        split_flat_token_preview(recovered_token_ids, num_draft_tokens, max_items)
+        if recovered_token_ids is not None
+        else None,
+        tensor_debug_preview(bonus_token_ids, max_items),
+        tensor_debug_preview(output_token_ids, max_items),
+        tensor_debug_preview(valid_sampled_tokens_count, max_items),
+        tensor_debug_preview(accepted_draft_counts, max_items),
+        tensor_debug_preview(rejected_draft_counts, max_items),
+    )
+
+
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -432,6 +483,8 @@ def rejection_sample(
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
     if HAS_TRITON:
         grid, block_size = cal_grid_and_block_size(batch_size)
+    target_argmax_for_debug = None
+    recovered_token_ids_for_debug = None
 
     if using_block_verify or using_entropy_verify:
         logger.info_once(
@@ -454,6 +507,7 @@ def rejection_sample(
             target_argmax = greedy_sample(target_logits)
         else:
             target_argmax = target_logits.argmax(dim=-1).view(-1)
+        target_argmax_for_debug = target_argmax
 
         if HAS_TRITON:
             rejection_greedy_sample_with_triton(
@@ -488,6 +542,14 @@ def rejection_sample(
                     is_greedy,
                 )
         if sampling_metadata.all_greedy:
+            _log_rejection_sample_debug(
+                output_token_ids,
+                draft_token_ids,
+                num_draft_tokens,
+                cu_num_draft_tokens,
+                bonus_token_ids,
+                target_argmax=target_argmax_for_debug,
+            )
             return output_token_ids
 
     # For random sampling with selected logits
@@ -524,6 +586,7 @@ def rejection_sample(
             global_vocab_size=global_vocab_size,
             enable_reduce_sampling=True,
         )
+        recovered_token_ids_for_debug = recovered_token_ids
 
         if not using_block_verify:
             # Rejection sampling for random sampling requests with selected logits
@@ -667,6 +730,7 @@ def rejection_sample(
             global_vocab_size=vocab_size,
             enable_reduce_sampling=False,
         )
+        recovered_token_ids_for_debug = recovered_token_ids
 
         if not using_block_verify:
             if HAS_TRITON:
@@ -769,6 +833,15 @@ def rejection_sample(
                     ori_target_probs=ori_target_probs,
                 )
 
+    _log_rejection_sample_debug(
+        output_token_ids,
+        draft_token_ids,
+        num_draft_tokens,
+        cu_num_draft_tokens,
+        bonus_token_ids,
+        target_argmax=target_argmax_for_debug,
+        recovered_token_ids=recovered_token_ids_for_debug,
+    )
     return output_token_ids
 
 

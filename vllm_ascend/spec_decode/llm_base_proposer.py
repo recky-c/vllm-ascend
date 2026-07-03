@@ -53,6 +53,11 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.debug import (
+    spec_debug_max_items,
+    spec_debug_trace_enabled,
+    tensor_debug_preview,
+)
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 
@@ -1028,6 +1033,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+        if spec_debug_trace_enabled():
+            max_items = spec_debug_max_items()
+            logger.info(
+                "[spec_decode/debug] proposer output: method=%s, "
+                "batch_size=%s, num_speculative_tokens=%s, num_tokens=%s, "
+                "num_input_tokens=%s, num_tokens_across_dp=%s, "
+                "next_token_ids=%s, token_indices_to_sample=%s, "
+                "draft_token_ids=%s",
+                self.method,
+                batch_size,
+                self.num_speculative_tokens,
+                num_tokens,
+                num_input_tokens,
+                num_tokens_across_dp,
+                tensor_debug_preview(next_token_ids, max_items),
+                tensor_debug_preview(token_indices_to_sample, max_items),
+                tensor_debug_preview(draft_token_ids, max_items),
+            )
         return draft_token_ids
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
@@ -1813,6 +1836,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.backup_next_token_ids.gpu[:batch_size],
         )
 
+        if spec_debug_trace_enabled():
+            max_items = spec_debug_max_items()
+            logger.info(
+                "[spec_decode/debug] prepare_next_token_ids_padded: "
+                "sampled_token_ids=%s, valid_sampled_tokens_count=%s, "
+                "next_token_ids=%s, discard_request_indices=%s",
+                tensor_debug_preview(sampled_token_ids, max_items),
+                tensor_debug_preview(valid_sampled_tokens_count, max_items),
+                tensor_debug_preview(next_token_ids, max_items),
+                tensor_debug_preview(discard_sampled_tokens_req_indices, max_items),
+            )
+
         return next_token_ids, valid_sampled_tokens_count
 
     def prepare_inputs(
@@ -1989,6 +2024,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1 - num_rejected_tokens_gpu
+
+        if spec_debug_trace_enabled():
+            max_items = spec_debug_max_items()
+            logger.info(
+                "[spec_decode/debug] prepare_inputs_padded: "
+                "cu_num_draft_tokens=%s, valid_sampled_tokens_count=%s, "
+                "num_rejected_tokens_gpu=%s, token_indices_to_sample=%s, "
+                "query_start_loc=%s",
+                tensor_debug_preview(spec_decode_metadata.cu_num_draft_tokens, max_items),
+                tensor_debug_preview(valid_sampled_tokens_count, max_items),
+                tensor_debug_preview(num_rejected_tokens_gpu, max_items),
+                tensor_debug_preview(token_indices_to_sample, max_items),
+                tensor_debug_preview(common_attn_metadata.query_start_loc, max_items),
+            )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
