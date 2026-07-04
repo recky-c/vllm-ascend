@@ -154,6 +154,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
+        if self.is_consumer:
+            return self.connector_worker.get_finished(finished_req_ids)
         return self.connector_worker.get_finished()
 
     def get_block_ids_with_load_errors(self) -> set[int]:

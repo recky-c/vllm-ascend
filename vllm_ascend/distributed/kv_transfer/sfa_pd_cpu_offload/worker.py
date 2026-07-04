@@ -267,7 +267,19 @@ class SFAPDCpuOffloadConsumerWorker:
         if self.sfa_worker is not None:
             self.sfa_worker.wait_for_save()
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def _cleanup_request_state(self, req_ids: set[str]) -> None:
+        for req_id in req_ids:
+            ext_id = get_external_request_id(req_id)
+            self._cpu_blocks_by_req.pop(req_id, None)
+            self.request_map.pop(ext_id, None)
+            self._dest_blocks_by_req.pop(ext_id, None)
+            self._pending_done.discard(ext_id)
+            self._pending_failed.discard(ext_id)
+
+    def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
+        if finished_req_ids:
+            self._cleanup_request_state(finished_req_ids)
+
         # memfabric pull mode: done comes from MembPullReadThread
         if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
             done = self._mf_read_thread.get_and_clear_done()
@@ -316,7 +328,8 @@ class SFAPDCpuOffloadConsumerWorker:
         """Per-req actual main-MLA CPU-block count for the solution-1 threshold."""
         if self.sfa_worker is None:
             return None
-        return {rid: self._cpu_blocks_by_req.get(rid, 0) for rid in req_ids}
+        result = {rid: self._cpu_blocks_by_req[rid] for rid in req_ids if rid in self._cpu_blocks_by_req}
+        return result or None
 
     def _register_memfabric_pull(
         self,

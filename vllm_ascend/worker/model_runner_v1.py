@@ -784,6 +784,82 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    def _restore_pd_main_block_table_offsets(
+        self,
+        num_reqs: int,
+        num_offloaded_blocks: np.ndarray,
+        restore_mask: np.ndarray,
+        patch_cpu_table: bool = False,
+    ) -> tuple[Any, np.ndarray] | None:
+        """Restore PD D-side main block tables after offloaded blocks are freed."""
+        block_tables = getattr(self.input_batch.block_table, "block_tables", ())
+        main_kv_cache_gid = 1
+        if len(block_tables) <= main_kv_cache_gid:
+            return None
+
+        block_table = self.input_batch.block_table[main_kv_cache_gid]
+        table = block_table.get_device_tensor(num_reqs)
+        max_blocks = table.shape[1]
+        row_counts = block_table.num_blocks_per_row[:num_reqs]
+        need_fix = any(
+            bool(restore_mask[req_idx])
+            and int(num_offloaded_blocks[req_idx]) > 0
+            and int(row_counts[req_idx]) > 0
+            and int(num_offloaded_blocks[req_idx]) < max_blocks
+            for req_idx in range(num_reqs)
+        )
+        if not need_fix:
+            return None
+
+        original_rows = (
+            block_table.get_numpy_array()[:num_reqs].copy()
+            if patch_cpu_table
+            else None
+        )
+        fixed_rows = original_rows.copy() if original_rows is not None else None
+        fixed_table = table.clone()
+        for req_idx in range(num_reqs):
+            if not restore_mask[req_idx]:
+                continue
+
+            num_resident_blocks = int(row_counts[req_idx])
+            if num_resident_blocks <= 0:
+                continue
+
+            offset = int(num_offloaded_blocks[req_idx])
+            if offset <= 0:
+                continue
+
+            fixed_table[req_idx].zero_()
+            if fixed_rows is not None and original_rows is not None:
+                fixed_rows[req_idx].fill(0)
+            if offset >= max_blocks:
+                continue
+
+            copy_len = min(num_resident_blocks, max_blocks - offset)
+            fixed_table[req_idx, offset:offset + copy_len].copy_(
+                table[req_idx, :copy_len]
+            )
+            if fixed_rows is not None and original_rows is not None:
+                fixed_rows[req_idx, offset:offset + copy_len] = original_rows[
+                    req_idx, :copy_len
+                ]
+
+        if patch_cpu_table:
+            assert fixed_rows is not None
+            block_table.get_numpy_array()[:num_reqs] = fixed_rows
+        table.copy_(fixed_table)
+        return (block_table, original_rows) if original_rows is not None else None
+
+    @staticmethod
+    def _restore_block_table_cpu_rows(
+        restore_state: tuple[Any, np.ndarray] | None,
+    ) -> None:
+        if restore_state is None:
+            return
+        block_table, original_rows = restore_state
+        block_table.get_numpy_array()[: original_rows.shape[0]] = original_rows
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -803,9 +879,44 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        cpu_blocks_map = None
+        num_offloaded_blocks = None
+        is_prefill = None
+        pd_restore_mask = None
+        if self.use_offload:
+            num_offloaded_blocks = self.input_batch.num_computed_tokens_cpu[:num_reqs] // self.block_size
+            # Solution 1: for remote-prefilled requests the main-MLA KV lives in
+            # the CPU pool, so the offload threshold must equal the ACTUAL number
+            # of main-MLA CPU blocks (covering the whole prefill prefix). Falls
+            # back to the heuristic for non-remote connectors (returns None).
+            cpu_blocks_map = maybe_get_num_cpu_blocks(self.input_batch.req_ids[:num_reqs])
+            if cpu_blocks_map is not None:
+                pd_restore_mask = np.zeros(num_reqs, dtype=bool)
+                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    if req_id in cpu_blocks_map:
+                        num_offloaded_blocks[i] = cpu_blocks_map[req_id]
+                        pd_restore_mask[i] = True
+            decode_threshold = 1
+            if self.speculative_config is not None:
+                decode_threshold += self.speculative_config.num_speculative_tokens
+            is_prefill = num_scheduled_tokens > decode_threshold
+            num_offloaded_blocks[is_prefill] = 0
+            if pd_restore_mask is not None:
+                pd_restore_mask[is_prefill] = False
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
+        if pd_restore_mask is not None and pd_restore_mask.any():
+            assert num_offloaded_blocks is not None
+            pd_block_table_restore_state = self._restore_pd_main_block_table_offsets(
+                num_reqs,
+                num_offloaded_blocks,
+                pd_restore_mask,
+                patch_cpu_table=self.use_compress and self.pcp_size <= 1,
+            )
+        else:
+            pd_block_table_restore_state = None
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -1282,6 +1393,7 @@ class NPUModelRunner(GPUModelRunner):
                 positions_compressed_list,
                 req_indices_compressed_list,
             )
+            self._restore_block_table_cpu_rows(pd_block_table_restore_state)
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -1369,21 +1481,8 @@ class NPUModelRunner(GPUModelRunner):
                 # return int(req_id.split('-')[0]) + 1 # for test, '0-94754505' -> 1
                 return zlib.adler32(req_id.encode('utf-8'))
 
-            num_offloaded_blocks = self.input_batch.num_computed_tokens_cpu[:num_reqs] // self.block_size
-            # Solution 1: for remote-prefilled requests the main-MLA KV lives in
-            # the CPU pool, so the offload threshold must equal the ACTUAL number
-            # of main-MLA CPU blocks (covering the whole prefill prefix). Falls
-            # back to the heuristic for non-remote connectors (returns None).
-            cpu_blocks_map = maybe_get_num_cpu_blocks(self.input_batch.req_ids[:num_reqs])
-            if cpu_blocks_map is not None:
-                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                    if req_id in cpu_blocks_map:
-                        num_offloaded_blocks[i] = cpu_blocks_map[req_id]
-            decode_threshold = 1
-            if self.speculative_config is not None:
-                decode_threshold += self.speculative_config.num_speculative_tokens
-            is_prefill = num_scheduled_tokens > decode_threshold
-            num_offloaded_blocks[is_prefill] = 0
+            assert num_offloaded_blocks is not None
+            assert is_prefill is not None
 
             if torch.distributed.get_rank() == 0:
                 logger.info(
