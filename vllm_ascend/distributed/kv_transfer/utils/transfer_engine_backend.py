@@ -223,7 +223,7 @@ class GlobalTE:
             ) from e
 
         # Match the official memfabric example: configure logging + TLS before init.
-        set_log_level(0)  # debug
+        set_log_level(2)  # debug
         set_conf_store_tls(False, "")
 
         engine = MFTransferEngine()
