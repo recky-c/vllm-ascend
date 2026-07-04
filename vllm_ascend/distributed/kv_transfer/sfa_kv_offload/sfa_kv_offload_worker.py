@@ -22,7 +22,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
-from zbal import zbal_init, zbal_uninit, empty_tensor, batch_copy, zbal_h2d_init
+from memfabric_hybrid import offload
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
@@ -121,7 +121,7 @@ class SFAKVOffloadWorker:
     ) -> torch.Tensor:
         num_elements = int(np.prod(shape))
         extra_elements = cdiv(alignment, torch.empty((), dtype=dtype).element_size())
-        tensor = empty_tensor([num_elements + extra_elements], dtype=dtype, pin_memory=True)
+        tensor = offload.empty([num_elements + extra_elements], dtype=dtype, pin_memory=True)
         return cls._align_memory(tensor, alignment)[:num_elements].view(shape)
 
     def __init__(
@@ -213,7 +213,11 @@ class SFAKVOffloadWorker:
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
         self.allocate_dram_size = 64 * 1024 * 1024 * 1024 # TODO get from config
-        zbal_h2d_init(self.allocate_dram_size, self.max_num_topk_rows * self.sfa_sparse_topk * 2)
+        logger.info(
+            f"SFAKVOffloadWoker start init h2d with {self.allocate_dram_size / 1024 / 1024 / 1024} GB dram/rank, "
+            "it might be time consuming, please wait."
+        )
+        offload.initialize(self.tp_rank, self.allocate_dram_size)
 
     def _infer_group_block_sizes(
         self,
@@ -451,7 +455,7 @@ class SFAKVOffloadWorker:
             self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
             self.lru_epochs_ptr = self.lru_epochs.data_ptr()
 
-            # sparse h2d (batch_copy related)
+            # sparse h2d (sparse_copy related)
             self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
             self.addr_v_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_v]
             self.gvas_k_bases: list[int] = [t.data_ptr() for t in self.k_caches_cpu]
@@ -465,25 +469,25 @@ class SFAKVOffloadWorker:
             size_buffer_size_bytes = self.max_num_topk_rows * self.sfa_sparse_topk * 2 * 4 # 2: k+v, 4: int32
             num_tokens_buffer_offset = size_buffer_offset + size_buffer_size_bytes
             num_tokens_buffer_size_bytes = 4
-            batch_copy_args_buffer_size_bytes = gvas_buffer_size_bytes + addr_buffer_size_bytes + size_buffer_size_bytes + num_tokens_buffer_size_bytes
-            self.batch_copy_args_buffer_cpu = torch.zeros([batch_copy_args_buffer_size_bytes], dtype=torch.int8, device='cpu', pin_memory=True)
-            self.batch_copy_args_buffer_npu = torch.zeros([batch_copy_args_buffer_size_bytes], dtype=torch.int8, device='npu')
+            sparse_copy_args_buffer_size_bytes = gvas_buffer_size_bytes + addr_buffer_size_bytes + size_buffer_size_bytes + num_tokens_buffer_size_bytes
+            self.sparse_copy_args_buffer_cpu = torch.zeros([sparse_copy_args_buffer_size_bytes], dtype=torch.int8, device='cpu', pin_memory=True)
+            self.sparse_copy_args_buffer_npu = torch.zeros([sparse_copy_args_buffer_size_bytes], dtype=torch.int8, device='npu')
 
-            self.gvas_buffer_cpu = self.batch_copy_args_buffer_cpu[gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes].view(torch.int64)
-            self.addr_buffer_cpu = self.batch_copy_args_buffer_cpu[addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes].view(torch.int64)
-            self.size_buffer_cpu = self.batch_copy_args_buffer_cpu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
+            self.gvas_buffer_cpu = self.sparse_copy_args_buffer_cpu[gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes].view(torch.int64)
+            self.addr_buffer_cpu = self.sparse_copy_args_buffer_cpu[addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes].view(torch.int64)
+            self.size_buffer_cpu = self.sparse_copy_args_buffer_cpu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
             self.num_tokens_buffer_cpu = \
-                self.batch_copy_args_buffer_cpu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
+                self.sparse_copy_args_buffer_cpu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
             assert self.gvas_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.addr_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.size_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_cpu.shape == torch.Size([1])
 
-            self.gvas_buffer_npu = self.batch_copy_args_buffer_npu[gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes].view(torch.int64)
-            self.addr_buffer_npu = self.batch_copy_args_buffer_npu[addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes].view(torch.int64)
-            self.size_buffer_npu = self.batch_copy_args_buffer_npu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
+            self.gvas_buffer_npu = self.sparse_copy_args_buffer_npu[gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes].view(torch.int64)
+            self.addr_buffer_npu = self.sparse_copy_args_buffer_npu[addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes].view(torch.int64)
+            self.size_buffer_npu = self.sparse_copy_args_buffer_npu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
             self.num_tokens_buffer_npu = \
-                self.batch_copy_args_buffer_npu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
+                self.sparse_copy_args_buffer_npu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
             assert self.gvas_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.addr_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
@@ -742,8 +746,8 @@ class SFAKVOffloadWorker:
         else:
             self.prepare_lru_resident_and_load_cpu(args)
 
-        self.batch_copy_args_buffer_npu.copy_(self.batch_copy_args_buffer_cpu, non_blocking=capturing)
-        batch_copy(
+        self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
+        offload.sparse_copy(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
             self.size_buffer_npu,
