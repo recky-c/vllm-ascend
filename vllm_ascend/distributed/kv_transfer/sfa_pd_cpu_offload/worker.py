@@ -1018,6 +1018,20 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         # stalls (a visible failure) instead of silent corruption.
         if all_ok and 0 <= layer_idx < len(self.layer_send_done_events):
             self.layer_send_done_events[layer_idx].set()
+            # Release the co-located ascend_store GVA-layerwise save thread
+            # (memcache backend), which per-layer blocks on the shared
+            # PD-transfer-finished event for THIS layer before saving. The base
+            # mooncake send path sets these in _transfer_kv_cache; we override
+            # that (pull mode) and never call super, so we must signal here too
+            # -- otherwise the save thread waits timeout=30s per layer and
+            # stalls the whole P node (observed remotely as a D-side connection
+            # failure). layer_transfer_finished_events is the same list the
+            # producer __init__ published via set_shared_layer_transfer_events()
+            # and the save thread reads via get_shared_layer_transfer_events();
+            # the save thread owns the .clear() after its wait().
+            pd_done_events = getattr(self, "layer_transfer_finished_events", None)
+            if pd_done_events is not None and 0 <= layer_idx < len(pd_done_events):
+                pd_done_events[layer_idx].set()
             logger.info(
                 "MembPull P layer send complete: layer=%d (%s), reqs=%s",
                 layer_idx,
