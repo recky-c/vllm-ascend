@@ -829,12 +829,16 @@ class NPUModelRunner(GPUModelRunner):
             offset = int(num_offloaded_blocks[req_idx])
             if offset <= 0:
                 continue
+            # The offloaded prefix exceeds the table width: there is no room to
+            # place resident blocks at [offset:]. Skip this req and leave its
+            # committed row untouched -- zeroing it would silently destroy the
+            # resident KV for an otherwise-unrelated req in a mixed batch.
+            if offset >= max_blocks:
+                continue
 
             fixed_table[req_idx].zero_()
             if fixed_rows is not None and original_rows is not None:
                 fixed_rows[req_idx].fill(0)
-            if offset >= max_blocks:
-                continue
 
             copy_len = min(num_resident_blocks, max_blocks - offset)
             fixed_table[req_idx, offset:offset + copy_len].copy_(

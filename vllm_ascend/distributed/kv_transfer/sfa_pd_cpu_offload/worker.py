@@ -277,13 +277,11 @@ class SFAPDCpuOffloadConsumerWorker:
             self._pending_failed.discard(ext_id)
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
-        if finished_req_ids:
-            self._cleanup_request_state(finished_req_ids)
+        done_recving: set[str] = set()
 
         # memfabric pull mode: done comes from MembPullReadThread
         if hasattr(self, "_mf_read_thread") and self._mf_read_thread is not None:
             done = self._mf_read_thread.get_and_clear_done()
-            done_recving: set[str] = set()
             still_pending: set[str] = set()
             for ext_id in done | self._pending_done:
                 internal = self.request_map.get(ext_id)
@@ -313,11 +311,17 @@ class SFAPDCpuOffloadConsumerWorker:
                     self._pending_done,
                     self._pending_failed,
                 )
-            return set(), done_recving
+        # else: read thread not up yet -> nothing finished (done_recving empty).
 
-        # memfabric pull mode only (mooncake staging path removed). If the read
-        # thread isn't up yet, nothing is finished.
-        return set(), set()
+        # Purge scheduler-finished req state AFTER resolving this step's
+        # done/failed signals against request_map. Doing it at the top would pop
+        # request_map[ext_id] and discard _pending_done[ext_id] before the
+        # resolution loop above, leaking any finished req whose DONE arrives in
+        # the same step (unmappable -> stuck in _pending_done forever).
+        if finished_req_ids:
+            self._cleanup_request_state(finished_req_ids)
+
+        return set(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         result = self._invalid_block_ids
