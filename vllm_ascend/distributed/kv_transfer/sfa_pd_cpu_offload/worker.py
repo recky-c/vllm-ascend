@@ -234,7 +234,6 @@ class SFAPDCpuOffloadConsumerWorker:
         current_slots: torch.Tensor,
         req_ids: torch.Tensor,
         token_to_req: torch.Tensor | None = None,
-        tokens_per_req: torch.Tensor | None = None,
         capturing: bool = False,
     ) -> bool:
         assert self.sfa_worker is not None
@@ -246,7 +245,6 @@ class SFAPDCpuOffloadConsumerWorker:
             current_slots,
             req_ids,
             token_to_req,
-            tokens_per_req,
             capturing,
         )
 
