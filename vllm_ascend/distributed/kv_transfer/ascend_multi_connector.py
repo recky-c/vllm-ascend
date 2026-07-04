@@ -7,7 +7,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import MooncakeLayerwiseConnector
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+    MooncakeLayerwiseConnector,
+    MooncakeLayerwiseConnectorScheduler,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -33,7 +36,11 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
         empty_blocks = blocks.new_empty()
         for i, c in enumerate(self._connectors):
-            if i == chosen_connector or isinstance(c, MooncakeLayerwiseConnector):
+            scheduler = getattr(c, "connector_scheduler", None)
+            is_layerwise_sender = isinstance(
+                c, MooncakeLayerwiseConnector
+            ) or isinstance(scheduler, MooncakeLayerwiseConnectorScheduler)
+            if i == chosen_connector or is_layerwise_sender:
                 # Forward call to the chosen connector (if any).
                 c.update_state_after_alloc(request, blocks, num_external_tokens)
             else:
