@@ -7,6 +7,7 @@ import torch
 import torch_npu
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     LayerMultiBlockReqMeta,
     ReqMeta,
@@ -92,7 +93,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         f'cpu block num ({len(block_ids_cpu)}) size mismatch'
                     )
                 if self.tp_rank == 0 and layer_id == 0:
-                    logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
+                    if envs.VLLM_ASCEND_SFA_DEBUG:
+                        logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
                 if len(block_ids_npu) > 1:
                     k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
                     v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')

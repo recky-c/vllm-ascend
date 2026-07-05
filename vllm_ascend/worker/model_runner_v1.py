@@ -106,6 +106,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -797,7 +798,7 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         ]
         """
-        if torch.distributed.get_rank() == 0:
+        if envs.VLLM_ASCEND_SFA_DEBUG and torch.distributed.get_rank() == 0:
             logger.info(f'>>>>> input tokens = {len(num_scheduled_tokens)}, {num_scheduled_tokens}')
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
@@ -1400,7 +1401,7 @@ class NPUModelRunner(GPUModelRunner):
             assert num_offloaded_blocks is not None
             assert is_prefill is not None
 
-            if torch.distributed.get_rank() == 0:
+            if envs.VLLM_ASCEND_SFA_DEBUG and torch.distributed.get_rank() == 0:
                 logger.info(
                     ">>>>> offload threshold: req_ids=%s, num_offloaded_blocks=%s, "
                     "num_computed=%s, is_prefill=%s",

@@ -23,6 +23,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorScheduler,
     get_external_request_id,
@@ -213,20 +214,21 @@ class SFAPDCpuOffloadScheduler:
         if metaserver is not None and not params.get("do_virtual", False):
             future = self.executor.submit(self._access_metaserver, url=metaserver, message=kv_transfer_params)
             future.add_done_callback(self._on_metaserver_done)
-        logger.info(
-            "SFAPDCpuOffload D advertised req %s: indexer_npu_ids=%s, "
-            "main_cpu_ids=%s, main_hbm_ids=%s, num_full=%s, "
-            "partial_hbm=%s, remote_host=%s, remote_port=%s, metaserver=%s",
-            request.request_id,
-            indexer_npu_ids,
-            main_cpu_ids,
-            main_hbm_ids,
-            num_main_cpu_blocks,
-            partial_hbm_bid,
-            self.side_channel_host,
-            self.side_channel_port,
-            metaserver,
-        )
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "SFAPDCpuOffload D advertised req %s: indexer_npu_ids=%s, "
+                "main_cpu_ids=%s, main_hbm_ids=%s, num_full=%s, "
+                "partial_hbm=%s, remote_host=%s, remote_port=%s, metaserver=%s",
+                request.request_id,
+                indexer_npu_ids,
+                main_cpu_ids,
+                main_hbm_ids,
+                num_main_cpu_blocks,
+                partial_hbm_bid,
+                self.side_channel_host,
+                self.side_channel_port,
+                metaserver,
+            )
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         # Delayed free: release CPU blocks of requests that finished in a prior
@@ -260,19 +262,20 @@ class SFAPDCpuOffloadScheduler:
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
                 return
-            logger.info(
-                "SFAPDCpuOffload D build meta req %s: main_hbm_ids=%s, "
-                "main_cpu_ids=%s, indexer_npu_ids=%s, num_full=%s, "
-                "partial_hbm=%s, offload_src=%s, offload_dst=%s",
-                req_id,
-                tracker.main_hbm_ids,
-                tracker.allocated_block_ids_cpu,
-                tracker.allocated_block_ids_npu,
-                tracker.num_full,
-                tracker.partial_hbm_bid,
-                offload_src or [],
-                offload_dst or [],
-            )
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "SFAPDCpuOffload D build meta req %s: main_hbm_ids=%s, "
+                    "main_cpu_ids=%s, indexer_npu_ids=%s, num_full=%s, "
+                    "partial_hbm=%s, offload_src=%s, offload_dst=%s",
+                    req_id,
+                    tracker.main_hbm_ids,
+                    tracker.allocated_block_ids_cpu,
+                    tracker.allocated_block_ids_npu,
+                    tracker.num_full,
+                    tracker.partial_hbm_bid,
+                    offload_src or [],
+                    offload_dst or [],
+                )
             meta.add_request(
                 ReqMeta(
                     req_id=tracker.req_id,
@@ -334,13 +337,14 @@ class SFAPDCpuOffloadScheduler:
                 )
             if offload_src:
                 tracker.allocated_block_ids_cpu.extend(offload_dst)
-                logger.info(
-                    "SFAPD B1 offload req %s: %d blocks HBM->CPU (num_offloaded %d->%d)",
-                    req_id,
-                    len(offload_src),
-                    num_offloaded,
-                    num_offloaded + len(offload_src),
-                )
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "SFAPD B1 offload req %s: %d blocks HBM->CPU (num_offloaded %d->%d)",
+                        req_id,
+                        len(offload_src),
+                        num_offloaded,
+                        num_offloaded + len(offload_src),
+                    )
             _add_req(req_id, offload_src, offload_dst)
         return meta
 

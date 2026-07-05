@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 from memfabric_hybrid import offload
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     SFAKVOffloadConnectorMetadata,
@@ -512,10 +513,11 @@ class SFAKVOffloadWorker:
         num_save_layers = sum(1 for layer_save_task in self.layer_save_tasks if layer_save_task)
         self.num_save_tasks = sum(len(layer_save_task) for layer_save_task in self.layer_save_tasks)
         if self.tp_rank == 0:
-            logger.info(
-                f'>>>>> start load kv, reqs num: {len(metadata.requests)}, '
-                f'save layer num = {num_save_layers}, save task num = {self.num_save_tasks}'
-            )
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    f'>>>>> start load kv, reqs num: {len(metadata.requests)}, '
+                    f'save layer num = {num_save_layers}, save task num = {self.num_save_tasks}'
+                )
 
         # generate block_table for load
         # NOTE reqs in self.req_ids and metadata.requests may not be in same order,
@@ -645,7 +647,8 @@ class SFAKVOffloadWorker:
         )
 
         if not do_offload and layer_id == 0 and self.tp_rank == 0:
-            logger.info(f'>>>>> load_kv_token_wise, num_tokens_to_load={num_tokens_to_load}')
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(f'>>>>> load_kv_token_wise, num_tokens_to_load={num_tokens_to_load}')
 
         if do_offload:
             # in graph mode, we don't want to interrupt graph twice (since it's time consuming),

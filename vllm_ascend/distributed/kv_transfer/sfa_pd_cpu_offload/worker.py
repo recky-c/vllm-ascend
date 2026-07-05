@@ -16,7 +16,6 @@ send setup, but swaps in a pull-mode sending thread that notifies D to read
 from __future__ import annotations
 
 import math
-import os
 import re
 import threading
 from typing import TYPE_CHECKING, Any
@@ -206,15 +205,16 @@ class SFAPDCpuOffloadConsumerWorker:
                 num_full = getattr(req, "num_full", 0) or 0
                 partial_hbm_bid = getattr(req, "partial_hbm_bid", None)
                 self._dest_blocks_by_req[ext_id] = (indexer_ids, main_ids, num_full, partial_hbm_bid)
-                logger.info(
-                    "MembPull D stored dest blocks req %s: indexer_hbm_ids=%s, "
-                    "main_cpu_ids=%s, num_full=%s, partial_hbm=%s",
-                    ext_id,
-                    indexer_ids,
-                    main_ids,
-                    num_full,
-                    partial_hbm_bid,
-                )
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "MembPull D stored dest blocks req %s: indexer_hbm_ids=%s, "
+                        "main_cpu_ids=%s, num_full=%s, partial_hbm=%s",
+                        ext_id,
+                        indexer_ids,
+                        main_ids,
+                        num_full,
+                        partial_hbm_bid,
+                    )
         # Refresh the per-req CPU-block count (Phase 3 source of truth) and
         # forward the load kickoff to the SFA worker (which also builds offload
         # tasks via process_layer_data when num_new_offload_blocks > 0).
@@ -300,15 +300,16 @@ class SFAPDCpuOffloadConsumerWorker:
                     still_pending_failed.add(ext_id)
             self._pending_failed = still_pending_failed
             if done or failed or done_recving or self._pending_done or self._pending_failed:
-                logger.info(
-                    "MembPull D get_finished: done_ext=%s, failed_ext=%s, "
-                    "done_recving_internal=%s, pending_done_ext=%s, pending_failed_ext=%s",
-                    done,
-                    failed,
-                    done_recving,
-                    self._pending_done,
-                    self._pending_failed,
-                )
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "MembPull D get_finished: done_ext=%s, failed_ext=%s, "
+                        "done_recving_internal=%s, pending_done_ext=%s, pending_failed_ext=%s",
+                        done,
+                        failed,
+                        done_recving,
+                        self._pending_done,
+                        self._pending_failed,
+                    )
         # else: read thread not up yet -> nothing finished (done_recving empty).
 
         # Purge scheduler-finished req state AFTER resolving this step's
@@ -488,14 +489,15 @@ class MembPullReadThread(threading.Thread):
                             "Received MF_META: P session=%s, %d layers", self._p_session, len(self._p_layer_meta)
                         )
                         for layer_name, layer_meta in self._p_layer_meta.items():
-                            logger.info(
-                                "MembPull D recv MF_META layer=%s: base_addrs=%s, "
-                                "block_len=%s, block_size_scale=%s",
-                                layer_name,
-                                layer_meta.get("base_addrs"),
-                                layer_meta.get("block_len"),
-                                layer_meta.get("block_size_scale"),
-                            )
+                            if envs.VLLM_ASCEND_SFA_DEBUG:
+                                logger.info(
+                                    "MembPull D recv MF_META layer=%s: base_addrs=%s, "
+                                    "block_len=%s, block_size_scale=%s",
+                                    layer_name,
+                                    layer_meta.get("base_addrs"),
+                                    layer_meta.get("block_len"),
+                                    layer_meta.get("block_size_scale"),
+                                )
                         sock.send_multipart((identity, b"", b"ACK"))
 
                     elif msg_type == READ_READY:
@@ -503,22 +505,24 @@ class MembPullReadThread(threading.Thread):
                         layer_name = msg[2]
                         ext_req_id = msg[3]  # external req_id — D looks up its own dest blocks by this
                         p_block_ids = msg[4]  # P's source block ids (shared by main + indexer on P)
-                        logger.info(
-                            "MembPull D recv READ_READY: layer=%d (%s), req=%s, p_block_ids=%s",
-                            layer_idx,
-                            layer_name,
-                            ext_req_id,
-                            p_block_ids,
-                        )
-                        try:
-                            self._do_read(layer_name, ext_req_id, p_block_ids)
-                            sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
+                        if envs.VLLM_ASCEND_SFA_DEBUG:
                             logger.info(
-                                "MembPull D sent READ_DONE: layer=%d (%s), req=%s",
+                                "MembPull D recv READ_READY: layer=%d (%s), req=%s, p_block_ids=%s",
                                 layer_idx,
                                 layer_name,
                                 ext_req_id,
+                                p_block_ids,
                             )
+                        try:
+                            self._do_read(layer_name, ext_req_id, p_block_ids)
+                            sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
+                            if envs.VLLM_ASCEND_SFA_DEBUG:
+                                logger.info(
+                                    "MembPull D sent READ_DONE: layer=%d (%s), req=%s",
+                                    layer_idx,
+                                    layer_name,
+                                    ext_req_id,
+                                )
                         except Exception as e:
                             logger.error(
                                 "MembPull read failed for layer %d (%s) req %s: %s",
@@ -534,14 +538,16 @@ class MembPullReadThread(threading.Thread):
                         request_id = msg[1]
                         with self._lock:
                             self._done_requests.add(request_id)
-                        logger.info("MembPull D recv DONE_SENDING: req=%s", request_id)
+                        if envs.VLLM_ASCEND_SFA_DEBUG:
+                            logger.info("MembPull D recv DONE_SENDING: req=%s", request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
 
                     elif msg_type == FAILED_SENDING_MSG:
                         request_id = msg[1]
                         with self._lock:
                             self._failed_requests.add(request_id)
-                        logger.info("MembPull D recv FAILED_SENDING: req=%s", request_id)
+                        if envs.VLLM_ASCEND_SFA_DEBUG:
+                            logger.info("MembPull D recv FAILED_SENDING: req=%s", request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
 
                     elif msg_type == GET_META_MSG:
@@ -595,17 +601,18 @@ class MembPullReadThread(threading.Thread):
             )
             return
         d_indexer_ids, d_main_ids, num_full, partial_hbm_bid = dest  # (npu, cpu, num_full, partial_hbm_bid)
-        logger.info(
-            "MembPull D resolve dest: layer=%s, req=%s, p_block_ids=%s, "
-            "d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, num_full=%s, partial_hbm=%s",
-            layer_name,
-            ext_req_id,
-            p_block_ids,
-            d_main_ids,
-            d_indexer_ids,
-            num_full,
-            partial_hbm_bid,
-        )
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "MembPull D resolve dest: layer=%s, req=%s, p_block_ids=%s, "
+                "d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, num_full=%s, partial_hbm=%s",
+                layer_name,
+                ext_req_id,
+                p_block_ids,
+                d_main_ids,
+                d_indexer_ids,
+                num_full,
+                partial_hbm_bid,
+            )
 
         # Locate the transformer-layer pool index from the MAIN layer name.
         pool_idx = None
@@ -758,21 +765,22 @@ class MembPullReadThread(threading.Thread):
             )
             return
 
-        logger.info(
-            "MembPull D start memfabric read: layer=%s, req=%s, p_session=%s, "
-            "p_block_ids=%s, d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, "
-            "partial_hbm=%s, n_main=%d, n_indexer=%d, transfers=%d",
-            layer_name,
-            ext_req_id,
-            self._p_session,
-            p_block_ids,
-            d_main_ids,
-            d_indexer_ids,
-            partial_hbm_bid,
-            n_main,
-            n_indexer,
-            len(local_ptrs),
-        )
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "MembPull D start memfabric read: layer=%s, req=%s, p_session=%s, "
+                "p_block_ids=%s, d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, "
+                "partial_hbm=%s, n_main=%d, n_indexer=%d, transfers=%d",
+                layer_name,
+                ext_req_id,
+                self._p_session,
+                p_block_ids,
+                d_main_ids,
+                d_indexer_ids,
+                partial_hbm_bid,
+                n_main,
+                n_indexer,
+                len(local_ptrs),
+            )
         ret = self.engine.batch_transfer_sync_read(self._p_session, local_ptrs, peer_ptrs, lengths)
         if ret != 0:
             raise RuntimeError(f"memfabric read failed for layer {layer_name}, ret={ret}")
@@ -781,7 +789,7 @@ class MembPullReadThread(threading.Thread):
         # match P exactly (1:1 byte copy); idx_post is the full D indexer block
         # sum (D blocks are 4× P's and only len(p_block_ids)/scale slots written,
         # so it won't equal P's idx — use it only as a "data landed" check).
-        if os.environ.get("VLLM_ASCEND_MF_VERIFY") == "1":
+        if envs.VLLM_ASCEND_MF_VERIFY:
             try:
                 k_cpu, v_cpu = w._cpu_pools[offload_id]
                 mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
@@ -805,18 +813,19 @@ class MembPullReadThread(threading.Thread):
                 )
             except Exception as ve:  # noqa: BLE001 - verify must never break the read path
                 logger.warning("MFV D checksum failed for %s: %s", layer_name, ve)
-        logger.info(
-            "MembPull D finished read: layer=%s, req=%s, pool_idx=%d, "
-            "main=%d/%d blocks, indexer=%d/%d blocks (scale split), transfers=%d",
-            layer_name,
-            ext_req_id,
-            pool_idx,
-            n_main,
-            len(d_main_ids),
-            n_indexer,
-            len(d_indexer_ids),
-            len(local_ptrs),
-        )
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "MembPull D finished read: layer=%s, req=%s, pool_idx=%d, "
+                "main=%d/%d blocks, indexer=%d/%d blocks (scale split), transfers=%d",
+                layer_name,
+                ext_req_id,
+                pool_idx,
+                n_main,
+                len(d_main_ids),
+                n_indexer,
+                len(d_indexer_ids),
+                len(local_ptrs),
+            )
 
 
 # ======================================================================
@@ -890,14 +899,15 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             return True  # nothing to transfer; not a failure
         encoded = encoder.encode((READ_READY, layer_idx, layer_name, ext_req_id, p_block_ids))
         try:
-            logger.info(
-                "MembPull P send READ_READY: layer=%d (%s), req=%s, p_block_ids=%s, path=%s",
-                layer_idx,
-                layer_name,
-                ext_req_id,
-                p_block_ids,
-                path,
-            )
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "MembPull P send READ_READY: layer=%d (%s), req=%s, p_block_ids=%s, path=%s",
+                    layer_idx,
+                    layer_name,
+                    ext_req_id,
+                    p_block_ids,
+                    path,
+                )
             resp = self._send_recv(path, encoded)
             ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
             if ack_msg[0] != READ_DONE:
@@ -909,13 +919,14 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                     ext_req_id,
                 )
                 return False
-            logger.info(
-                "MembPull P recv READ_DONE: layer=%d (%s), req=%s, ack=%s",
-                layer_idx,
-                layer_name,
-                ext_req_id,
-                ack_msg,
-            )
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "MembPull P recv READ_DONE: layer=%d (%s), req=%s, ack=%s",
+                    layer_idx,
+                    layer_name,
+                    ext_req_id,
+                    ack_msg,
+                )
             return True
         except Exception as e:
             logger.error(
@@ -944,12 +955,13 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
 
         layer_name = send_task.layer_name
         layer_idx = send_task.layer_idx
-        logger.info(
-            "MembPull P transfer task ready: layer=%d (%s), reqs=%s",
-            layer_idx,
-            layer_name,
-            list(send_task.send_request.keys()) if send_task.send_request else [],
-        )
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "MembPull P transfer task ready: layer=%d (%s), reqs=%s",
+                layer_idx,
+                layer_name,
+                list(send_task.send_request.keys()) if send_task.send_request else [],
+            )
 
         if not send_task.send_request:
             logger.warning(
@@ -976,14 +988,15 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
 
         path = make_zmq_path("tcp", remote_host, remote_port)
         encoder = msgspec.msgpack.Encoder()
-        logger.info(
-            "MembPull P transfer endpoint: layer=%d (%s), path=%s, remote_host=%s, remote_port=%s",
-            layer_idx,
-            layer_name,
-            path,
-            remote_host,
-            remote_port,
-        )
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "MembPull P transfer endpoint: layer=%d (%s), path=%s, remote_host=%s, remote_port=%s",
+                layer_idx,
+                layer_name,
+                path,
+                remote_host,
+                remote_port,
+            )
 
         # First call: send MF_META (P session + P layer addresses). P's
         # layer_metadata[main_name] carries [k, v, dsa_k] (3 tensors) because the
@@ -997,14 +1010,15 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                     "block_len": list(meta.block_len),
                     "block_size_scale": list(meta.block_size_scale),
                 }
-                logger.info(
-                    "MembPull P send MF_META layer=%s: base_addrs=%s, "
-                    "block_len=%s, block_size_scale=%s",
-                    ln,
-                    p_meta_dict[ln]["base_addrs"],
-                    p_meta_dict[ln]["block_len"],
-                    p_meta_dict[ln]["block_size_scale"],
-                )
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "MembPull P send MF_META layer=%s: base_addrs=%s, "
+                        "block_len=%s, block_size_scale=%s",
+                        ln,
+                        p_meta_dict[ln]["base_addrs"],
+                        p_meta_dict[ln]["block_len"],
+                        p_meta_dict[ln]["block_size_scale"],
+                    )
             meta_encoded = encoder.encode((MF_META, self.p_session, encoder.encode(p_meta_dict)))
             try:
                 self._send_recv(path, meta_encoded)
@@ -1024,7 +1038,7 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         # up its destination blocks by req_id; P never handles D's block ids.
         # Verify-mode (VLLM_ASCEND_MF_VERIFY=1): log P's source-block sums so the
         # user can diff against D's destination sums (MFV D ...) per (layer, req).
-        verify = os.environ.get("VLLM_ASCEND_MF_VERIFY") == "1"
+        verify = envs.VLLM_ASCEND_MF_VERIFY
         src_caches = getattr(self, "_source_kv_caches", None)
         all_ok = True
         for req_id, rm in send_task.send_request.items():
@@ -1032,7 +1046,8 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             p_block_ids = local[0] if (local and len(local) > 0) else []
             ext_id = get_external_request_id(req_id)
             if layer_idx == 0:
-                logger.info("MembPull P send READ_READY layer 0 req %s: p_blocks=%d", ext_id, len(p_block_ids))
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info("MembPull P send READ_READY layer 0 req %s: p_blocks=%d", ext_id, len(p_block_ids))
             if verify and src_caches is not None and p_block_ids:
                 src = src_caches.get(layer_name)
                 if isinstance(src, (list, tuple)) and len(src) >= 3:
@@ -1069,12 +1084,13 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
             pd_done_events = getattr(self, "layer_transfer_finished_events", None)
             if pd_done_events is not None and 0 <= layer_idx < len(pd_done_events):
                 pd_done_events[layer_idx].set()
-            logger.info(
-                "MembPull P layer send complete: layer=%d (%s), reqs=%s",
-                layer_idx,
-                layer_name,
-                list(send_task.send_request.keys()),
-            )
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "MembPull P layer send complete: layer=%d (%s), reqs=%s",
+                    layer_idx,
+                    layer_name,
+                    list(send_task.send_request.keys()),
+                )
 
         # After the last layer, send DONE_SENDING so D reports done_recving.
         # Send directly via ZMQ (can't use callback_func = send_done_send_signal
@@ -1087,12 +1103,13 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
                     done_encoded = encoder.encode((DONE_SENDING_MSG, external_req_id, 0, ""))
                     try:
                         self._send_recv(path, done_encoded)
-                        logger.info(
-                            "MembPull P sent DONE_SENDING: req=%s, external_req=%s, path=%s",
-                            req_id,
-                            external_req_id,
-                            path,
-                        )
+                        if envs.VLLM_ASCEND_SFA_DEBUG:
+                            logger.info(
+                                "MembPull P sent DONE_SENDING: req=%s, external_req=%s, path=%s",
+                                req_id,
+                                external_req_id,
+                                path,
+                            )
                     except Exception as e:
                         logger.error("MembPull DONE_SENDING failed for %s: %s", req_id, e)
 
@@ -1152,21 +1169,22 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
                 tp_ratio = max(1, self.tp_size // remote_tp_size)
                 old_remote_port = req_meta.remote_port
                 req_meta.remote_port = req_meta.remote_port + self.tp_rank // tp_ratio
-                logger.info(
-                    "MembPull P start_load_kv req %s: remote_host=%s, "
-                    "remote_port=%s->%s, tp_rank=%s, tp_ratio=%s, local_block_ids=%s, "
-                    "chunk_finish=%s, local_computed_tokens=%s, local_transed_tokens=%s",
-                    req_id,
-                    req_meta.remote_host,
-                    old_remote_port,
-                    req_meta.remote_port,
-                    self.tp_rank,
-                    tp_ratio,
-                    req_meta.local_block_ids,
-                    req_meta.chunk_finish,
-                    req_meta.local_computed_tokens,
-                    req_meta.local_transed_tokens,
-                )
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "MembPull P start_load_kv req %s: remote_host=%s, "
+                        "remote_port=%s->%s, tp_rank=%s, tp_ratio=%s, local_block_ids=%s, "
+                        "chunk_finish=%s, local_computed_tokens=%s, local_transed_tokens=%s",
+                        req_id,
+                        req_meta.remote_host,
+                        old_remote_port,
+                        req_meta.remote_port,
+                        self.tp_rank,
+                        tp_ratio,
+                        req_meta.local_block_ids,
+                        req_meta.chunk_finish,
+                        req_meta.local_computed_tokens,
+                        req_meta.local_transed_tokens,
+                    )
             return
         super().start_load_kv(metadata)
 
