@@ -637,14 +637,18 @@ class MembPullReadThread(threading.Thread):
         # in _main_names order).
         offload_id = w.sfa_worker._get_offload_layer_id(layer_name)
         if pool_idx != offload_id:
-            logger.warning(
-                "MembPull _do_read: layer-order mismatch for %s — pull _main_names "
-                "idx=%d != resident offload_id=%d; main MLA was being written to the "
-                "wrong CPU-pool slot. Using offload_id.",
-                layer_name,
-                pool_idx,
-                offload_id,
-            )
+            # Diagnostic only: confirms the layer-order mismatch (_main_names
+            # vs offload_layer_names) was detected and the fix (use offload_id)
+            # handled it. Gated -- the fix is correct, no action needed in prod.
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.warning(
+                    "MembPull _do_read: layer-order mismatch for %s — pull _main_names "
+                    "idx=%d != resident offload_id=%d; main MLA was being written to the "
+                    "wrong CPU-pool slot. Using offload_id.",
+                    layer_name,
+                    pool_idx,
+                    offload_id,
+                )
 
         p_meta = self._p_layer_meta.get(layer_name)
         if p_meta is None:
