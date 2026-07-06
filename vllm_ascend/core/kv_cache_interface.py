@@ -258,15 +258,36 @@ class OffloadMLAAttentionSpec(AttentionSpec):
         )
     
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        """
-        The maximum possible memory usage of this KV cache in bytes.
+        """The maximum possible memory usage of this KV cache in bytes.
 
-        Returns:
-            The KV cache size in bytes
+        Feeds the startup must-fit check (_check_enough_kv_cache_memory) and the
+        max_model_len auto-fit -- NOT num_blocks pool sizing, so changing this
+        only relaxes the max_model_len limit, it does not shrink the pool.
         """
+        ktc = vllm_config.kv_transfer_config
+        if ktc is not None and ktc.kv_role == "kv_consumer":
+            # PD D-side: the main-MLA prefix is pulled into the CPU pool
+            # (null-padded, never HBM). The vLLM pool only holds the per-req
+            # resident tail (~2 real blocks: current partial + one in offload
+            # handoff), bounded by the manager's in-place decode-block free
+            # (OffloadMLAAttentionManager). Size this group as a pool-level safe
+            # upper bound -- (2 + num_speculative) * max_num_seqs blocks -- NOT
+            # cdiv(max_model_len, block_size), so the must-fit check's MLA term
+            # is O(1) and a large max_model_len is bounded by the indexer group.
+            # kv_role == "kv_consumer" (strict) excludes kv_both local offload,
+            # where the prefix does transit HBM during prefill.
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            num_speculative = (
+                vllm_config.speculative_config.num_speculative_tokens
+                if vllm_config.speculative_config is not None
+                else 0
+            )
+            blocks_per_req = 2 + num_speculative
+            return blocks_per_req * max_num_seqs * self.page_size_bytes
+        # Producer (P) or local offload (kv_both) or no kv-transfer: the prefix
+        # transits HBM during prefill before being offloaded, so the peak is the
+        # full max_model_len.
         max_model_len = vllm_config.model_config.max_model_len
-        # can only offload & free after prefill, so need max_model_len
-        # maybe it's better to have a 'max_input_len' attr here
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
 

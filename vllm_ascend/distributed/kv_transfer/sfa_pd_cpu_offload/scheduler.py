@@ -83,7 +83,39 @@ class SFAPDCpuOffloadScheduler:
             for group_spec in (kv_cache_config.kv_cache_groups if kv_cache_config else [])
         ]
         # main MLA group block size (group 1) — the CPU offload granularity.
-        self._main_block_size = self.block_size[_MAIN_GROUP_IDX] if len(self.block_size) > _MAIN_GROUP_IDX else 128
+        # The manager uses its self.block_size to size the null-padded prefix
+        # and the SFA kernel uses _main_block_size (via cpu_blocks_map) as the
+        # num_offloaded_blocks mask threshold; divergence silently over/under-
+        # masks resident KV. Both DERIVE from this group's spec, so they match
+        # WHEN DCP*PCP == 1 (the current PD config). Caveat: vLLM core scales
+        # SingleTypeKVCacheManager.self.block_size by dcp_world_size*
+        # pcp_world_size when either > 1, while _main_block_size here is the RAW
+        # spec value — so under DCP/PCP > 1 the two diverge and this connector's
+        # null-pad/mask coupling is NOT supported without extra work. Assert the
+        # group exists rather than silently falling back to 128.
+        assert len(self.block_size) > _MAIN_GROUP_IDX, (
+            f"PD offload expects a main-MLA group at index {_MAIN_GROUP_IDX}; "
+            f"got groups={self.block_size}"
+        )
+        self._main_block_size = self.block_size[_MAIN_GROUP_IDX]
+
+        # Hard-fail the unsupported DCP/PCP>1 config instead of silently
+        # mis-masking: under DCP*PCP>1 vLLM core scales the manager's
+        # self.block_size (used for the null-pad width) while _main_block_size
+        # here stays raw (used for the attention num_offloaded_blocks mask
+        # threshold). Divergence -> null-pad width != mask width -> resident KV
+        # read from wrong slots (silent corruption). PD with DCP/PCP>1 is not
+        # supported by this connector. (Asserted here, on the D-side consumer
+        # scheduler, because null-pad only activates for remote-prefilled reqs.)
+        pcp = vllm_config.parallel_config.prefill_context_parallel_size
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        assert pcp * dcp == 1, (
+            f"SFAPDCpuOffloadConnector null-pad/mask coupling requires "
+            f"DCP*PCP == 1 (got pcp={pcp}, dcp={dcp}); the manager block_size "
+            f"is scaled by dcp*pcp while _main_block_size stays raw, so the "
+            f"null-pad width and the attention mask threshold diverge. PD with "
+            f"DCP/PCP>1 is not supported."
+        )
 
         self.side_channel_host = get_ip()
         self.side_channel_port = (
@@ -283,6 +315,23 @@ class SFAPDCpuOffloadScheduler:
             end = min(num_blocks_after_step, len(tracker.main_hbm_ids))
             offload_src = tracker.main_hbm_ids[num_offloaded:end] if end > num_offloaded else []
             offload_dst = self.cpu_block_manager.allocate_block(len(offload_src)) if offload_src else []
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                # Show the slice arithmetic so a hardware run can confirm the
+                # offload range skips the null-padded prefix ([0:N]) and catches
+                # real decode blocks ([N:end]). main_hbm_ids includes the null
+                # prefix (get_block_ids does not filter nulls), so num_offloaded
+                # (=N from Part A) correctly offsets past it.
+                logger.info(
+                    "SFAPD B1 offload slice req %s: num_blocks_after_step=%d, "
+                    "len(main_hbm_ids)=%d, slice=[%d:%d] -> %d blocks (null_prefix=%d)",
+                    req_id,
+                    num_blocks_after_step,
+                    len(tracker.main_hbm_ids),
+                    num_offloaded,
+                    end,
+                    len(offload_src),
+                    tracker.num_full,
+                )
             if offload_src:
                 tracker.allocated_block_ids_cpu.extend(offload_dst)
                 logger.info(
