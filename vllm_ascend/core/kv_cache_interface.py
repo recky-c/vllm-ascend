@@ -24,6 +24,46 @@ def _get_c8_k_scale_cache_dtype() -> torch.dtype:
     return torch.float32 if get_ascend_device_type() == AscendDeviceType.A5 else torch.float16
 
 
+# GLM5.2 / DSV3.2 SFA offload + LIC8 unified pool layout (spec_0 / spec_1).
+# spec_0: k(512) + v(64) + pad(8 bf16 slots) per 128-token main page.
+# spec_1: idx(128 int8) + pad(16) + scale(2 fp16) per 128-token indexer slot;
+#         indexer kernel block_size = 8 * main block_size (1024 tokens).
+# main_page_bytes : indexer_page_bytes == 8 : 1 for unify_kv_cache_spec_page_size.
+OFFLOAD_C8_KV_PAD_DIM = 8
+OFFLOAD_C8_INDEXER_BLOCK_MULTIPLIER = 8
+
+
+def offload_c8_main_page_size_bytes(
+    block_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    dtype: torch.dtype,
+    *,
+    num_kv_heads: int = 1,
+) -> int:
+    dtype_size = get_dtype_size(dtype)
+    return block_size * num_kv_heads * (
+        kv_lora_rank * dtype_size
+        + qk_rope_head_dim * dtype_size
+        + OFFLOAD_C8_KV_PAD_DIM * dtype_size
+    )
+
+
+def offload_c8_indexer_page_size_bytes(
+    block_size: int,
+    index_head_dim: int,
+    indexer_pad_dim: int,
+    scale_dtype: torch.dtype,
+    *,
+    num_kv_heads: int = 1,
+) -> int:
+    return block_size * num_kv_heads * (
+        index_head_dim * get_dtype_size(torch.int8)
+        + indexer_pad_dim
+        + get_dtype_size(scale_dtype)
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class AscendMLAAttentionSpec(MLAAttentionSpec):
     """MLAAttentionSpec extended to support DSA models, with optional Sparse C8 support.
@@ -54,11 +94,26 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     scale_dtype: torch.dtype = torch.int8
     sparse_head_dim: tuple[int, ...] | None = None
     cache_sparse_c8: bool = False
+    # C8 + SFA offload: indexer bytes are carved from the same paged pool as main
+    # MLA (8:1 page ratio). page_size_bytes uses spec_1 byte mix, not the non-offload
+    # C8 formula that also charges kv_lora/k_rope.
+    offload_unified_pool_c8: bool = False
     c8_k_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_cache_dtype)
     c8_k_scale_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_scale_cache_dtype)
 
     @property
     def page_size_bytes(self) -> int:
+        if self.offload_unified_pool_c8:
+            assert self.sparse_head_dim is not None
+            index_head_dim = self.sparse_head_dim[2]
+            return offload_c8_indexer_page_size_bytes(
+                self.block_size,
+                index_head_dim,
+                self.scale_dim,
+                self.c8_k_scale_cache_dtype,
+                num_kv_heads=self.num_kv_heads,
+            )
+
         if self.cache_sparse_c8:
             assert self.sparse_head_dim is not None
             assert len(self.sparse_head_dim) == 3
@@ -170,6 +225,13 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         assert len(cache_sparse_c8_set) == 1, (
             "All attention layers in the same KV cache group must use the same sparse C8 setting."
         )
+        offload_unified_pool_c8_set = set(
+            spec.offload_unified_pool_c8 for spec in specs
+        )
+        assert len(offload_unified_pool_c8_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "offload unified-pool C8 setting."
+        )
         return cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -180,6 +242,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             dtype=specs[0].dtype,
             cache_dtype_str=cache_dtype_str_set.pop(),
             cache_sparse_c8=specs[0].cache_sparse_c8,
+            offload_unified_pool_c8=specs[0].offload_unified_pool_c8,
         )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
@@ -246,8 +309,11 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class OffloadMLAAttentionSpec(AttentionSpec):
+    # Per-token bf16 pad slots in spec_0 (main treats as pad; index uses as scale).
+    kv_pad_dim: int = 0
+
     @property
     def real_page_size_bytes(self) -> int:
         return (
@@ -256,6 +322,17 @@ class OffloadMLAAttentionSpec(AttentionSpec):
             * self.head_size
             * get_dtype_size(self.dtype)
         )
+
+    @property
+    def page_size_bytes(self) -> int:
+        if self.kv_pad_dim:
+            return self.real_page_size_bytes + (
+                self.block_size
+                * self.num_kv_heads
+                * self.kv_pad_dim
+                * get_dtype_size(self.dtype)
+            )
+        return self.real_page_size_bytes
     
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """The maximum possible memory usage of this KV cache in bytes.
