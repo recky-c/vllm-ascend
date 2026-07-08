@@ -266,24 +266,13 @@ class OffloadMLAAttentionSpec(AttentionSpec):
         """
         ktc = vllm_config.kv_transfer_config
         if ktc is not None and ktc.kv_role == "kv_consumer":
-            # PD D-side: the main-MLA prefix is pulled into the CPU pool
-            # (null-padded, never HBM). The vLLM pool only holds the per-req
-            # resident tail (~2 real blocks: current partial + one in offload
-            # handoff), bounded by the manager's in-place decode-block free
-            # (OffloadMLAAttentionManager). Size this group as a pool-level safe
-            # upper bound -- (2 + num_speculative) * max_num_seqs blocks -- NOT
-            # cdiv(max_model_len, block_size), so the must-fit check's MLA term
-            # is O(1) and a large max_model_len is bounded by the indexer group.
-            # kv_role == "kv_consumer" (strict) excludes kv_both local offload,
-            # where the prefix does transit HBM during prefill.
-            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-            num_speculative = (
-                vllm_config.speculative_config.num_speculative_tokens
-                if vllm_config.speculative_config is not None
-                else 0
-            )
-            blocks_per_req = 2 + num_speculative
-            return blocks_per_req * max_num_seqs * self.page_size_bytes
+            # PD D-side: the main-MLA prefix is null-padded (no HBM), but with
+            # the in-place decode-block free removed (it raced the connector's
+            # async HBM->CPU copy under high concurrency) decode blocks now stay
+            # resident. The per-req peak is therefore the full max_model_len,
+            # not the ~(2 + num_speculative) resident tail. Size accordingly.
+            max_model_len = vllm_config.model_config.max_model_len
+            return cdiv(max_model_len, self.block_size) * self.page_size_bytes
         # Producer (P) or local offload (kv_both) or no kv-transfer: the prefix
         # transits HBM during prefill before being offloaded, so the peak is the
         # full max_model_len.
