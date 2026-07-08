@@ -10,6 +10,7 @@ HBM. The D-side load path (LRU-resident H2D) is reused from
 See ``/Users/liufeng/.claude/plans/luminous-shimmying-wind.md`` for the design.
 """
 
+import re
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.request import Request
+
+_LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
 
 
 class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -167,9 +170,24 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.start_load_kv(self._get_connector_metadata())
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # SFA loads inside ``prepare_lru_resident_and_load`` (D); P waits via
-        # ``wait_for_layer_send`` when its layer buffer may be reused.
-        return
+        """Per-layer gate called before each layer's attention computation.
+
+        D-side: no-op (SFA loads inside ``prepare_lru_resident_and_load``).
+        P-side: **buffer-reuse gate** — before P overwrites a shared HBM buffer
+        for this layer, ensure D has finished reading it (READ_DONE received).
+        Uses ``wait_for_layer_send(layer_idx)`` internally.
+
+        The per-layer send-done events are cleared when a READ_READY_BATCH is
+        sent and set again by the pipelined MembPull send thread when READ_DONE
+        arrives. Events are initially set, so the first cycle does not block.
+        """
+        if not self.is_producer:
+            return
+        match = _LAYER_IDX_RE.search(layer_name)
+        if match is None:
+            return
+        layer_idx = int(match.group(1))
+        self.wait_for_layer_send(layer_idx)
 
     def save_kv_layer(
         self,
@@ -179,9 +197,11 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         **kwargs,
     ) -> None:
         assert self.connector_worker is not None
-        # NOTE: signature diverges by role — mooncake (P) needs the metadata
-        # tuple, the composed SFA worker (D) takes none. The worker branches
-        # internally; we forward the bound args.
+        # SFA attention calls this every forward, including profiling / graph
+        # capture where no per-step connector metadata is bound. Nothing to save
+        # then; skip rather than trip _get_connector_metadata's assert.
+        if not self.has_connector_metadata():
+            return
         self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, self._get_connector_metadata())
 
     def wait_for_save(self):

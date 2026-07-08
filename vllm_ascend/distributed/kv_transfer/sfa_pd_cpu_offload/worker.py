@@ -4,7 +4,7 @@
 
 D (``kv_consumer``): composes :class:`SFAKVOffloadWorker` for the LRU-resident
 H2D load path + CPU pool, and runs a memfabric pull read thread. P notifies D
-per layer via READ_READY; D reads indexer KV into HBM and main MLA KV into the
+per layer via READ_READY_BATCH; D reads indexer KV into HBM and main MLA KV into the
 CPU pool (the partial last block stays in HBM until decode fills it, then the
 B1 offload path copies it to CPU).
 
@@ -16,11 +16,13 @@ send setup, but swaps in a pull-mode sending thread that notifies D to read
 from __future__ import annotations
 
 import math
+import queue
 import re
 import threading
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import numpy as np
 import torch
 import zmq
 from vllm.config import VllmConfig
@@ -33,15 +35,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_connector as _mlc
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    DONE_SENDING_MSG,
-    FAILED_SENDING_MSG,
     GET_META_MSG,
     KVCacheSendingLayerThread,
     LayerMetadata,
     MooncakeAgentMetadata,
     MooncakeLayerwiseConnectorWorker,
-    ensure_zmq_recv,
-    ensure_zmq_send,
     get_external_request_id,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
@@ -74,12 +72,35 @@ def _layer_idx(layer_name: str) -> int:
     return int(match.group(1))
 
 
+def _coalesce_desc(
+    peer: np.ndarray,
+    local: np.ndarray,
+    length: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge adjacent descriptors whose peer AND local addresses are both
+    contiguous into one descriptor of summed length. The memfabric engine
+    issues one transfer per descriptor, so coalescing a run of R contiguous
+    blocks into one descriptor cuts both descriptor count and per-op overhead.
+    Lossless: the merged descriptor covers exactly the same bytes."""
+    n = peer.shape[0]
+    if n <= 1:
+        return peer, local, length
+    contiguous = (peer[1:] == peer[:-1] + length[:-1]) & (local[1:] == local[:-1] + length[:-1])
+    if contiguous.all():
+        return peer[:1], local[:1], np.array([int(length.sum())], dtype=np.int64)
+    run_start = np.concatenate(([0], np.nonzero(~contiguous)[0] + 1))
+    run_end = np.append(run_start[1:] - 1, n - 1)
+    cum = np.cumsum(length)
+    merged_len = cum[run_end] - cum[run_start] + length[run_start]
+    return peer[run_start], local[run_start], merged_len
+
+
 MF_META = b"mf_meta"  # P→D: (MF_META, p_session, p_layer_meta_serialized)
-# READ_READY (pull model): P sends only its OWN source block ids + the external
-# req_id; D looks up its destination blocks by req_id (D's block ids never
-# travel to P). One READ_READY per (layer, req).
-READ_READY = b"read_ready"  # P→D: (READ_READY, layer_idx, layer_name, ext_req_id, p_block_ids)
-READ_DONE = b"read_done"  # D→P: (READ_DONE, layer_idx)
+# READ_READY_BATCH (pull model): P sends its OWN source block ids + external
+# req_ids for one layer; D looks up its destination blocks by req_id.
+READ_READY_BATCH = b"read_ready_batch"  # P→D: one layer of (ext_req_id, p_block_ids) + done req ids
+READ_DONE = b"read_done"  # D→P: (READ_DONE, layer_idx), successful read only
+READ_FAILED = b"read_failed"  # D→P: (READ_FAILED, layer_idx, error)
 
 
 def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
@@ -132,10 +153,9 @@ class SFAPDCpuOffloadConsumerWorker:
         # main layer name -> (k_nope HBM, v_rope HBM); the partial block's HBM
         # dest. Populated in register_kv_caches.
         self._hbm_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        # External req ids whose DONE/FAILED signal arrived before request_map
+        # External req ids whose DONE signal arrived before request_map
         # was seeded (see get_finished). Retried every step until mapped.
         self._pending_done: set[str] = set()
-        self._pending_failed: set[str] = set()
 
     # ------------------------------------------------------------------
     # Common
@@ -193,7 +213,7 @@ class SFAPDCpuOffloadConsumerWorker:
         # (num_new_offload_blocks > 0 triggers it in sfa_worker.start_load_kv).
         # Seed external->internal request id map for get_finished, and store D's
         # own destination blocks per request (keyed by external id, which is what
-        # P sends in READ_READY). The scheduler includes remote-prefill requests
+        # P sends in READ_READY_BATCH). The scheduler includes remote-prefill requests
         # here (even while async-waiting) so both exist before P's signal arrives.
         for req in getattr(metadata, "requests", []):
             req_id = getattr(req, "req_id", None)
@@ -272,7 +292,6 @@ class SFAPDCpuOffloadConsumerWorker:
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
             self._pending_done.discard(ext_id)
-            self._pending_failed.discard(ext_id)
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
         done_recving: set[str] = set()
@@ -289,31 +308,19 @@ class SFAPDCpuOffloadConsumerWorker:
                     still_pending.add(ext_id)
             self._pending_done = still_pending
 
-            # Failed requests: unblock them (load will error / wrong KV)
-            failed = self._mf_read_thread.get_and_clear_failed()
-            still_pending_failed: set[str] = set()
-            for ext_id in failed | self._pending_failed:
-                internal = self.request_map.get(ext_id)
-                if internal is not None:
-                    done_recving.add(internal)
-                else:
-                    still_pending_failed.add(ext_id)
-            self._pending_failed = still_pending_failed
-            if done or failed or done_recving or self._pending_done or self._pending_failed:
+            if done or done_recving or self._pending_done:
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
-                        "MembPull D get_finished: done_ext=%s, failed_ext=%s, "
-                        "done_recving_internal=%s, pending_done_ext=%s, pending_failed_ext=%s",
+                        "MembPull D get_finished: done_ext=%s, "
+                        "done_recving_internal=%s, pending_done_ext=%s",
                         done,
-                        failed,
                         done_recving,
                         self._pending_done,
-                        self._pending_failed,
                     )
         # else: read thread not up yet -> nothing finished (done_recving empty).
 
         # Purge scheduler-finished req state AFTER resolving this step's
-        # done/failed signals against request_map. Doing it at the top would pop
+        # done signals against request_map. Doing it at the top would pop
         # request_map[ext_id] and discard _pending_done[ext_id] before the
         # resolution loop above, leaking any finished req whose DONE arrives in
         # the same step (unmappable -> stuck in _pending_done forever).
@@ -351,6 +358,7 @@ class SFAPDCpuOffloadConsumerWorker:
         # Store layer info for MembPullReadThread
         self._indexer_names = indexer_names
         self._main_names = main_names
+        self._main_name_to_idx = {n: i for i, n in enumerate(main_names)}
         self._cpu_pools = list(zip(k_caches_cpu, v_caches_cpu))
         self._indexer_tensors = []
         for main_name in main_names:
@@ -417,8 +425,9 @@ class SFAPDCpuOffloadConsumerWorker:
 # memfabric pull mode — D reads from P HBM
 # ======================================================================
 class MembPullReadThread(threading.Thread):
-    """D-side thread for memfabric pull: receives READ_READY from P,
-    reads KV from P's HBM via batch_transfer_sync_read, sends READ_DONE.
+    """D-side thread for memfabric pull: receives READ_READY_BATCH from P,
+    reads KV from P's HBM via batch_transfer_sync_read, then replies with
+    READ_DONE or READ_FAILED.
 
     indexer → D HBM (direct), main MLA → D CPU pool DRAM (local target,
     no registration needed per memfabric read semantics).
@@ -442,7 +451,6 @@ class MembPullReadThread(threading.Thread):
         self._p_layer_meta: dict[str, Any] = {}
         # done tracking (req-level)
         self._done_requests: set[str] = set()
-        self._failed_requests: set[str] = set()
         self._lock = threading.Lock()
         self._host = get_ip()
 
@@ -451,12 +459,6 @@ class MembPullReadThread(threading.Thread):
             d = self._done_requests
             self._done_requests = set()
             return d
-
-    def get_and_clear_failed(self) -> set[str]:
-        with self._lock:
-            f = self._failed_requests
-            self._failed_requests = set()
-            return f
 
     def run(self):
         from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
@@ -500,55 +502,46 @@ class MembPullReadThread(threading.Thread):
                                 )
                         sock.send_multipart((identity, b"", b"ACK"))
 
-                    elif msg_type == READ_READY:
+                    elif msg_type == READ_READY_BATCH:
                         layer_idx = msg[1]
                         layer_name = msg[2]
-                        ext_req_id = msg[3]  # external req_id — D looks up its own dest blocks by this
-                        p_block_ids = msg[4]  # P's source block ids (shared by main + indexer on P)
+                        read_reqs = [(entry[0], list(entry[1])) for entry in msg[3]]
+                        done_ext_ids = list(msg[4]) if len(msg) > 4 else []
                         if envs.VLLM_ASCEND_SFA_DEBUG:
                             logger.info(
-                                "MembPull D recv READ_READY: layer=%d (%s), req=%s, p_block_ids=%s",
+                                "MembPull D recv READ_READY_BATCH: layer=%d (%s), reqs=%d, done_reqs=%d",
                                 layer_idx,
                                 layer_name,
-                                ext_req_id,
-                                p_block_ids,
+                                len(read_reqs),
+                                len(done_ext_ids),
                             )
                         try:
-                            self._do_read(layer_name, ext_req_id, p_block_ids)
+                            if read_reqs:
+                                self._do_read_batch(layer_name, read_reqs)
                             sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
                             if envs.VLLM_ASCEND_SFA_DEBUG:
                                 logger.info(
-                                    "MembPull D sent READ_DONE: layer=%d (%s), req=%s",
+                                    "MembPull D sent READ_DONE: layer=%d (%s), reqs=%d, done_reqs=%d",
                                     layer_idx,
                                     layer_name,
-                                    ext_req_id,
+                                    len(read_reqs),
+                                    len(done_ext_ids),
                                 )
                         except Exception as e:
                             logger.error(
-                                "MembPull read failed for layer %d (%s) req %s: %s",
+                                "MembPull batch read failed for layer %d (%s), reqs=%d: %s",
                                 layer_idx,
                                 layer_name,
-                                ext_req_id,
+                                len(read_reqs),
                                 e,
                             )
-                            sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
-
-                    elif msg_type == DONE_SENDING_MSG:
-                        # P finished all layers for this request
-                        request_id = msg[1]
-                        with self._lock:
-                            self._done_requests.add(request_id)
-                        if envs.VLLM_ASCEND_SFA_DEBUG:
-                            logger.info("MembPull D recv DONE_SENDING: req=%s", request_id)
-                        sock.send_multipart((identity, b"", b"ACK"))
-
-                    elif msg_type == FAILED_SENDING_MSG:
-                        request_id = msg[1]
-                        with self._lock:
-                            self._failed_requests.add(request_id)
-                        if envs.VLLM_ASCEND_SFA_DEBUG:
-                            logger.info("MembPull D recv FAILED_SENDING: req=%s", request_id)
-                        sock.send_multipart((identity, b"", b"ACK"))
+                            payload = encoder.encode((READ_FAILED, layer_idx, str(e)))
+                            sock.send_multipart((identity, b"", payload))
+                        # Mark done outside the try so a last-layer read failure
+                        # (READ_FAILED, sent above) still unblocks get_finished.
+                        if done_ext_ids:
+                            with self._lock:
+                                self._done_requests.update(done_ext_ids)
 
                     elif msg_type == GET_META_MSG:
                         # D responds with its own metadata (for compatibility)
@@ -566,32 +559,104 @@ class MembPullReadThread(threading.Thread):
         finally:
             ctx.destroy(linger=0)
 
-    def _do_read(
+    def _resolve_read_layer(self, layer_name: str) -> dict[str, Any] | None:
+        """Resolve all layer-constant read state once per layer. The old code
+        recomputed this per request (a linear scan of _main_names, an offload_id
+        lookup, a p_meta lookup, and all base/length/scale derivation per req).
+        Returns None if the whole layer must be skipped (logged once); per-req
+        skips stay in _build_req_descriptors."""
+        w = self._worker
+        pool_idx = w._main_name_to_idx.get(layer_name)
+        if pool_idx is None:
+            logger.warning("MembPull _do_read: layer %s not in main names, skip", layer_name)
+            return None
+        # Main-MLA CPU pool is indexed by the resident-load offload_id, NOT pool_idx
+        # (_cpu_pools follows offload_layer_names order; _main_names/indexer tensors
+        # follow the indexer group). pool_idx stays correct for the indexer tensor.
+        offload_id = w.sfa_worker._get_offload_layer_id(layer_name)
+        if pool_idx != offload_id and envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.warning(
+                "MembPull _do_read: layer-order mismatch for %s — pull _main_names "
+                "idx=%d != resident offload_id=%d; main MLA was being written to the "
+                "wrong CPU-pool slot. Using offload_id.",
+                layer_name, pool_idx, offload_id,
+            )
+        p_meta = self._p_layer_meta.get(layer_name)
+        if p_meta is None:
+            logger.warning(
+                "MembPull _do_read: layer %s not in P layer_meta (MF_META not received? have %d layers), skip",
+                layer_name,
+                len(self._p_layer_meta),
+            )
+            return None
+        p_base_addrs = p_meta["base_addrs"]
+        p_block_len = p_meta["block_len"]
+
+        k_cpu, v_cpu = w._cpu_pools[offload_id]
+        hbm_kv = w._hbm_kv.get(layer_name)
+        if hbm_kv is None:
+            k_hbm_ptr = v_hbm_ptr = None
+        else:
+            k_hbm_ptr, v_hbm_ptr = hbm_kv[0].data_ptr(), hbm_kv[1].data_ptr()
+
+        # Indexer leg constants (None if the layer can't do the indexer leg).
+        indexer = None
+        if len(p_base_addrs) < 3:
+            logger.error(
+                "MembPull indexer: P layer_meta for %s has %d tensors, need >=3 "
+                "(dsa_k must be registered as the main layer's tensor [2]); skip indexer leg",
+                layer_name,
+                len(p_base_addrs),
+            )
+        else:
+            p_dsa_len = p_block_len[2]
+            d_indexer = w._indexer_tensors[pool_idx]
+            d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
+            if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
+                logger.error(
+                    "MembPull indexer %s: D dsa_k block_len=%d not a multiple of P=%d; skip indexer leg",
+                    layer_name,
+                    d_dsa_len,
+                    p_dsa_len,
+                )
+            else:
+                indexer = {
+                    "p_dsa_base": p_base_addrs[2],
+                    "p_dsa_len": p_dsa_len,
+                    "d_base": d_indexer.data_ptr(),
+                    "d_dsa_len": d_dsa_len,
+                    "scale": d_dsa_len // p_dsa_len,
+                    "shape": tuple(d_indexer.shape),
+                }
+
+        return {
+            "layer_name": layer_name,
+            "pool_idx": pool_idx,
+            "offload_id": offload_id,
+            "p_k_base": p_base_addrs[0],
+            "p_v_base": p_base_addrs[1],
+            "p_k_len": p_block_len[0],
+            "p_v_len": p_block_len[1],
+            "k_cpu_ptr": k_cpu.data_ptr(),
+            "v_cpu_ptr": v_cpu.data_ptr(),
+            "k_hbm_ptr": k_hbm_ptr,
+            "v_hbm_ptr": v_hbm_ptr,
+            "indexer": indexer,
+        }
+
+    def _build_req_descriptors(
         self,
-        layer_name: str,
+        layer: dict[str, Any],
         ext_req_id: str,
         p_block_ids: list[int],
-    ) -> None:
-        """Read one layer's KV (main MLA + indexer) from P HBM → D in one pull.
-
-        P sends only its source block ids + ext_req_id; D looks up its OWN
-        destination blocks for this request in
-        ``worker._dest_blocks_by_req[ext_req_id]`` = (indexer_npu_ids,
-        main_cpu_ids). Those were allocated by D's scheduler and passed to the
-        worker via connector_meta (pull model: D's block ids never travel to P).
-
-        Both legs share ``p_block_ids`` (on P the indexer is written into
-        dsa_k_cache at the SAME slots as main MLA). Destinations differ:
-          main     → D CPU pool at main_cpu_ids (P tensors [0]=k, [1]=v)
-          indexer  → D indexer HBM at indexer_npu_ids (P tensor [2]=dsa_k)
-
-        All transfers are issued in a single ``batch_transfer_sync_read``.
-        """
-        if self._p_session is None:
-            raise RuntimeError("MF_META not received before READ_READY")
-
+        want_info: bool,
+    ) -> tuple[list[int], list[int], list[int], dict[str, Any] | None]:
+        """Build memfabric read descriptors for one request using layer-constant
+        state from _resolve_read_layer. Empty ptrs (+ None info) for per-req
+        skips (no dest / empty p_block_ids / nothing to transfer)."""
         w = self._worker
-        # D's own destination blocks for this request (allocated by D scheduler).
+        layer_name = layer["layer_name"]
+
         dest = w._dest_blocks_by_req.get(ext_req_id)
         if dest is None:
             logger.warning(
@@ -599,7 +664,7 @@ class MembPullReadThread(threading.Thread):
                 ext_req_id,
                 layer_name,
             )
-            return
+            return [], [], [], None
         d_indexer_ids, d_main_ids, num_full, partial_hbm_bid = dest  # (npu, cpu, num_full, partial_hbm_bid)
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info(
@@ -613,186 +678,131 @@ class MembPullReadThread(threading.Thread):
                 num_full,
                 partial_hbm_bid,
             )
-
-        # Locate the transformer-layer pool index from the MAIN layer name.
-        pool_idx = None
-        for idx, mname in enumerate(w._main_names):
-            if layer_name == mname:
-                pool_idx = idx
-                break
-        if pool_idx is None:
-            logger.warning("MembPull _do_read: layer %s not in main names, skip", layer_name)
-            return
-
-        # Main-MLA CPU-pool index MUST match the resident-load side. _main_names
-        # (and the _indexer_tensors array used below) are ordered by the indexer
-        # group, but the sfa_worker CPU pool (k_caches_cpu / _cpu_pools) is ordered
-        # by offload_layer_names (kv_caches dict order). If those orderings differ,
-        # indexing the pool with pool_idx writes this layer's KV into another
-        # layer's slot while the resident load later reads yet another slot —
-        # scrambling every layer's KV (output goes fully garbled; MFV sums still
-        # match because they checksum the slot the pull targeted, not the slot the
-        # resident read path uses). Index the main-MLA pool by the resident-load
-        # offload_id; pool_idx is still correct for _indexer_tensors (that array is
-        # in _main_names order).
-        offload_id = w.sfa_worker._get_offload_layer_id(layer_name)
-        if pool_idx != offload_id:
-            # Diagnostic only: confirms the layer-order mismatch (_main_names
-            # vs offload_layer_names) was detected and the fix (use offload_id)
-            # handled it. Gated -- the fix is correct, no action needed in prod.
-            if envs.VLLM_ASCEND_SFA_DEBUG:
-                logger.warning(
-                    "MembPull _do_read: layer-order mismatch for %s — pull _main_names "
-                    "idx=%d != resident offload_id=%d; main MLA was being written to the "
-                    "wrong CPU-pool slot. Using offload_id.",
-                    layer_name,
-                    pool_idx,
-                    offload_id,
-                )
-
-        p_meta = self._p_layer_meta.get(layer_name)
-        if p_meta is None:
-            logger.warning(
-                "MembPull _do_read: layer %s not in P layer_meta (MF_META not received? have %d layers), skip",
-                layer_name,
-                len(self._p_layer_meta),
-            )
-            return
-
         if not p_block_ids:
             logger.warning("MembPull _do_read: empty p_block_ids for %s, skip", layer_name)
-            return
+            return [], [], [], None
 
-        p_base_addrs = p_meta["base_addrs"]
-        p_block_len = p_meta["block_len"]
+        p_k_base, p_v_base = layer["p_k_base"], layer["p_v_base"]
+        p_k_len, p_v_len = layer["p_k_len"], layer["p_v_len"]
 
-        local_ptrs: list[int] = []
-        peer_ptrs: list[int] = []
-        lengths: list[int] = []
+        peer_chunks: list[np.ndarray] = []
+        local_chunks: list[np.ndarray] = []
+        length_chunks: list[np.ndarray] = []
         n_main = 0
         n_indexer = 0
 
-        # Main MLA leg. Part A: the first `num_full` of P's blocks are FULL → D
-        # CPU pool (1:1 with d_main_ids); the optional last block is the PARTIAL
-        # → D main MLA HBM (group1) at partial_hbm_bid, so decode can append.
-        p_k_base, p_v_base = p_base_addrs[0], p_base_addrs[1]
-        p_k_len, p_v_len = p_block_len[0], p_block_len[1]
+        # Main MLA leg: first `num_full` P blocks FULL -> D CPU pool; optional
+        # last PARTIAL -> D HBM.
         full_p_blocks = p_block_ids[:num_full]
-        if full_p_blocks and d_main_ids:
-            k_cpu, v_cpu = w._cpu_pools[offload_id]
-            for p_bid, d_bid in zip(full_p_blocks, d_main_ids):
-                peer_ptrs.append(p_k_base + p_bid * p_k_len)
-                local_ptrs.append(k_cpu.data_ptr() + d_bid * p_k_len)
-                lengths.append(p_k_len)
-                peer_ptrs.append(p_v_base + p_bid * p_v_len)
-                local_ptrs.append(v_cpu.data_ptr() + d_bid * p_v_len)
-                lengths.append(p_v_len)
-            n_main = min(len(full_p_blocks), len(d_main_ids))
-        # Partial last block → D HBM (whole block_size transfers; the tail beyond
-        # prompt_len is garbage and gets overwritten as decode appends).
+        n_full = min(len(full_p_blocks), len(d_main_ids))
+        if n_full:
+            full_p = np.array(full_p_blocks[:n_full], dtype=np.int64)
+            d_main = np.array(d_main_ids[:n_full], dtype=np.int64)
+            len_k = np.full(n_full, p_k_len, dtype=np.int64)
+            len_v = np.full(n_full, p_v_len, dtype=np.int64)
+            # Coalesce the k and v legs separately (each is in block order); a run
+            # of contiguous blocks on both P and D becomes one descriptor.
+            cp, cl, clen = _coalesce_desc(p_k_base + full_p * p_k_len,
+                                          layer["k_cpu_ptr"] + d_main * p_k_len, len_k)
+            peer_chunks.append(cp)
+            local_chunks.append(cl)
+            length_chunks.append(clen)
+            cp, cl, clen = _coalesce_desc(p_v_base + full_p * p_v_len,
+                                          layer["v_cpu_ptr"] + d_main * p_v_len, len_v)
+            peer_chunks.append(cp)
+            local_chunks.append(cl)
+            length_chunks.append(clen)
+            n_main = n_full
         if partial_hbm_bid is not None and num_full < len(p_block_ids):
-            hbm_kv = w._hbm_kv.get(layer_name)
-            if hbm_kv is None:
+            k_hbm_ptr = layer["k_hbm_ptr"]
+            if k_hbm_ptr is None:
                 logger.warning("MembPull _do_read: no HBM k/v for partial block %s, skip partial", layer_name)
             else:
-                k_hbm, v_hbm = hbm_kv
                 partial_p_bid = p_block_ids[num_full]
-                peer_ptrs.append(p_k_base + partial_p_bid * p_k_len)
-                local_ptrs.append(k_hbm.data_ptr() + partial_hbm_bid * p_k_len)
-                lengths.append(p_k_len)
-                peer_ptrs.append(p_v_base + partial_p_bid * p_v_len)
-                local_ptrs.append(v_hbm.data_ptr() + partial_hbm_bid * p_v_len)
-                lengths.append(p_v_len)
+                peer_chunks.append(np.array(
+                    [p_k_base + partial_p_bid * p_k_len,
+                     p_v_base + partial_p_bid * p_v_len], dtype=np.int64))
+                local_chunks.append(np.array(
+                    [k_hbm_ptr + partial_hbm_bid * p_k_len,
+                     layer["v_hbm_ptr"] + partial_hbm_bid * p_v_len], dtype=np.int64))
+                length_chunks.append(np.array([p_k_len, p_v_len], dtype=np.int64))
                 n_main += 1
 
-        # Indexer leg: P tensor [2]=dsa_k → D indexer HBM. D's indexer
-        # block_size is `scale`× P's (D uses coarser indexer blocks, e.g. 4× →
-        # fewer of them: 2 D blocks cover the same tokens as ~7-8 P blocks), so
-        # each D indexer block is split into `scale` P-sized sub-addresses to
-        # align with P's finer block list. Extra D sub-addresses (D_blocks ×
-        # scale > len(P blocks)) are discarded by zip.
-        if d_indexer_ids:
-            if len(p_base_addrs) < 3:
-                logger.error(
-                    "MembPull indexer: P layer_meta for %s has %d tensors, need >=3 "
-                    "(dsa_k must be registered as the main layer's tensor [2]); skip indexer leg",
-                    layer_name,
-                    len(p_base_addrs),
-                )
-            else:
-                p_dsa_base = p_base_addrs[2]
-                p_dsa_len = p_block_len[2]  # P per-indexer-block bytes (kv-block granularity)
-                d_indexer = w._indexer_tensors[pool_idx]
-                # D per-indexer-block bytes (coarser — spans scale× P's blocks).
-                d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
-                d_base = d_indexer.data_ptr()
-                if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
-                    logger.error(
-                        "MembPull indexer %s: D dsa_k block_len=%d not a multiple of P=%d; skip indexer leg",
-                        layer_name,
-                        d_dsa_len,
-                        p_dsa_len,
-                    )
-                else:
-                    scale = d_dsa_len // p_dsa_len
-                    # Split each D indexer block into `scale` P-sized sub-addresses.
-                    d_sub_addrs: list[int] = []
-                    for d_bid in d_indexer_ids:
-                        d_block_base = d_base + d_bid * d_dsa_len
-                        for off in range(scale):
-                            d_sub_addrs.append(d_block_base + off * p_dsa_len)
-                    logger.debug(
-                        "MembPull indexer %s: p_dsa_len=%d d_dsa_len=%d scale=%d, "
-                        "D dsa_k shape=%s, D_sub=%d P_blocks=%d",
-                        layer_name,
-                        p_dsa_len,
-                        d_dsa_len,
-                        scale,
-                        tuple(d_indexer.shape),
-                        len(d_sub_addrs),
-                        len(p_block_ids),
-                    )
-                    # Pair with P's blocks; zip truncates to the shorter, discarding
-                    # any extra D sub-addresses (e.g. 8 D sub-addrs vs 7 P blocks).
-                    for p_bid, d_sub in zip(p_block_ids, d_sub_addrs):
-                        peer_ptrs.append(p_dsa_base + p_bid * p_dsa_len)
-                        local_ptrs.append(d_sub)
-                        lengths.append(p_dsa_len)
-                    n_indexer = min(len(p_block_ids), len(d_sub_addrs))
+        # Indexer leg: each D block splits into `scale` P-sized sub-addresses;
+        # extra sub-addresses beyond len(p_block_ids) are discarded.
+        idx = layer["indexer"]
+        if idx is not None and d_indexer_ids:
+            p_dsa_base, p_dsa_len = idx["p_dsa_base"], idx["p_dsa_len"]
+            d_base, d_dsa_len, scale = idx["d_base"], idx["d_dsa_len"], idx["scale"]
+            d_idx_arr = np.array(d_indexer_ids, dtype=np.int64)
+            offs = np.arange(scale, dtype=np.int64)
+            d_sub = (d_base + d_idx_arr[:, None] * d_dsa_len + offs * p_dsa_len).reshape(-1)
+            n_pairs = min(len(p_block_ids), d_sub.shape[0])
+            p_idx = np.array(p_block_ids[:n_pairs], dtype=np.int64)
+            logger.debug(
+                "MembPull indexer %s: p_dsa_len=%d d_dsa_len=%d scale=%d, "
+                "D dsa_k shape=%s, D_sub=%d P_blocks=%d",
+                layer_name, p_dsa_len, d_dsa_len, scale, idx["shape"],
+                int(d_sub.shape[0]), len(p_block_ids),
+            )
+            cp, cl, clen = _coalesce_desc(
+                p_dsa_base + p_idx * p_dsa_len,
+                d_sub[:n_pairs],
+                np.full(n_pairs, p_dsa_len, dtype=np.int64),
+            )
+            peer_chunks.append(cp)
+            local_chunks.append(cl)
+            length_chunks.append(clen)
+            n_indexer = n_pairs
 
-        if not local_ptrs:
+        if not peer_chunks:
             logger.warning(
                 "MembPull _do_read: nothing to transfer for %s (main=%d, indexer=%d)",
                 layer_name,
                 n_main,
                 n_indexer,
             )
-            return
+            return [], [], [], None
 
-        if envs.VLLM_ASCEND_SFA_DEBUG:
-            logger.info(
-                "MembPull D start memfabric read: layer=%s, req=%s, p_session=%s, "
-                "p_block_ids=%s, d_main_cpu_ids=%s, d_indexer_hbm_ids=%s, "
-                "partial_hbm=%s, n_main=%d, n_indexer=%d, transfers=%d",
-                layer_name,
-                ext_req_id,
-                self._p_session,
-                p_block_ids,
-                d_main_ids,
-                d_indexer_ids,
-                partial_hbm_bid,
-                n_main,
-                n_indexer,
-                len(local_ptrs),
-            )
-        ret = self.engine.batch_transfer_sync_read(self._p_session, local_ptrs, peer_ptrs, lengths)
-        if ret != 0:
-            raise RuntimeError(f"memfabric read failed for layer {layer_name}, ret={ret}")
+        peer_ptrs = np.concatenate(peer_chunks).tolist()
+        local_ptrs = np.concatenate(local_chunks).tolist()
+        lengths = np.concatenate(length_chunks).tolist()
+
+        # Build read_info only when a consumer is active (_log_read_result is
+        # gated on VLLM_ASCEND_MF_VERIFY / VLLM_ASCEND_SFA_DEBUG); otherwise this
+        # dict would be allocated per req per layer and immediately discarded.
+        info = None
+        if want_info:
+            info = {
+                "layer_name": layer_name,
+                "ext_req_id": ext_req_id,
+                "pool_idx": layer["pool_idx"],
+                "offload_id": layer["offload_id"],
+                "d_main_ids": d_main_ids,
+                "d_indexer_ids": d_indexer_ids,
+                "partial_hbm_bid": partial_hbm_bid,
+                "n_main": n_main,
+                "n_indexer": n_indexer,
+                "num_transfers": len(local_ptrs),
+                # pre-coalesce descriptor count (2 per main block incl. partial + 1 per indexer pair)
+                "atomic_transfers": 2 * n_main + n_indexer,
+            }
+        return local_ptrs, peer_ptrs, lengths, info
+
+    def _log_read_result(self, read_info: dict[str, Any]) -> None:
         # Verify-mode (VLLM_ASCEND_MF_VERIFY=1): log D's destination sums so the
         # user can diff against P's source sums (MFV P ...). main_k/main_v should
         # match P exactly (1:1 byte copy); idx_post is the full D indexer block
         # sum (D blocks are 4× P's and only len(p_block_ids)/scale slots written,
         # so it won't equal P's idx — use it only as a "data landed" check).
+        w = self._worker
+        layer_name = read_info["layer_name"]
+        ext_req_id = read_info["ext_req_id"]
+        pool_idx = read_info["pool_idx"]
+        offload_id = read_info["offload_id"]
+        d_main_ids = read_info["d_main_ids"]
+        d_indexer_ids = read_info["d_indexer_ids"]
+        partial_hbm_bid = read_info["partial_hbm_bid"]
         if envs.VLLM_ASCEND_MF_VERIFY:
             try:
                 k_cpu, v_cpu = w._cpu_pools[offload_id]
@@ -824,12 +834,78 @@ class MembPullReadThread(threading.Thread):
                 layer_name,
                 ext_req_id,
                 pool_idx,
-                n_main,
+                read_info["n_main"],
                 len(d_main_ids),
-                n_indexer,
+                read_info["n_indexer"],
                 len(d_indexer_ids),
-                len(local_ptrs),
+                read_info["num_transfers"],
             )
+
+    def _do_read_batch(
+        self,
+        layer_name: str,
+        read_reqs: list[tuple[str, list[int]]],
+    ) -> None:
+        """Read all requests for one layer in a single memfabric batch."""
+        if self._p_session is None:
+            raise RuntimeError("MF_META not received before READ_READY_BATCH")
+
+        # Resolve layer-constant state once (pool idx, offload id, p_meta, base
+        # addrs/lengths, scale, CPU/HBM pool ptrs); was recomputed per req before.
+        layer = self._resolve_read_layer(layer_name)
+        if layer is None:
+            return  # layer-level skip, already logged once
+
+        want_info = bool(envs.VLLM_ASCEND_MF_VERIFY or envs.VLLM_ASCEND_SFA_DEBUG)
+        all_local_ptrs: list[int] = []
+        all_peer_ptrs: list[int] = []
+        all_lengths: list[int] = []
+        read_infos: list[dict[str, Any]] = []
+        for ext_req_id, p_block_ids in read_reqs:
+            try:
+                local_ptrs, peer_ptrs, lengths, read_info = self._build_req_descriptors(
+                    layer, ext_req_id, p_block_ids, want_info
+                )
+            except Exception as e:  # noqa: BLE001 - keep other reqs in the layer moving
+                logger.error(
+                    "MembPull prepare batch read failed for layer %s req %s: %s",
+                    layer_name,
+                    ext_req_id,
+                    e,
+                )
+                continue
+            if not local_ptrs:
+                continue
+            all_local_ptrs.extend(local_ptrs)
+            all_peer_ptrs.extend(peer_ptrs)
+            all_lengths.extend(lengths)
+            if want_info:
+                read_infos.append(read_info)
+
+        if not all_local_ptrs:
+            logger.warning(
+                "MembPull _do_read_batch: nothing to transfer for layer %s, reqs=%d",
+                layer_name,
+                len(read_reqs),
+            )
+            return
+
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            atomic_total = sum(r.get("atomic_transfers", 0) for r in read_infos)
+            logger.info(
+                "MembPull D start batched memfabric read: layer=%s, reqs=%d, "
+                "p_session=%s, transfers=%d (coalesced from %d)",
+                layer_name,
+                len(read_infos),
+                self._p_session,
+                len(all_local_ptrs),
+                atomic_total,
+            )
+        ret = self.engine.batch_transfer_sync_read(self._p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
+        if ret != 0:
+            raise RuntimeError(f"memfabric batch read failed for layer {layer_name}, ret={ret}")
+        for read_info in read_infos:
+            self._log_read_result(read_info)
 
 
 # ======================================================================
@@ -839,7 +915,8 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
     """P-side sending thread for memfabric pull mode.
 
     Does NOT push (no batch_transfer_sync_write). Instead, after each layer's
-    KV is ready in P HBM, notifies D via READ_READY (ZMQ), waits for READ_DONE.
+    KV is ready in P HBM, notifies D via READ_READY_BATCH (ZMQ), and drains
+    READ_DONE / READ_FAILED replies.
     First call sends MF_META (P session + layer addresses) to D.
     """
 
@@ -850,279 +927,229 @@ class _MembPullSendingThread(KVCacheSendingLayerThread):
         self._mf_meta_sent = False
         # P's memfabric session (unique_id) — set by producer worker
         self.p_session: str = ""
-        # Buffer-reuse gate: set after READ_DONE so model runner knows the
-        # layer's KV has been read by D and the buffer can be reused.
-        self.layer_send_done_events: list[threading.Event] = [threading.Event() for _ in range(total_layers)]
+        # Buffer-reuse gate: set means the layer's source buffer has no pending
+        # D-side read. Initially set because nothing has been sent yet.
+        self.layer_send_done_events: list[threading.Event] = []
+        for _ in range(total_layers):
+            event = threading.Event()
+            event.set()
+            self.layer_send_done_events.append(event)
         # Persistent ZMQ Context — creating a new Context per message (zmq_ctx)
         # causes I/O thread churn + TCP resource exhaustion when 4 P ranks fire
         # hundreds of messages rapidly on the same machine.
         self._persist_ctx = zmq.Context()
+        # Pipeline state: dict of persistent DEALER sockets (one per D endpoint)
+        # and a stop flag for the event loop.
+        self._dealers: dict[str, Any] = {}  # path -> DEALER socket (never closed until shutdown)
+        self._stopped = False
 
-    def _send_recv(self, path: str, encoded: bytes) -> bytes:
-        """Send a ZMQ REQ message, block until response. Uses a short-lived
-        socket from the persistent Context (clean REQ state per message,
-        no Context creation overhead)."""
-        from vllm.utils.network_utils import make_zmq_socket
+    def _ensure_dealer(self, path: str):
+        """Get (or lazy-create) a persistent DEALER socket for the given D endpoint."""
+        if path not in self._dealers:
+            dealer = self._persist_ctx.socket(zmq.DEALER)
+            dealer.setsockopt(zmq.LINGER, 0)
+            dealer.setsockopt(zmq.SNDHWM, 0)  # unbounded outbound (fire-and-forget)
+            dealer.setsockopt(zmq.RCVHWM, 0)  # unbounded inbound (read reply drain)
+            dealer.connect(path)
+            self._dealers[path] = dealer
+        return self._dealers[path]
 
-        sock = make_zmq_socket(ctx=self._persist_ctx, path=path, socket_type=zmq.REQ, bind=False)
-        # Set a timeout so the send/recv doesn't block forever if D is dead or unreachable. 
-        # The caller can catch the exception and handle it (e.g., log, retry, or fail the request).
-        sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-        try:
-            ensure_zmq_send(sock, encoded, path)
-            return ensure_zmq_recv(sock, poller, path, timeout=self.timeout)
-        finally:
-            sock.close(linger=0)
+    def run(self) -> None:
+        """Pipelined event loop.
 
-    def _send_read_ready(
-        self,
-        path: str,
-        encoder: msgspec.msgpack.Encoder,
-        layer_idx: int,
-        layer_name: str,
-        ext_req_id: str,
-        p_block_ids: list[int],
-    ) -> bool:
-        """Send one READ_READY for (layer, req), block until READ_DONE.
+        Continuously: (1) dequeue send-tasks (one per layer, enqueued by the
+        main thread as each layer's KV compute finishes) and fire READ_READY_BATCH
+        on the DEALER socket **without waiting for a read reply**; (2)
+        non-blocking drain of READ_DONE / READ_FAILED replies and set
+        ``layer_send_done_events`` / ``layer_transfer_finished_events`` once D
+        is no longer reading from the P-side source buffer.
 
-        P sends only its OWN source block ids + the external req_id; D looks up
-        its destination blocks by req_id (pull model — D's blocks never travel
-        to P). Returns True iff D acknowledged with READ_DONE (or nothing to
-        transfer); False on failure, so the caller can withhold the buffer-reuse
-        signal instead of silently letting P overwrite a buffer D never read.
+        The pipeline overlap: P computes layer L+1 while D reads layer L. The
+        reply for L normally arrives during P's compute of L+1..L+k, and by the
+        time P reaches the reuse point ``wait_for_layer_send(L)`` the event is
+        already set. For layer reuse (shared HBM buffers), the model runner
+        checks the event at the reuse boundary.
         """
-        if not p_block_ids:
-            logger.warning(
-                "MembPull: skip READ_READY layer %d (%s) req %s — empty p_block_ids",
-                layer_idx,
-                layer_name,
-                ext_req_id,
-            )
-            return True  # nothing to transfer; not a failure
-        encoded = encoder.encode((READ_READY, layer_idx, layer_name, ext_req_id, p_block_ids))
+        # Preserve base-class setup: set device for this thread and signal
+        # ready so the main thread's ready_event.wait() unblocks.
         try:
-            if envs.VLLM_ASCEND_SFA_DEBUG:
-                logger.info(
-                    "MembPull P send READ_READY: layer=%d (%s), req=%s, p_block_ids=%s, path=%s",
-                    layer_idx,
-                    layer_name,
-                    ext_req_id,
-                    p_block_ids,
-                    path,
-                )
-            resp = self._send_recv(path, encoded)
-            ack_msg = msgspec.msgpack.Decoder(type=tuple).decode(resp)
-            if ack_msg[0] != READ_DONE:
-                logger.warning(
-                    "MembPull: unexpected ACK %s for layer %d (%s) req %s",
-                    ack_msg,
-                    layer_idx,
-                    layer_name,
-                    ext_req_id,
-                )
-                return False
-            if envs.VLLM_ASCEND_SFA_DEBUG:
-                logger.info(
-                    "MembPull P recv READ_DONE: layer=%d (%s), req=%s, ack=%s",
-                    layer_idx,
-                    layer_name,
-                    ext_req_id,
-                    ack_msg,
-                )
-            return True
+            from vllm.distributed import get_world_group
+            local_rank = get_world_group().local_rank
+            torch.npu.set_device(torch.device(f"npu:{local_rank}"))
+        except Exception:
+            pass  # best-effort; the thread mainly does ZMQ, not NPU ops
+        self.ready_event.set()
+
+        encoder = msgspec.msgpack.Encoder()
+        decoder = msgspec.msgpack.Decoder(type=tuple)
+        try:
+            while not self._stopped:
+                # 1. Non-blocking task dequeue (main thread enqueues per-layer)
+                try:
+                    send_task = self.send_queue.get(timeout=0.001)
+                    try:
+                        self._process_send_task(send_task, encoder)
+                    except Exception as e:
+                        logger.error("MembPull send task failed (layer=%s): %s: %s",
+                                     getattr(send_task, 'layer_idx', '?'), type(e).__name__, e)
+                except queue.Empty:
+                    pass
+                # 2. Non-blocking read-reply drain (all open DEALER sockets)
+                try:
+                    if self._dealers:
+                        self._drain_read_replies(decoder)
+                except Exception as e:
+                    logger.error("MembPull read-reply drain error: %s: %s", type(e).__name__, e)
         except Exception as e:
-            logger.error(
-                "MembPull handshake failed for layer %d (%s) req %s: %s",
-                layer_idx,
-                layer_name,
-                ext_req_id,
-                e,
-            )
-            return False
+            logger.error("MembPull send thread crashed: %s: %s", type(e).__name__, e)
+        finally:
+            if self._dealers:
+                self._drain_read_replies(decoder)
+                for dealer in self._dealers.values():
+                    dealer.close(linger=0)
+                self._dealers.clear()
 
-    def _transfer_kv_cache(self, send_task: Any) -> None:  # type: ignore[override]
-        """Override: no write. Notify D to read this layer, wait for READ_DONE.
+    def _process_send_task(self, send_task: Any, encoder: msgspec.msgpack.Encoder) -> None:
+        """Send READ_READY_BATCH for one layer's reqs (fire-and-forget).
 
-        P has a single kv_cache_group (main MLA); on P the indexer KV is written
-        into ``dsa_k_cache`` (= kv_caches[main][2]) at the SAME slots as main
-        MLA, so one P block list sources both legs. P sends one READ_READY per
-        (layer, req) carrying only P's source block ids + the external req_id;
-        D looks up its own destination blocks by req_id (pull model — D's block
-        ids never travel to P).
+        Replaces the old ``_transfer_kv_cache``. The per-layer reply is drained
+        asynchronously by ``_drain_read_replies`` in the event loop, not waited
+        on here. This lets P proceed to the next layer immediately.
         """
-        # CRITICAL: wait for the KV (incl. the dsa_k scatter) to be fully written
-        # to P HBM before notifying D to read, else D reads stale/unwritten data.
         if send_task.wait_event is not None:
             send_task.wait_event.synchronize()
-
-        layer_name = send_task.layer_name
         layer_idx = send_task.layer_idx
-        if envs.VLLM_ASCEND_SFA_DEBUG:
-            logger.info(
-                "MembPull P transfer task ready: layer=%d (%s), reqs=%s",
-                layer_idx,
-                layer_name,
-                list(send_task.send_request.keys()) if send_task.send_request else [],
-            )
+        layer_name = send_task.layer_name
 
-        if not send_task.send_request:
-            logger.warning(
-                "MembPull: send_task.send_request EMPTY for layer %d (%s) — "
-                "scheduler did not populate requests, skipping",
-                layer_idx,
-                layer_name,
-            )
-            return
-        req_meta = next(iter(send_task.send_request.values()))
-        remote_host = req_meta.remote_host
-        # req_meta.remote_port already includes tp_rank offset (set by the
-        # mooncake layerwise base class). D binds ROUTER on this port.
-        remote_port = req_meta.remote_port
-        if not remote_host or not remote_port:
-            logger.warning(
-                "MembPull P missing remote endpoint for layer %d (%s): host=%s, port=%s",
-                layer_idx,
-                layer_name,
-                remote_host,
-                remote_port,
-            )
-            return
-
-        path = make_zmq_path("tcp", remote_host, remote_port)
-        encoder = msgspec.msgpack.Encoder()
-        if envs.VLLM_ASCEND_SFA_DEBUG:
-            logger.info(
-                "MembPull P transfer endpoint: layer=%d (%s), path=%s, remote_host=%s, remote_port=%s",
-                layer_idx,
-                layer_name,
-                path,
-                remote_host,
-                remote_port,
-            )
-
-        # First call: send MF_META (P session + P layer addresses). P's
-        # layer_metadata[main_name] carries [k, v, dsa_k] (3 tensors) because the
-        # mooncake base registers the full 3-tuple, so D reaches the indexer
-        # tensor as base_addrs[2] without a separate indexer layer entry.
-        if not self._mf_meta_sent:
-            p_meta_dict = {}
-            for ln, meta in self.layer_metadata.items():
-                p_meta_dict[ln] = {
-                    "base_addrs": list(meta.kv_caches_base_addr),
-                    "block_len": list(meta.block_len),
-                    "block_size_scale": list(meta.block_size_scale),
-                }
-                if envs.VLLM_ASCEND_SFA_DEBUG:
-                    logger.info(
-                        "MembPull P send MF_META layer=%s: base_addrs=%s, "
-                        "block_len=%s, block_size_scale=%s",
-                        ln,
-                        p_meta_dict[ln]["base_addrs"],
-                        p_meta_dict[ln]["block_len"],
-                        p_meta_dict[ln]["block_size_scale"],
-                    )
-            meta_encoded = encoder.encode((MF_META, self.p_session, encoder.encode(p_meta_dict)))
-            try:
-                self._send_recv(path, meta_encoded)
-                self._mf_meta_sent = True
-                logger.info(
-                    "MembPull P sent MF_META: session=%s, layers=%d, path=%s",
-                    self.p_session,
-                    len(p_meta_dict),
-                    path,
-                )
-            except Exception as e:
-                logger.error("Failed to send MF_META: %s", e)
-
-        # One READ_READY per (layer, req): P sends only its OWN source block ids
-        # (local_block_ids[0] — P's single group serves both main k/v and the
-        # indexer dsa_k, which share slots on P) + the external req_id. D looks
-        # up its destination blocks by req_id; P never handles D's block ids.
-        # Verify-mode (VLLM_ASCEND_MF_VERIFY=1): log P's source-block sums so the
-        # user can diff against D's destination sums (MFV D ...) per (layer, req).
-        verify = envs.VLLM_ASCEND_MF_VERIFY
-        src_caches = getattr(self, "_source_kv_caches", None)
-        all_ok = True
+        # Fire one READ_READY_BATCH for this layer (DEALER async send, no wait).
+        read_reqs: list[tuple[str, list[int]]] = []
+        done_ext_ids: list[str] = []
+        endpoints: set[tuple[str, int]] = set()
         for req_id, rm in send_task.send_request.items():
-            local = rm.local_block_ids
-            p_block_ids = local[0] if (local and len(local) > 0) else []
+            p_block_ids = rm.local_block_ids[0] if rm.local_block_ids else []
             ext_id = get_external_request_id(req_id)
-            if layer_idx == 0:
-                if envs.VLLM_ASCEND_SFA_DEBUG:
-                    logger.info("MembPull P send READ_READY layer 0 req %s: p_blocks=%d", ext_id, len(p_block_ids))
-            if verify and src_caches is not None and p_block_ids:
-                src = src_caches.get(layer_name)
-                if isinstance(src, (list, tuple)) and len(src) >= 3:
-                    mk = src[0][p_block_ids].float().sum().item()
-                    mv = src[1][p_block_ids].float().sum().item()
-                    mi = src[2][p_block_ids].float().sum().item()
-                    logger.info(
-                        "MFV P layer %s req %s main_k=%.6f main_v=%.6f idx=%.6f",
-                        layer_name,
-                        ext_id,
-                        mk,
-                        mv,
-                        mi,
-                    )
-            if not self._send_read_ready(path, encoder, layer_idx, layer_name, ext_id, p_block_ids):
-                all_ok = False
-
-        # Only signal "buffer safe to reuse" if D actually read the layer for
-        # every request. On failure, withhold the signal so wait_for_layer_send
-        # stalls (a visible failure) instead of silent corruption.
-        if all_ok and 0 <= layer_idx < len(self.layer_send_done_events):
-            self.layer_send_done_events[layer_idx].set()
-            # Release the co-located ascend_store GVA-layerwise save thread
-            # (memcache backend), which per-layer blocks on the shared
-            # PD-transfer-finished event for THIS layer before saving. The base
-            # mooncake send path sets these in _transfer_kv_cache; we override
-            # that (pull mode) and never call super, so we must signal here too
-            # -- otherwise the save thread waits timeout=30s per layer and
-            # stalls the whole P node (observed remotely as a D-side connection
-            # failure). layer_transfer_finished_events is the same list the
-            # producer __init__ published via set_shared_layer_transfer_events()
-            # and the save thread reads via get_shared_layer_transfer_events();
-            # the save thread owns the .clear() after its wait().
-            pd_done_events = getattr(self, "layer_transfer_finished_events", None)
-            if pd_done_events is not None and 0 <= layer_idx < len(pd_done_events):
-                pd_done_events[layer_idx].set()
+            # Gate on remote: a non-migrated chunk_finish req has no D target,
+            # would be unmappable on D (leak into _pending_done) and could empty endpoints.
+            chunk_done = (
+                layer_idx == self.total_layers - 1
+                and rm.chunk_finish
+                and bool(rm.remote_host)
+                and bool(rm.remote_port)
+            )
+            if p_block_ids:
+                read_reqs.append((ext_id, p_block_ids))
+            if chunk_done:
+                done_ext_ids.append(ext_id)
+            if (p_block_ids or chunk_done) and rm.remote_host and rm.remote_port:
+                endpoints.add((rm.remote_host, rm.remote_port))
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
-                    "MembPull P layer send complete: layer=%d (%s), reqs=%s",
-                    layer_idx,
-                    layer_name,
-                    list(send_task.send_request.keys()),
+                    "MembPull P add READ_READY_BATCH item: layer=%d (%s), req=%s, p_blocks=%d, done=%s",
+                    layer_idx, layer_name, ext_id, len(p_block_ids), chunk_done,
                 )
 
-        # After the last layer, send DONE_SENDING so D reports done_recving.
-        # Send directly via ZMQ (can't use callback_func = send_done_send_signal
-        # because it accesses req_meta.trans_count which is empty — we skipped
-        # super()._transfer_kv_cache() that populates it).
-        if layer_idx == self.total_layers - 1:
-            for req_id, rm in send_task.send_request.items():
-                if rm.chunk_finish:
-                    external_req_id = get_external_request_id(req_id)
-                    done_encoded = encoder.encode((DONE_SENDING_MSG, external_req_id, 0, ""))
-                    try:
-                        self._send_recv(path, done_encoded)
-                        if envs.VLLM_ASCEND_SFA_DEBUG:
-                            logger.info(
-                                "MembPull P sent DONE_SENDING: req=%s, external_req=%s, path=%s",
-                                req_id,
-                                external_req_id,
-                                path,
-                            )
-                    except Exception as e:
-                        logger.error("MembPull DONE_SENDING failed for %s: %s", req_id, e)
+        if read_reqs or done_ext_ids:
+            if 0 <= layer_idx < len(self.layer_send_done_events):
+                self.layer_send_done_events[layer_idx].clear()
+            pd_done = getattr(self, "layer_transfer_finished_events", None)
+            if pd_done is not None and 0 <= layer_idx < len(pd_done):
+                pd_done[layer_idx].clear()
+            if len(endpoints) != 1:
+                raise RuntimeError(
+                    f"MembPull layer {layer_idx} expects exactly one D endpoint, got {sorted(endpoints)}"
+                )
+            remote_host, remote_port = next(iter(endpoints))
+            path = make_zmq_path("tcp", remote_host, remote_port)
+            dealer = self._ensure_dealer(path)
+
+            # MF_META (first call, synchronous: send + block recv one reply)
+            if not self._mf_meta_sent:
+                self._send_mf_meta(dealer, encoder)
+            dealer.send(encoder.encode((READ_READY_BATCH, layer_idx, layer_name, read_reqs, done_ext_ids)))
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "MembPull P send READ_READY_BATCH: layer=%d (%s), reqs=%d, done_reqs=%d",
+                    layer_idx,
+                    layer_name,
+                    len(read_reqs),
+                    len(done_ext_ids),
+                )
+        else:
+            self._signal_layer_done(layer_idx)
+
+    def _send_mf_meta(self, dealer, encoder: msgspec.msgpack.Encoder) -> None:
+        """Send MF_META synchronously (one DEALER send + block recv_multipart)."""
+        p_meta_dict = {}
+        for ln, meta in self.layer_metadata.items():
+            p_meta_dict[ln] = {
+                "base_addrs": list(meta.kv_caches_base_addr),
+                "block_len": list(meta.block_len),
+                "block_size_scale": list(meta.block_size_scale),
+            }
+        dealer.send(encoder.encode((MF_META, self.p_session, encoder.encode(p_meta_dict))))
+        if dealer.poll(timeout=int(self.timeout * 1000)):
+            frames = dealer.recv_multipart()
+            payload = [f for f in frames if f != b""]
+            if payload != [b"ACK"]:
+                raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")
+            self._mf_meta_sent = True
+            logger.info("MembPull P sent MF_META: session=%s, layers=%d", self.p_session, len(p_meta_dict))
+        else:
+            raise RuntimeError("MembPull P MF_META timed out (no reply from D)")
+
+    def _drain_read_replies(self, decoder: msgspec.msgpack.Decoder) -> None:
+        """Non-blocking: recv all pending read replies from ALL DEALER sockets.
+
+        Uses recv_multipart (not recv) because D's ROUTER sends
+        ``(identity, b"", payload)`` — DEALER receives ``[b"", payload]``
+        (2 frames). Filter the empty ``b""`` like D's own parsing does.
+        """
+        for dealer in self._dealers.values():
+            while True:
+                try:
+                    if not dealer.poll(timeout=0):
+                        break
+                    frames = dealer.recv_multipart(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                payload = [f for f in frames if f != b""]
+                if len(payload) != 1:
+                    continue
+                try:
+                    msg = decoder.decode(payload[0])
+                except Exception:
+                    continue
+                if len(msg) >= 2 and msg[0] == READ_DONE:
+                    layer_idx = msg[1]
+                    self._signal_layer_done(layer_idx)
+                elif len(msg) >= 2 and msg[0] == READ_FAILED:
+                    layer_idx = msg[1]
+                    error = msg[2] if len(msg) > 2 else ""
+                    logger.error(
+                        "MembPull P received READ_FAILED: layer=%s, error=%s",
+                        layer_idx,
+                        error,
+                    )
+                    self._signal_layer_done(layer_idx)
+
+    def _signal_layer_done(self, layer_idx: int) -> None:
+        """Release the P-side reuse gate for one layer."""
+        if 0 <= layer_idx < len(self.layer_send_done_events):
+            self.layer_send_done_events[layer_idx].set()
+        # Also release the co-located ascend_store GVA-layerwise save thread
+        # (shares layer_transfer_finished_events).
+        pd_done = getattr(self, "layer_transfer_finished_events", None)
+        if pd_done is not None and 0 <= layer_idx < len(pd_done):
+            pd_done[layer_idx].set()
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info("MembPull P layer send complete: layer=%d", layer_idx)
 
 
 class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
     """P-side worker = mooncake layerwise send setup + pull-mode sending thread.
 
     Reuses the mooncake base for send-queue setup, but swaps in
-    :class:`_MembPullSendingThread` (notifies D to read via READ_READY, does NOT
+    :class:`_MembPullSendingThread` (notifies D to read via READ_READY_BATCH, does NOT
     push). D looks up its own destination blocks by req_id; P sends only its
     source block ids. A per-layer send-done event gates P's KV buffer reuse.
     """
@@ -1142,7 +1169,7 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         """Override: in memfabric pull mode, P does NOT need D's metadata
         (P is not pushing to D — D reads from P). Skip GET_META entirely
         to avoid flooding D's ROUTER with 61 unnecessary requests that
-        delay MF_META / READ_READY."""
+        delay MF_META / READ_READY_BATCH."""
         if self._backend == BACKEND_MEMFABRIC:
             return req_meta
         return super().update_decoder_info(req_id, req_meta)
@@ -1229,17 +1256,42 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
             global_te._unique_id,
         )
 
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: list[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        connector_metadata: KVConnectorMetadata,
+        **kwargs,
+    ) -> None:
+        if (
+            self._backend == BACKEND_MEMFABRIC
+            and getattr(connector_metadata, "requests", None)
+            and self.current_layer < self.total_layers
+        ):
+            layer_idx = self.current_layer
+            if self.layer_send_done_events is not None and 0 <= layer_idx < len(self.layer_send_done_events):
+                self.layer_send_done_events[layer_idx].clear()
+            pd_done = getattr(self.kv_send_layer_thread, "layer_transfer_finished_events", None)
+            if pd_done is not None and 0 <= layer_idx < len(pd_done):
+                pd_done[layer_idx].clear()
+        super().save_kv_layer(layer_name, kv_layer, attn_metadata, connector_metadata, **kwargs)
+
     def wait_for_layer_send(self, layer_idx: int) -> None:
         """Block until D has read layer ``layer_idx``'s KV (buffer-reuse gate).
 
-        In pull mode D reads P's KV via memfabric; this waits for D's READ_DONE
-        before P reuses the KV buffer for a later layer, so D finishes reading
-        before P overwrites it.
+        In pull mode D reads P's KV via memfabric; this waits until D replies
+        with READ_DONE or READ_FAILED before P reuses the KV buffer for a later
+        layer, so D is no longer reading before P overwrites it.
         """
         if self.layer_send_done_events is None:
             return
         if 0 <= layer_idx < len(self.layer_send_done_events):
-            self.layer_send_done_events[layer_idx].wait()
+            event = self.layer_send_done_events[layer_idx]
+            if not event.wait(timeout=10):
+                raise RuntimeError(
+                    f"Timed out waiting for D to read layer {layer_idx}'s KV before buffer reuse"
+                )
 
     def get_layer_send_event(self, layer_idx: int) -> threading.Event | None:
         if self.layer_send_done_events is None:
