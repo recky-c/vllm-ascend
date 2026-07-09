@@ -61,6 +61,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_debug import kv_spec_summary
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -197,6 +198,69 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+_KV_DEBUG_TAG = "[KV_DEBUG]"
+
+
+def _kv_debug_summarize_config(kv_cache_config: KVCacheConfig) -> dict:
+    return {
+        "num_blocks": kv_cache_config.num_blocks,
+        "kv_cache_groups": [
+            {
+                "group_id": idx,
+                "layer_names": group.layer_names,
+                "spec": kv_spec_summary(group.kv_cache_spec),
+            }
+            for idx, group in enumerate(kv_cache_config.kv_cache_groups)
+        ],
+        "kv_cache_tensors": [
+            {
+                "tensor_id": idx,
+                "size_bytes": tensor.size,
+                "shared_by": tensor.shared_by,
+            }
+            for idx, tensor in enumerate(kv_cache_config.kv_cache_tensors)
+        ],
+    }
+
+
+def _kv_debug_summarize_allocated_caches(
+    kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
+) -> dict:
+    summary: dict = {}
+    for layer_name, cache in kv_caches.items():
+        if isinstance(cache, tuple):
+            summary[layer_name] = {
+                "type": "tuple",
+                "parts": [
+                    {
+                        "shape": list(part.shape),
+                        "dtype": str(part.dtype),
+                        "numel": part.numel(),
+                        "bytes": part.numel() * part.element_size(),
+                    }
+                    for part in cache
+                ],
+            }
+        else:
+            summary[layer_name] = {
+                "type": type(cache).__name__,
+                "shape": list(cache.shape),
+                "dtype": str(cache.dtype),
+                "numel": cache.numel(),
+                "bytes": cache.numel() * cache.element_size(),
+            }
+    return summary
+
+
+def _kv_debug_tensor_bytes(
+    cache: torch.Tensor | tuple[torch.Tensor, ...] | None,
+) -> int:
+    if cache is None:
+        return 0
+    if isinstance(cache, tuple):
+        return sum(_kv_debug_tensor_bytes(part) for part in cache)
+    return cache.numel() * cache.element_size()
 
 
 @dataclass
@@ -3951,18 +4015,39 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        logger.info(
+            "%s: initialize_kv_cache input config=%s",
+            _KV_DEBUG_TAG,
+            _kv_debug_summarize_config(kv_cache_config),
+        )
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        logger.info(
+            "%s: after encoder/sharing adjustments config=%s",
+            _KV_DEBUG_TAG,
+            _kv_debug_summarize_config(kv_cache_config),
+        )
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
+        logger.info(
+            "%s: attn_groups=%d use_hybrid_blocks=%s need_accepted_tokens pending",
+            _KV_DEBUG_TAG,
+            len(self.attn_groups),
+            self.use_hybrid_blocks,
+        )
         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
         self.need_accepted_tokens = any(
             [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
+        )
+        logger.info(
+            "%s: need_accepted_tokens=%s",
+            _KV_DEBUG_TAG,
+            self.need_accepted_tokens,
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
@@ -3986,6 +4071,13 @@ class NPUModelRunner(GPUModelRunner):
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
+
+        logger.info(
+            "%s: initialize_kv_cache done allocated=%s shared_layers=%s",
+            _KV_DEBUG_TAG,
+            _kv_debug_summarize_allocated_caches(kv_caches),
+            dict(self.shared_kv_cache_layers),
+        )
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -4029,9 +4121,52 @@ class NPUModelRunner(GPUModelRunner):
             corresponding memory buffer for KV cache.
         """
         # Initialize the memory buffer for KV cache
+        logger.info(
+            "%s: initialize_kv_cache_tensors start config=%s",
+            _KV_DEBUG_TAG,
+            _kv_debug_summarize_config(kv_cache_config),
+        )
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        logger.info(
+            "%s: raw tensors allocated layers=%d total_bytes=%d detail=%s",
+            _KV_DEBUG_TAG,
+            len(kv_cache_raw_tensors),
+            sum(
+                _kv_debug_tensor_bytes(tensor)
+                for tensor in kv_cache_raw_tensors.values()
+            ),
+            {
+                name: (
+                    {
+                        "type": "tuple",
+                        "parts": [
+                            {
+                                "shape": list(part.shape),
+                                "dtype": str(part.dtype),
+                                "bytes": _kv_debug_tensor_bytes(part),
+                            }
+                            for part in cache
+                            if part is not None
+                        ],
+                    }
+                    if isinstance(cache, tuple)
+                    else {
+                        "shape": list(cache.shape),
+                        "dtype": str(cache.dtype),
+                        "bytes": _kv_debug_tensor_bytes(cache),
+                    }
+                )
+                for name, cache in kv_cache_raw_tensors.items()
+                if cache is not None
+            },
+        )
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+        logger.info(
+            "%s: reshaped kv caches=%s",
+            _KV_DEBUG_TAG,
+            _kv_debug_summarize_allocated_caches(kv_caches),
+        )
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -4956,10 +5091,24 @@ class NPUModelRunner(GPUModelRunner):
         """
 
         if has_ec_transfer() and get_ec_transfer().is_producer:
+            logger.info("%s: EC transfer producer, returning empty spec", _KV_DEBUG_TAG)
             return {}
 
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        logger.info(
+            "%s: start assembly flags use_compress=%s use_sparse=%s block_size=%s",
+            _KV_DEBUG_TAG,
+            self.use_compress,
+            self.use_sparse,
+            self.block_size,
+        )
+        logger.info(
+            "%s: attn_layers count=%d modules=%s",
+            _KV_DEBUG_TAG,
+            len(attn_layers),
+            {name: type(module).__name__ for name, module in attn_layers.items()},
+        )
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
@@ -4975,15 +5124,33 @@ class NPUModelRunner(GPUModelRunner):
                 # a given amount of memory to accommodate longer context lengths
                 # or enable more requests to be processed simultaneously.
                 self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
+                logger.info(
+                    "%s: skip layer=%s (kv_sharing -> %s)",
+                    _KV_DEBUG_TAG,
+                    layer_name,
+                    kv_tgt_layer,
+                )
                 continue
             elif self.use_compress:
                 # Skip modules that don't need KV cache (eg encoder-only attention)
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec[layer_name] = spec
+                    logger.info(
+                        "%s: layer=%s branch=use_compress spec=%s",
+                        _KV_DEBUG_TAG,
+                        layer_name,
+                        kv_spec_summary(spec),
+                    )
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
+                    logger.info(
+                        "%s: layer=%s branch=Attention spec=%s",
+                        _KV_DEBUG_TAG,
+                        layer_name,
+                        kv_spec_summary(spec),
+                    )
 
             elif isinstance(attn_module, MLAAttention):
                 if self.use_sparse:
@@ -5007,6 +5174,12 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_c8=has_indexer and self.ascend_config.is_sparse_c8_layer(layer_name),
                     )
+                    logger.info(
+                        "%s: layer=%s branch=MLAAttention.sparse spec=%s",
+                        _KV_DEBUG_TAG,
+                        layer_name,
+                        kv_spec_summary(kv_cache_spec[layer_name]),
+                    )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
                         head_size = attn_module.head_size + attn_module.qk_rope_head_dim
@@ -5021,6 +5194,12 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=cache_dtype_str,
                     )
                     attn_layer_names.add(layer_name)
+                    logger.info(
+                        "%s: layer=%s branch=MLAAttention spec=%s",
+                        _KV_DEBUG_TAG,
+                        layer_name,
+                        kv_spec_summary(kv_cache_spec[layer_name]),
+                    )
 
             elif isinstance(attn_module, MambaBase):
                 mamba_layers[layer_name] = attn_module
@@ -5046,6 +5225,12 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=spec.cache_dtype_str,
                     )
                     attn_layer_names.add(layer_name)
+                    logger.info(
+                        "%s: layer=%s branch=CacheOnlyAttentionLayer spec=%s",
+                        _KV_DEBUG_TAG,
+                        layer_name,
+                        kv_spec_summary(kv_cache_spec[layer_name]),
+                    )
 
         if len(mamba_layers) > 0:
             mamba_page_size_padded = 0
@@ -5053,11 +5238,29 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := mamba_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec[layer_name] = spec
                     mamba_page_size_padded = spec.page_size_bytes
+                    logger.info(
+                        "%s: layer=%s branch=MambaBase spec=%s",
+                        _KV_DEBUG_TAG,
+                        layer_name,
+                        kv_spec_summary(spec),
+                    )
             # align attn_page_size to mamba_page_size_padded
             for layer_name in attn_layer_names:
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
+                    logger.info(
+                        "%s: padded page_size for layer=%s to %s",
+                        _KV_DEBUG_TAG,
+                        layer_name,
+                        mamba_page_size_padded,
+                    )
 
+        logger.info(
+            "%s: final kv_cache_spec layers=%d summary=%s",
+            _KV_DEBUG_TAG,
+            len(kv_cache_spec),
+            {name: kv_spec_summary(spec) for name, spec in kv_cache_spec.items()},
+        )
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(

@@ -537,11 +537,29 @@ class NPUWorker(WorkerBase):
         """
         GiB = lambda b: b / GiB_bytes
 
+        logger.info(
+            "[KV_DEBUG] determine_available_memory start: "
+            "init_free=%.2f GiB init_total=%.2f GiB requested=%.2f GiB "
+            "gpu_memory_utilization=%.4f model_weights=%.2f GiB "
+            "kv_cache_memory_bytes=%s",
+            GiB(self.init_snapshot.free_memory),
+            GiB(self.init_snapshot.total_memory),
+            GiB(self.requested_memory),
+            self.cache_config.gpu_memory_utilization,
+            GiB(self.model_runner.model_memory_usage),
+            self.cache_config.kv_cache_memory_bytes,
+        )
+
         # Fast path: user has explicitly specified KV cache size via
         # --kv-cache-memory. Still run profile_run() to compile the model,
         # but skip the memory profiling calculation entirely.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             self.model_runner.profile_run()
+            logger.info(
+                "[KV_DEBUG] determine_available_memory fast_path: "
+                "skip profiling math, return kv_cache_memory_bytes=%.2f GiB",
+                GiB(kv_cache_memory_bytes),
+            )
             logger.info(
                 "Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache "
                 "as specified by kv_cache_memory_bytes, skipping memory profiling. "
@@ -592,12 +610,37 @@ class NPUWorker(WorkerBase):
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
 
+        logger.info(
+            "[KV_DEBUG] determine_available_memory profile breakdown: "
+            "before_torch_peak=%.2f GiB after_torch_peak=%.2f GiB "
+            "torch_peak_increase=%.2f GiB non_torch_increase=%.2f GiB "
+            "weights_memory=%.2f GiB non_kv_cache_memory=%.2f GiB "
+            "after_profile_free=%.2f GiB formula=requested(%.2f)-non_kv(%.2f) "
+            "=> available_kv=%.2f GiB",
+            GiB(profile_result.before_profile.torch_peak),
+            GiB(profile_torch_peak),
+            GiB(profile_result.torch_peak_increase),
+            GiB(profile_result.non_torch_increase),
+            GiB(profile_result.weights_memory),
+            GiB(profile_result.non_kv_cache_memory),
+            GiB(free_gpu_memory),
+            GiB(self.requested_memory),
+            GiB(profile_result.non_kv_cache_memory),
+            GiB(self.available_kv_cache_memory_bytes),
+        )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
 
-        return int(self.available_kv_cache_memory_bytes)
+        available = int(self.available_kv_cache_memory_bytes)
+        logger.info(
+            "[KV_DEBUG] determine_available_memory return=%d bytes (%.2f GiB)",
+            available,
+            GiB(available),
+        )
+        return available
 
     def profile_memory(self) -> None:
         """Profiles the torch reserved memory, torch allocated memory in execute_model()."""
