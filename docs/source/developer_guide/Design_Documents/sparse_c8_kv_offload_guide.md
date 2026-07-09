@@ -331,11 +331,19 @@ main_k[0]  main_v[1]  indexer_k[2]  resident_k[3]  resident_v[4]  indexer_s[5]
 
 **原则**：main 与 indexer **共用 vLLM paged pool**；每个物理 page **要么写 main，要么写 index**，不同时写。不再 pool 外单独分配 `dsa_k` / `scale`。
 
-#### spec_0（main group，`OffloadMLAAttentionSpec` + `kv_pad_dim=8`）
+#### spec_0（main group，`make_offload_main_mla_spec` / `OffloadMLAAttentionSpec`）
+
+C8 时通过 ``page_bytes_per_token`` 记账（与 spec_1 同一套
+``block_size * num_kv_heads * page_bytes_per_token`` 公式）。``kv_pad_dim``
+与 ``page_block_multiplier`` 由 ``compute_offload_sparse_c8_layout`` 从模型维度
+推导（``page_block_multiplier = 2 * kv_lora_rank // index_head_dim``，
+``kv_pad_dim`` 补齐 spec_0 与 spec_1 的 8:1 page 比例），不再硬编码常量。
 
 ```text
 block_size = 128
-page_bytes = 128 × (512 + 64 + 8) × 2 = 149504   # bf16 k + v + pad
+# per token: (k 512 + v 64 + pad 8) × 2 bytes (bf16)
+# pad = (page_block_multiplier * spec_1_bytes - (k+v)*2) / 2
+page_bytes = 128 × (512 + 64 + 8) × 2 = 149504
 ```
 
 池内切分（每层 raw 三元组）：
@@ -346,10 +354,14 @@ raw_v     → v_cache [num_blocks, 128, 64]  bf16
 raw_scale → pad 区  [num_blocks, 128, 8]  bf16（main 不用；index 作 scale）
 ```
 
-#### spec_1（indexer group，`AscendMLAAttentionSpec` + `offload_unified_pool_c8`）
+#### spec_1（indexer group，`make_offload_indexer_mla_spec` / `AscendMLAAttentionSpec`）
+
+C8 时同样设置 ``page_bytes_per_token``（spec_1 byte-mix 布局）。
 
 ```text
-page_bytes = 128 × (128 int8 + 16 pad + 2 fp16) = 18688
+# per token: (idx 128 + pad 16 + scale 2) × 1 byte (int8 byte-mix accounting)
+# scale 物理上是 1 个 fp16（2 bytes），在 spec_1 公式里按 2 bytes 计入
+page_bytes = 128 × (128 + 16 + 2) = 18688
 main_page : indexer_page = 8 : 1   # unify_kv_cache_spec_page_size
 unify 后 indexer block_size = 1024  # kernel_block_sizes[0]
 ```
@@ -366,7 +378,9 @@ non-C8 offload 仍用 `raw_k` bf16 view：`dsa_k [num_blocks, 512, 128]`，`kern
 #### 分配路径（`_allocate_kv_cache_tensors`）
 
 - non-C8：`(raw_k, raw_v)` 二路切分。
-- C8：`(raw_k, raw_v, raw_scale)` 三路切分，`calc_split_factor([512, 64, 8])`，**无** `_allocate_sparse_c8_indexer_tensors`。
+- C8：`(raw_k, raw_v, raw_scale)` 三路切分，
+  ``calc_split_factor([kv_lora_rank, qk_rope_head_dim, kv_pad_dim])``（``kv_pad_dim``
+  由 ``compute_offload_sparse_c8_layout`` 推导），**无** `_allocate_sparse_c8_indexer_tensors`。
 
 ### 6.3 scatter（sfa_v1）
 
