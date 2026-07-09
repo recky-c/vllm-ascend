@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -155,6 +156,7 @@ class SFAKVOffloadWorker:
         self.use_layerwise = use_layerwize
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_group = get_tp_group()
         self.pp_size = parallel_config.pipeline_parallel_size
         self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
 
@@ -223,12 +225,18 @@ class SFAKVOffloadWorker:
         self.load_stream = torch_npu.npu.Stream()
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
-        self.allocate_dram_size = 64 * 1024 * 1024 * 1024 # TODO get from config
+        self.allocate_dram_size = 128 * 1024 * 1024 * 1024 # TODO get from config
         logger.info(
-            f"SFAKVOffloadWoker start init h2d with {self.allocate_dram_size / 1024 / 1024 / 1024} GB dram/rank, "
+            f"SFAKVOffloadWoker start init CPU KV pool with {self.allocate_dram_size / 1024 / 1024 / 1024} GB dram, "
             "it might be time consuming, please wait."
         )
-        offload.initialize(self.tp_rank, self.allocate_dram_size)
+        config = offload.OffloadConfig()
+        config.device_id = torch_npu.npu.current_device()
+        config.size = self.allocate_dram_size
+        config.world_size = self.tp_size
+        config.rank_id = self.tp_rank
+        offload.initialize(config)
+        self.tp_group.barrier()
 
     def _infer_group_block_sizes(
         self,
@@ -377,28 +385,29 @@ class SFAKVOffloadWorker:
             else:
                 raise ValueError("SFA KV Offload only support layerwise now.")
 
-            npu_block_num = self.num_blocks
-            # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
-            # but you may want to set this to 1 in debug case in case of allocating to much dram
-            # TODO remove this and directly compute from model config before merge
-            cpu_block_num_multiple = 1
-            cpu_block_num = npu_block_num * cpu_block_num_multiple
-            cpu_cache_size_single_card = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
-            logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size_single_card / 1024 / 1024 / 1024} GB per rank')
-            if cpu_cache_size_single_card > self.allocate_dram_size:
-                raise ValueError(
-                    f"Needed cpu memory ({cpu_cache_size_single_card / 1024 / 1024 / 1024} GB/rank) is greater than "
-                    f"available cpu memory ({self.allocate_dram_size / 1024 / 1024 / 1024} GB/rank), "
-                    "try to decrease gpu_memory_utilization or allocate more cpu memory during init."
-                )
-            self.k_caches_cpu: list[torch.Tensor] = [
-                self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16)
-                for _ in range(self.num_layers)
-            ]
-            self.v_caches_cpu: list[torch.Tensor] = [
-                self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
-                for _ in range(self.num_layers)
-            ]
+            if self.tp_rank == 0:
+                npu_block_num = self.num_blocks
+                # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
+                # but you may want to set this to 1 in debug case in case of allocating to much dram
+                # TODO remove this and directly compute from model config before merge
+                cpu_block_num_multiple = 4
+                cpu_block_num = npu_block_num * cpu_block_num_multiple
+                cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
+                logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
+                if cpu_cache_size > self.allocate_dram_size:
+                    raise ValueError(
+                        f"Needed cpu memory ({cpu_cache_size / 1024 / 1024 / 1024} GB) is greater than "
+                        f"available cpu memory ({self.allocate_dram_size / 1024 / 1024 / 1024} GB), "
+                        "try to decrease gpu_memory_utilization or allocate more cpu memory during init."
+                    )
+                self.k_caches_cpu: list[torch.Tensor] = [
+                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16)
+                    for _ in range(self.num_layers)
+                ]
+                self.v_caches_cpu: list[torch.Tensor] = [
+                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
+                    for _ in range(self.num_layers)
+                ]
 
             # topk cache reuse related
             self.lru_workspace_threads = 8
@@ -509,8 +518,19 @@ class SFAKVOffloadWorker:
             # sparse h2d (sparse_copy related)
             self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
             self.addr_v_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_v]
-            self.gvas_k_bases: list[int] = [t.data_ptr() for t in self.k_caches_cpu]
-            self.gvas_v_bases: list[int] = [t.data_ptr() for t in self.v_caches_cpu]
+            self.gvas_k_bases: list[int] = []
+            self.gvas_v_bases: list[int] = []
+            gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
+            gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
+            if self.tp_rank == 0:
+                for layer_id in range(self.num_layers):
+                    gvas_k_tensor[layer_id] = self.k_caches_cpu[layer_id].data_ptr()
+                    gvas_v_tensor[layer_id] = self.v_caches_cpu[layer_id].data_ptr()
+            self.tp_group.broadcast(gvas_k_tensor, src=0)
+            self.tp_group.broadcast(gvas_v_tensor, src=0)
+            for layer_id in range(self.num_layers):
+                self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
+                self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
 
             gvas_buffer_offset = 0
             gvas_buffer_size_bytes = self.max_num_topk_rows * self.sfa_sparse_topk * 2 * 8 # 2: k+v, 8: int64
@@ -557,7 +577,7 @@ class SFAKVOffloadWorker:
             event.clear()
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
-            if request.num_new_offload_blocks <= 0:
+            if self.tp_rank > 0 or request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
             self.process_layer_data(request)
         num_save_layers = sum(1 for layer_save_task in self.layer_save_tasks if layer_save_task)
