@@ -189,11 +189,14 @@ class SFAPDCpuOffloadConsumerWorker:
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
-        # CPU pool owned by the composed SFA worker. P fills it via memfabric
-        # pull (D reads main MLA KV from P HBM into this CPU pool).
-        assert self.sfa_worker.k_caches_cpu is not None, "Composed SFA worker did not allocate the CPU pool"
-        k_caches_cpu = self.sfa_worker.k_caches_cpu
-        v_caches_cpu = self.sfa_worker.v_caches_cpu
+        # CPU pool owned by the composed SFA worker. With TP-group shared CPU
+        # pool (sfa_kv_offload_worker: only tp_rank==0 allocates), only rank 0
+        # has k_caches_cpu/v_caches_cpu. Rank 0 does PD receive (memfabric pull
+        # from P HBM into the CPU pool); other ranks skip PD receive and rely on
+        # the shared pool via sfa_worker's broadcast ptrs (gvas_k_bases) for
+        # LRU load. LRU load runs on all ranks; offload on rank 0 only.
+        k_caches_cpu = getattr(self.sfa_worker, 'k_caches_cpu', None)
+        v_caches_cpu = getattr(self.sfa_worker, 'v_caches_cpu', None)
 
         # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
         # last block lands here instead of the CPU pool. Keyed by main layer name
@@ -204,11 +207,16 @@ class SFAPDCpuOffloadConsumerWorker:
             if isinstance(t, (list, tuple)) and len(t) in (5, 6)
         }
 
-        # memfabric pull mode only (the mooncake staging path has been removed).
-        assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
-            "SFAPDCpuOffloadConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
-        )
-        self._register_memfabric_pull(kv_caches, k_caches_cpu, v_caches_cpu)
+        if k_caches_cpu is not None and v_caches_cpu is not None:
+            # Rank 0: register memfabric pull (PD receive into the CPU pool).
+            assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
+                "SFAPDCpuOffloadConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
+            )
+            self._register_memfabric_pull(kv_caches, k_caches_cpu, v_caches_cpu)
+        else:
+            # Non-rank-0: no PD receive (rank 0 fills the shared CPU pool).
+            # LRU load / offload run via sfa_worker using the broadcast ptrs.
+            self._cpu_pools = []
 
     # -- D-side forwards to the composed SFA worker (LRU load path) --
     def start_load_kv(self, metadata: KVConnectorMetadata):
