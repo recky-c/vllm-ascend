@@ -396,15 +396,15 @@ class NPUModelRunner(GPUModelRunner):
                     self.model_config.hf_text_config.qk_rope_head_dim,
                     self.model_config.hf_text_config.index_head_dim,
                 )
-        # dsa c8
+        # dsa c8 — always set device dtypes; C8 offload paths read them even when
+        # enable_sparse_c8 is off during early get_kv_cache_spec (non-C8 offload).
         self.use_sparse_c8_indexer = self.ascend_config.enable_sparse_c8
-        if self.use_sparse_c8_indexer:
-            if get_ascend_device_type() == AscendDeviceType.A5:
-                self.c8_k_cache_dtype = torch.float8_e4m3fn
-                self.c8_k_scale_cache_dtype = torch.float32
-            else:
-                self.c8_k_cache_dtype = torch.int8
-                self.c8_k_scale_cache_dtype = torch.float16
+        if get_ascend_device_type() == AscendDeviceType.A5:
+            self.c8_k_cache_dtype = torch.float8_e4m3fn
+            self.c8_k_scale_cache_dtype = torch.float32
+        else:
+            self.c8_k_cache_dtype = torch.int8
+            self.c8_k_scale_cache_dtype = torch.float16
 
         self.attn_backend = get_attn_backend(
             0,
@@ -5216,7 +5216,11 @@ class NPUModelRunner(GPUModelRunner):
                         qk_rope_head_dim=hf_cfg.qk_rope_head_dim,
                         index_head_dim=hf_cfg.index_head_dim,
                         c8_unified_pool=self.use_sparse_c8_indexer,
-                        scale_dtype=self.c8_k_scale_cache_dtype,
+                        scale_dtype=(
+                            self.c8_k_scale_cache_dtype
+                            if self.use_sparse_c8_indexer
+                            else None
+                        ),
                     )
                 else:
                     hf_cfg = self.model_config.hf_text_config
@@ -5236,7 +5240,11 @@ class NPUModelRunner(GPUModelRunner):
                         qk_rope_head_dim=hf_cfg.qk_rope_head_dim,
                         sparse_head_dim=self.sparse_head_dim,
                         c8_unified_pool=self.use_sparse_c8_indexer,
-                        scale_dtype=self.c8_k_scale_cache_dtype,
+                        scale_dtype=(
+                            self.c8_k_scale_cache_dtype
+                            if self.use_sparse_c8_indexer
+                            else None
+                        ),
                     )
             elif (isinstance(attn_module, Attention)
                     and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):
