@@ -4318,6 +4318,10 @@ class NPUModelRunner(GPUModelRunner):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
+                    # P-node LIC8 (use_sparse, not use_offload) uses dsa_k_scale in a
+                    # separate pool leg; unified-pool scale_tensor_split_factor only
+                    # applies on the D-side offload path below.
+                    scale_tensor_split_factor = None
                     if self.use_sparse and not self.use_offload:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
                         kv_cache_spec = layer_kv_cache_spec[layer_name]
