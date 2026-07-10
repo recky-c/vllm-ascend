@@ -61,7 +61,6 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_debug import kv_spec_summary
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -202,6 +201,19 @@ SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 _KV_DEBUG_TAG = "[KV_DEBUG]"
 
 
+def _kv_spec_summary(spec: Any) -> dict[str, Any]:
+    """Local KVCacheSpec summary for debug logs (vLLM 0.23.0 lacks kv_debug)."""
+    return {
+        "type": type(spec).__name__,
+        "block_size": getattr(spec, "block_size", None),
+        "storage_block_size": getattr(spec, "storage_block_size", None),
+        "page_size_bytes": getattr(spec, "page_size_bytes", None),
+        "num_kv_heads": getattr(spec, "num_kv_heads", None),
+        "head_size": getattr(spec, "head_size", None),
+        "dtype": str(getattr(spec, "dtype", None)),
+    }
+
+
 def _kv_debug_summarize_config(kv_cache_config: KVCacheConfig) -> dict:
     return {
         "num_blocks": kv_cache_config.num_blocks,
@@ -209,7 +221,7 @@ def _kv_debug_summarize_config(kv_cache_config: KVCacheConfig) -> dict:
             {
                 "group_id": idx,
                 "layer_names": group.layer_names,
-                "spec": kv_spec_summary(group.kv_cache_spec),
+                "spec": _kv_spec_summary(group.kv_cache_spec),
             }
             for idx, group in enumerate(kv_cache_config.kv_cache_groups)
         ],
@@ -5139,7 +5151,7 @@ class NPUModelRunner(GPUModelRunner):
                         "%s: layer=%s branch=use_compress spec=%s",
                         _KV_DEBUG_TAG,
                         layer_name,
-                        kv_spec_summary(spec),
+                        _kv_spec_summary(spec),
                     )
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
@@ -5149,7 +5161,7 @@ class NPUModelRunner(GPUModelRunner):
                         "%s: layer=%s branch=Attention spec=%s",
                         _KV_DEBUG_TAG,
                         layer_name,
-                        kv_spec_summary(spec),
+                        _kv_spec_summary(spec),
                     )
 
             elif isinstance(attn_module, MLAAttention):
@@ -5178,7 +5190,7 @@ class NPUModelRunner(GPUModelRunner):
                         "%s: layer=%s branch=MLAAttention.sparse spec=%s",
                         _KV_DEBUG_TAG,
                         layer_name,
-                        kv_spec_summary(kv_cache_spec[layer_name]),
+                        _kv_spec_summary(kv_cache_spec[layer_name]),
                     )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
@@ -5198,7 +5210,7 @@ class NPUModelRunner(GPUModelRunner):
                         "%s: layer=%s branch=MLAAttention spec=%s",
                         _KV_DEBUG_TAG,
                         layer_name,
-                        kv_spec_summary(kv_cache_spec[layer_name]),
+                        _kv_spec_summary(kv_cache_spec[layer_name]),
                     )
 
             elif isinstance(attn_module, MambaBase):
@@ -5229,7 +5241,7 @@ class NPUModelRunner(GPUModelRunner):
                         "%s: layer=%s branch=CacheOnlyAttentionLayer spec=%s",
                         _KV_DEBUG_TAG,
                         layer_name,
-                        kv_spec_summary(kv_cache_spec[layer_name]),
+                        _kv_spec_summary(kv_cache_spec[layer_name]),
                     )
 
         if len(mamba_layers) > 0:
@@ -5242,7 +5254,7 @@ class NPUModelRunner(GPUModelRunner):
                         "%s: layer=%s branch=MambaBase spec=%s",
                         _KV_DEBUG_TAG,
                         layer_name,
-                        kv_spec_summary(spec),
+                        _kv_spec_summary(spec),
                     )
             # align attn_page_size to mamba_page_size_padded
             for layer_name in attn_layer_names:
@@ -5259,7 +5271,7 @@ class NPUModelRunner(GPUModelRunner):
             "%s: final kv_cache_spec layers=%d summary=%s",
             _KV_DEBUG_TAG,
             len(kv_cache_spec),
-            {name: kv_spec_summary(spec) for name, spec in kv_cache_spec.items()},
+            {name: _kv_spec_summary(spec) for name, spec in kv_cache_spec.items()},
         )
         return kv_cache_spec
 
