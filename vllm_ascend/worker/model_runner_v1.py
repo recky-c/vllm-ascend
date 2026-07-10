@@ -237,13 +237,16 @@ def _kv_debug_summarize_config(kv_cache_config: KVCacheConfig) -> dict:
 
 
 def _kv_debug_summarize_allocated_caches(
-    kv_caches: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
+    kv_caches: dict[
+        str,
+        torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+    ],
 ) -> dict:
     summary: dict = {}
     for layer_name, cache in kv_caches.items():
-        if isinstance(cache, tuple):
+        if isinstance(cache, (tuple, list)):
             summary[layer_name] = {
-                "type": "tuple",
+                "type": type(cache).__name__,
                 "parts": [
                     {
                         "shape": list(part.shape),
@@ -266,11 +269,11 @@ def _kv_debug_summarize_allocated_caches(
 
 
 def _kv_debug_tensor_bytes(
-    cache: torch.Tensor | tuple[torch.Tensor, ...] | None,
+    cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
 ) -> int:
     if cache is None:
         return 0
-    if isinstance(cache, tuple):
+    if isinstance(cache, (tuple, list)):
         return sum(_kv_debug_tensor_bytes(part) for part in cache)
     return cache.numel() * cache.element_size()
 
