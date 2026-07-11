@@ -111,6 +111,7 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
         self.is_kv_producer = self.vllm_config.kv_transfer_config and self.vllm_config.kv_transfer_config.is_kv_producer
         if get_ascend_config().short_request_first_config.enabled:
             self._init_short_request_first_waiting_queue()
+        self.use_sfa_offload = get_ascend_config().use_offload
 
     def _pop_waiting_request(
         self,
@@ -340,6 +341,9 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                                     recomputed_num_computed_tokens,
                                 )
                             )
+                        if self.use_sfa_offload:
+                            # In sfa offload, we directly recompute.
+                            offloaded = False
                         if offloaded:
                             logger.info(
                                 "Recompute preemption offload enabled for request %s, computed_tokens=%d.",
@@ -369,6 +373,9 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                                     recomputed_req.client_index,
                                 )
                             )
+                        if self.use_sfa_offload:
+                            # In sfa offload, we also need to free cpu blocks here.
+                            self.connector.request_finished(recomputed_req, [])
                         if recomputed_req == request:
                             break
                     else:
