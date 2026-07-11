@@ -3,10 +3,11 @@
 """Worker side of the PD-disaggregated SFA connector (memfabric pull mode).
 
 D (``kv_consumer``): composes :class:`SFAKVOffloadWorker` for the LRU-resident
-H2D load path + CPU pool, and runs a memfabric pull read thread. P notifies D
-per layer via READ_READY_BATCH; D reads indexer KV into HBM and main MLA KV into the
-CPU pool (the partial last block stays in HBM until decode fills it, then the
-B1 offload path copies it to CPU).
+H2D load path + TP-shared CPU pool, and runs one memfabric pull read thread per
+TP rank. Every rank reads Indexer KV and partial Main KV into local HBM; TP0
+also reads full Main MLA KV into the shared CPU pool. P notifies D per layer
+via READ_READY_BATCH. Once a partial block fills during decode, the B1 offload
+path on TP0 copies it to the CPU pool.
 
 P (``kv_producer``): reuses :class:`MooncakeLayerwiseConnectorWorker` for the
 send setup, but swaps in a pull-mode sending thread that notifies D to read
@@ -189,12 +190,10 @@ class SFAPDCpuOffloadConsumerWorker:
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
-        # CPU pool owned by the composed SFA worker. With TP-group shared CPU
-        # pool (sfa_kv_offload_worker: only tp_rank==0 allocates), only rank 0
-        # has k_caches_cpu/v_caches_cpu. Rank 0 does PD receive (memfabric pull
-        # from P HBM into the CPU pool); other ranks skip PD receive and rely on
-        # the shared pool via sfa_worker's broadcast ptrs (gvas_k_bases) for
-        # LRU load. LRU load runs on all ranks; offload on rank 0 only.
+        # The full Main KV CPU pool is TP-shared and allocated only by TP0.
+        # Every rank still runs PD receive because Indexer and partial Main KV
+        # land in rank-local HBM. Non-TP0 ranks therefore pull only those HBM
+        # legs and use TP0's CPU pool through the broadcast GVA pointers.
         k_caches_cpu = getattr(self.sfa_worker, 'k_caches_cpu', None)
         v_caches_cpu = getattr(self.sfa_worker, 'v_caches_cpu', None)
 
@@ -207,16 +206,10 @@ class SFAPDCpuOffloadConsumerWorker:
             if isinstance(t, (list, tuple)) and len(t) in (5, 6)
         }
 
-        if k_caches_cpu is not None and v_caches_cpu is not None:
-            # Rank 0: register memfabric pull (PD receive into the CPU pool).
-            assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
-                "SFAPDCpuOffloadConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
-            )
-            self._register_memfabric_pull(kv_caches, k_caches_cpu, v_caches_cpu)
-        else:
-            # Non-rank-0: no PD receive (rank 0 fills the shared CPU pool).
-            # LRU load / offload run via sfa_worker using the broadcast ptrs.
-            self._cpu_pools = []
+        assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
+            "SFAPDCpuOffloadConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
+        )
+        self._register_memfabric_pull(kv_caches, k_caches_cpu, v_caches_cpu)
 
     # -- D-side forwards to the composed SFA worker (LRU load path) --
     def start_load_kv(self, metadata: KVConnectorMetadata):
@@ -356,11 +349,12 @@ class SFAPDCpuOffloadConsumerWorker:
     def _register_memfabric_pull(
         self,
         kv_caches: dict[str, torch.Tensor],
-        k_caches_cpu: list[torch.Tensor],
-        v_caches_cpu: list[torch.Tensor],
+        k_caches_cpu: list[torch.Tensor] | None,
+        v_caches_cpu: list[torch.Tensor] | None,
     ) -> None:
         """memfabric pull mode: D does NOT register anything. Only P registers
-        its HBM. D creates a read engine + MembPullReadThread."""
+        its HBM. Every D rank reads local HBM legs; TP0 also reads full Main KV
+        into the shared CPU pool."""
         num_blocks = self.kv_cache_config.num_blocks
         indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
 
@@ -377,7 +371,12 @@ class SFAPDCpuOffloadConsumerWorker:
         self._indexer_names = indexer_names
         self._main_names = main_names
         self._main_name_to_idx = {n: i for i, n in enumerate(main_names)}
-        self._cpu_pools = list(zip(k_caches_cpu, v_caches_cpu))
+        if (k_caches_cpu is None) != (v_caches_cpu is None):
+            raise RuntimeError("SFA shared CPU K/V pools must either both exist or both be absent")
+        has_cpu_pool = k_caches_cpu is not None
+        self._cpu_pools: list[tuple[torch.Tensor, torch.Tensor] | None] = (
+            list(zip(k_caches_cpu, v_caches_cpu)) if has_cpu_pool else [None] * len(main_names)
+        )
         self._indexer_tensors = []
         self._indexer_scale_tensors: list[torch.Tensor | None] = []
         for main_name in main_names:
@@ -391,7 +390,6 @@ class SFAPDCpuOffloadConsumerWorker:
         for pool_idx, (iname, mname) in enumerate(zip(indexer_names, main_names)):
             indexer_t = self._indexer_tensors[pool_idx]
             indexer_scale_t = self._indexer_scale_tensors[pool_idx]
-            k_cpu, v_cpu = self._cpu_pools[pool_idx]
             indexer_addrs = [indexer_t.data_ptr()]
             indexer_block_lens = [indexer_t.element_size() * math.prod(indexer_t.shape[1:])]
             indexer_block_scales = [indexer_t.shape[0] // num_blocks if num_blocks else 1]
@@ -409,18 +407,21 @@ class SFAPDCpuOffloadConsumerWorker:
                 block_len=indexer_block_lens,
                 block_size_scale=indexer_block_scales,
             )
-            self.layer_metadata[mname] = LayerMetadata(
-                tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
-                kv_caches_base_addr=[k_cpu.data_ptr(), v_cpu.data_ptr()],
-                block_len=[
-                    k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
-                    v_cpu.element_size() * math.prod(v_cpu.shape[1:]),
-                ],
-                block_size_scale=[
-                    k_cpu.shape[0] // num_blocks if num_blocks else 1,
-                    v_cpu.shape[0] // num_blocks if num_blocks else 1,
-                ],
-            )
+            cpu_pool = self._cpu_pools[pool_idx]
+            if cpu_pool is not None:
+                k_cpu, v_cpu = cpu_pool
+                self.layer_metadata[mname] = LayerMetadata(
+                    tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
+                    kv_caches_base_addr=[k_cpu.data_ptr(), v_cpu.data_ptr()],
+                    block_len=[
+                        k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
+                        v_cpu.element_size() * math.prod(v_cpu.shape[1:]),
+                    ],
+                    block_size_scale=[
+                        k_cpu.shape[0] // num_blocks if num_blocks else 1,
+                        v_cpu.shape[0] // num_blocks if num_blocks else 1,
+                    ],
+                )
 
         # Create memfabric engine (no registration)
         self._ensure_engine()
@@ -434,9 +435,11 @@ class SFAPDCpuOffloadConsumerWorker:
         self._mf_read_thread.start()
         self._mf_read_thread.ready_event.wait()
         logger.info(
-            "SFAPDCpuOffload D-side registered (memfabric pull): %d indexer + %d main layers, zero D-side registration",
+            "SFAPDCpuOffload D-side registered (memfabric pull): "
+            "%d indexer + %d main layers, full-main CPU destination=%s",
             len(indexer_names),
             len(main_names),
+            has_cpu_pool,
         )
 
     def _refresh_cpu_blocks_by_req(self, metadata: KVConnectorMetadata):
@@ -626,7 +629,12 @@ class MembPullReadThread(threading.Thread):
         p_base_addrs = p_meta["base_addrs"]
         p_block_len = p_meta["block_len"]
 
-        k_cpu, v_cpu = w._cpu_pools[offload_id]
+        cpu_pool = w._cpu_pools[offload_id]
+        if cpu_pool is None:
+            k_cpu_ptr = v_cpu_ptr = None
+        else:
+            k_cpu, v_cpu = cpu_pool
+            k_cpu_ptr, v_cpu_ptr = k_cpu.data_ptr(), v_cpu.data_ptr()
         hbm_kv = w._hbm_kv.get(layer_name)
         if hbm_kv is None:
             k_hbm_ptr = v_hbm_ptr = None
@@ -701,8 +709,8 @@ class MembPullReadThread(threading.Thread):
             "p_v_base": p_base_addrs[1],
             "p_k_len": p_block_len[0],
             "p_v_len": p_block_len[1],
-            "k_cpu_ptr": k_cpu.data_ptr(),
-            "v_cpu_ptr": v_cpu.data_ptr(),
+            "k_cpu_ptr": k_cpu_ptr,
+            "v_cpu_ptr": v_cpu_ptr,
             "k_hbm_ptr": k_hbm_ptr,
             "v_hbm_ptr": v_hbm_ptr,
             "indexer": indexer,
@@ -759,7 +767,8 @@ class MembPullReadThread(threading.Thread):
         # Main MLA leg: first `num_full` P blocks FULL -> D CPU pool; optional
         # last PARTIAL -> D HBM.
         full_p_blocks = p_block_ids[:num_full]
-        n_full = min(len(full_p_blocks), len(d_main_ids))
+        has_cpu_destination = layer["k_cpu_ptr"] is not None and layer["v_cpu_ptr"] is not None
+        n_full = min(len(full_p_blocks), len(d_main_ids)) if has_cpu_destination else 0
         if n_full:
             full_p = np.array(full_p_blocks[:n_full], dtype=np.int64)
             d_main = np.array(d_main_ids[:n_full], dtype=np.int64)
@@ -913,9 +922,13 @@ class MembPullReadThread(threading.Thread):
         partial_hbm_bid = read_info["partial_hbm_bid"]
         if envs.VLLM_ASCEND_MF_VERIFY:
             try:
-                k_cpu, v_cpu = w._cpu_pools[offload_id]
-                mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
-                mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                cpu_pool = w._cpu_pools[offload_id]
+                if cpu_pool is None:
+                    mk = mv = 0.0
+                else:
+                    k_cpu, v_cpu = cpu_pool
+                    mk = k_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
+                    mv = v_cpu[d_main_ids].float().sum().item() if d_main_ids else 0.0
                 # Part A: the partial last block is in HBM (not the CPU pool) —
                 # add it so D's main sum matches P's (full + partial) source sum.
                 if partial_hbm_bid is not None:
@@ -1318,9 +1331,9 @@ class SFAPDCpuOffloadProducerWorker(MooncakeLayerwiseConnectorWorker):
         * reset ``self.current_layer`` — the per-step layer counter that
           ``save_kv_layer`` increments; without the reset it drifts to
           ``>= total_layers`` and every request after the first is skipped.
-        * adjust ``remote_port`` by ``tp_rank`` — D's ROUTER binds
-          ``side_channel_port + tp_rank`` (one per rank) but D advertises the
-          base port, so each P rank must send to ``base + tp_rank``.
+        * adjust ``remote_port`` by ``tp_rank`` — each P rank sends replicated
+          SFA KV to its matching D rank. D TP0 stores full Main KV in the shared
+          CPU pool; every D rank stores its local Indexer and partial Main KV.
 
         ``remote_host`` / ``local_block_ids`` are already correct from
         ``build_connector_meta`` and need no transformation (P's single group
