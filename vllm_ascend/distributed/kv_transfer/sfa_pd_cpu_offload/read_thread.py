@@ -32,6 +32,7 @@ class ConsumerReadState:
     main_name_to_idx: dict[str, int]
     cpu_pools: list[tuple[Any, Any] | None]
     hbm_kv: dict[str, tuple[Any, Any]]
+    main_packed: list[bool]
     indexer_tensors: list[Any]
     indexer_scale_tensors: list[Any | None]
     dest_blocks_by_req: dict[str, tuple[list[int], list[int], int, int | None]]
@@ -209,6 +210,7 @@ class MembPullReadThread(threading.Thread):
             return None
         p_base_addrs = p_meta["base_addrs"]
         p_block_len = p_meta["block_len"]
+        packed_main = state.main_packed[pool_idx] if pool_idx < len(state.main_packed) else False
 
         cpu_pool = state.cpu_pools[offload_id]
         if cpu_pool is None:
@@ -222,15 +224,21 @@ class MembPullReadThread(threading.Thread):
         else:
             k_hbm_ptr, v_hbm_ptr = hbm_kv[0].data_ptr(), hbm_kv[1].data_ptr()
 
+        main_k_idx = 0
+        main_v_idx = None if packed_main else 1
+        indexer_idx = 1 if packed_main else 2
+        scale_idx = 2 if packed_main else 3
+
         indexer = None
-        if len(p_base_addrs) < 3:
+        if len(p_base_addrs) <= indexer_idx:
             logger.error(
-                "MembPull indexer: P layer_meta for %s has %d tensors, need >=3; skip indexer leg",
+                "MembPull indexer: P layer_meta for %s has %d tensors, need indexer slot %d; skip indexer leg",
                 layer_name,
                 len(p_base_addrs),
+                indexer_idx,
             )
         else:
-            p_dsa_len = p_block_len[2]
+            p_dsa_len = p_block_len[indexer_idx]
             d_indexer = state.indexer_tensors[pool_idx]
             d_dsa_len = d_indexer.element_size() * math.prod(d_indexer.shape[1:])
             if p_dsa_len <= 0 or d_dsa_len % p_dsa_len != 0:
@@ -242,7 +250,7 @@ class MembPullReadThread(threading.Thread):
                 )
             else:
                 indexer = {
-                    "p_dsa_base": p_base_addrs[2],
+                    "p_dsa_base": p_base_addrs[indexer_idx],
                     "p_dsa_len": p_dsa_len,
                     "d_base": d_indexer.data_ptr(),
                     "d_dsa_len": d_dsa_len,
@@ -253,10 +261,10 @@ class MembPullReadThread(threading.Thread):
         scale = None
         scale_tensor = state.indexer_scale_tensors[pool_idx] if pool_idx < len(state.indexer_scale_tensors) else None
         if scale_tensor is not None:
-            if len(p_base_addrs) < 4:
+            if len(p_base_addrs) <= scale_idx:
                 scale = {"error": "p_addr_mismatch", "p_n": len(p_base_addrs)}
             else:
-                p_scale_len = p_block_len[3]
+                p_scale_len = p_block_len[scale_idx]
                 d_scale_len = scale_tensor.element_size() * math.prod(scale_tensor.shape[1:])
                 if p_scale_len <= 0 or d_scale_len % p_scale_len != 0:
                     scale = {
@@ -266,7 +274,7 @@ class MembPullReadThread(threading.Thread):
                     }
                 else:
                     scale = {
-                        "p_scale_base": p_base_addrs[3],
+                        "p_scale_base": p_base_addrs[scale_idx],
                         "p_scale_len": p_scale_len,
                         "d_scale_base": scale_tensor.data_ptr(),
                         "d_scale_len": d_scale_len,
@@ -277,10 +285,11 @@ class MembPullReadThread(threading.Thread):
             "layer_name": layer_name,
             "pool_idx": pool_idx,
             "offload_id": offload_id,
-            "p_k_base": p_base_addrs[0],
-            "p_v_base": p_base_addrs[1],
-            "p_k_len": p_block_len[0],
-            "p_v_len": p_block_len[1],
+            "packed_main": packed_main,
+            "p_k_base": p_base_addrs[main_k_idx],
+            "p_v_base": None if main_v_idx is None else p_base_addrs[main_v_idx],
+            "p_k_len": p_block_len[main_k_idx],
+            "p_v_len": 0 if main_v_idx is None else p_block_len[main_v_idx],
             "k_cpu_ptr": k_cpu_ptr,
             "v_cpu_ptr": v_cpu_ptr,
             "k_hbm_ptr": k_hbm_ptr,
@@ -324,6 +333,7 @@ class MembPullReadThread(threading.Thread):
             logger.warning("MembPull _do_read: empty p_block_ids for %s, skip", layer_name)
             return [], [], [], None
 
+        packed_main = layer["packed_main"]
         p_k_base, p_v_base = layer["p_k_base"], layer["p_v_base"]
         p_k_len, p_v_len = layer["p_k_len"], layer["p_v_len"]
 
@@ -334,21 +344,29 @@ class MembPullReadThread(threading.Thread):
         n_indexer = 0
 
         full_p_blocks = p_block_ids[:num_full]
-        has_cpu_destination = layer["k_cpu_ptr"] is not None and layer["v_cpu_ptr"] is not None
+        has_cpu_destination = layer["k_cpu_ptr"] is not None and (
+            packed_main or layer["v_cpu_ptr"] is not None
+        )
         n_full = min(len(full_p_blocks), len(d_main_ids)) if has_cpu_destination else 0
         if n_full:
             full_p = np.array(full_p_blocks[:n_full], dtype=np.int64)
             d_main = np.array(d_main_ids[:n_full], dtype=np.int64)
             len_k = np.full(n_full, p_k_len, dtype=np.int64)
-            len_v = np.full(n_full, p_v_len, dtype=np.int64)
             cp, cl, clen = _coalesce_desc(p_k_base + full_p * p_k_len, layer["k_cpu_ptr"] + d_main * p_k_len, len_k)
             peer_chunks.append(cp)
             local_chunks.append(cl)
             length_chunks.append(clen)
-            cp, cl, clen = _coalesce_desc(p_v_base + full_p * p_v_len, layer["v_cpu_ptr"] + d_main * p_v_len, len_v)
-            peer_chunks.append(cp)
-            local_chunks.append(cl)
-            length_chunks.append(clen)
+            if not packed_main:
+                assert p_v_base is not None
+                len_v = np.full(n_full, p_v_len, dtype=np.int64)
+                cp, cl, clen = _coalesce_desc(
+                    p_v_base + full_p * p_v_len,
+                    layer["v_cpu_ptr"] + d_main * p_v_len,
+                    len_v,
+                )
+                peer_chunks.append(cp)
+                local_chunks.append(cl)
+                length_chunks.append(clen)
             n_main = n_full
         if partial_hbm_bid is not None and num_full < len(p_block_ids):
             k_hbm_ptr = layer["k_hbm_ptr"]
@@ -356,16 +374,26 @@ class MembPullReadThread(threading.Thread):
                 logger.warning("MembPull _do_read: no HBM k/v for partial block %s, skip partial", layer_name)
             else:
                 partial_p_bid = p_block_ids[num_full]
-                peer_chunks.append(
-                    np.array([p_k_base + partial_p_bid * p_k_len, p_v_base + partial_p_bid * p_v_len], dtype=np.int64)
-                )
-                local_chunks.append(
-                    np.array(
-                        [k_hbm_ptr + partial_hbm_bid * p_k_len, layer["v_hbm_ptr"] + partial_hbm_bid * p_v_len],
-                        dtype=np.int64,
+                if packed_main:
+                    peer_chunks.append(
+                        np.array([p_k_base + partial_p_bid * p_k_len], dtype=np.int64)
                     )
-                )
-                length_chunks.append(np.array([p_k_len, p_v_len], dtype=np.int64))
+                    local_chunks.append(
+                        np.array([k_hbm_ptr + partial_hbm_bid * p_k_len], dtype=np.int64)
+                    )
+                    length_chunks.append(np.array([p_k_len], dtype=np.int64))
+                else:
+                    assert p_v_base is not None
+                    peer_chunks.append(
+                        np.array([p_k_base + partial_p_bid * p_k_len, p_v_base + partial_p_bid * p_v_len], dtype=np.int64)
+                    )
+                    local_chunks.append(
+                        np.array(
+                            [k_hbm_ptr + partial_hbm_bid * p_k_len, layer["v_hbm_ptr"] + partial_hbm_bid * p_v_len],
+                            dtype=np.int64,
+                        )
+                    )
+                    length_chunks.append(np.array([p_k_len, p_v_len], dtype=np.int64))
                 n_main += 1
 
         idx = layer["indexer"]
@@ -402,9 +430,9 @@ class MembPullReadThread(threading.Thread):
             if "error" in scale:
                 if scale["error"] == "p_addr_mismatch":
                     raise RuntimeError(
-                        f"MembPull indexer scale {layer_name}: D is LIC8 (has scale "
+                        f"MembPull indexer scale {layer_name}: D has scale "
                         f"tensor) but P exposed only {scale['p_n']} base addrs "
-                        f"(no scale leg) -- P/D LIC8 config mismatch."
+                        f"(no scale leg) -- P/D sparse C8 config mismatch."
                     )
                 raise RuntimeError(
                     f"MembPull indexer scale {layer_name}: D scale block_len="
@@ -461,7 +489,7 @@ class MembPullReadThread(threading.Thread):
                 "n_main": n_main,
                 "n_indexer": n_indexer,
                 "num_transfers": len(local_ptrs),
-                "atomic_transfers": 2 * n_main + n_indexer,
+                "atomic_transfers": (1 if packed_main else 2) * n_main + n_indexer,
             }
         return local_ptrs, peer_ptrs, lengths, info
 

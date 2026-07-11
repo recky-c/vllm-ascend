@@ -41,6 +41,16 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
     SFAKVOffloadWorker,
 )
+from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+    OFFLOAD_C8_INDEXER_K,
+    OFFLOAD_C8_INDEXER_S,
+    OFFLOAD_C8_MAIN_KV,
+    OFFLOAD_INDEXER_K,
+    OFFLOAD_MAIN_K,
+    OFFLOAD_MAIN_V,
+    OFFLOAD_TUPLE_LEN,
+    is_offload_c8_kv_cache,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     LayerMetadata,
     SendTask,
@@ -164,8 +174,9 @@ class SFAPDCpuOffloadConsumerWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Prepare D-side indexer HBM + main MLA CPU-pool destinations.
 
-        The sfa model runner hands a 5-tuple per layer:
-        ``(k_nope, v_rope, dsa_k_indexer, topk_buf_k, topk_buf_v)``.
+        The sfa model runner hands a non-C8 5-tuple or a unified C8
+        4-tuple. In C8 mode, main KV is one packed tensor and indexer scale is
+        stored at tuple slot 2.
         """
         # --- D side: compose the SFA worker for LRU load + CPU pool ---
         self.sfa_worker = SFAKVOffloadWorker(self.vllm_config, self.use_layerwise, self.kv_cache_config)
@@ -180,9 +191,14 @@ class SFAPDCpuOffloadConsumerWorker:
 
         # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
         # last block lands here instead of the CPU pool. Keyed by main layer name
-        # (the 5-tuple layers); tuple[0]=k_nope, tuple[1]=v_rope.
+        # C8 layers expose one packed main tensor; non-C8 layers expose K/V.
         self._hbm_kv = {
-            n: (t[0], t[1]) for n, t in kv_caches.items() if isinstance(t, (list, tuple)) and len(t) in (5, 6)
+            n: (t[OFFLOAD_C8_MAIN_KV], t[OFFLOAD_C8_MAIN_KV])
+            if is_offload_c8_kv_cache(t)
+            else (t[OFFLOAD_MAIN_K], t[OFFLOAD_MAIN_V])
+            for n, t in kv_caches.items()
+            if isinstance(t, (list, tuple))
+            and (len(t) == OFFLOAD_TUPLE_LEN or is_offload_c8_kv_cache(t))
         }
 
         # memfabric pull mode only.
@@ -332,6 +348,7 @@ class SFAPDCpuOffloadConsumerWorker:
             main_name_to_idx=self._main_name_to_idx,
             cpu_pools=self._cpu_pools,
             hbm_kv=self._hbm_kv,
+            main_packed=self._main_packed,
             indexer_tensors=self._indexer_tensors,
             indexer_scale_tensors=self._indexer_scale_tensors,
             dest_blocks_by_req=self._dest_blocks_by_req,
@@ -353,7 +370,12 @@ class SFAPDCpuOffloadConsumerWorker:
         def _offload_tuple_len(v: object) -> int:
             return len(v) if isinstance(v, (list, tuple)) else 1
 
-        main_names = [n for n, v in kv_caches.items() if _offload_tuple_len(v) in (5, 6)]
+        main_names = [
+            n
+            for n, v in kv_caches.items()
+            if _offload_tuple_len(v) == OFFLOAD_TUPLE_LEN
+            or is_offload_c8_kv_cache(v)
+        ]
         main_by_layer_idx = {_layer_idx(name): name for name in main_names}
         main_names = [main_by_layer_idx[_layer_idx(name)] for name in indexer_names]
 
@@ -361,6 +383,7 @@ class SFAPDCpuOffloadConsumerWorker:
         self._indexer_names = indexer_names
         self._main_names = main_names
         self._main_name_to_idx = {n: i for i, n in enumerate(main_names)}
+        self._main_packed = []
         if (k_caches_cpu is None) != (v_caches_cpu is None):
             raise RuntimeError("SFA shared CPU K/V pools must either both exist or both be absent")
         has_cpu_pool = k_caches_cpu is not None
@@ -371,8 +394,14 @@ class SFAPDCpuOffloadConsumerWorker:
         self._indexer_scale_tensors: list[torch.Tensor | None] = []
         for main_name in main_names:
             main_tuple = list(kv_caches[main_name])
-            self._indexer_tensors.append(main_tuple[2])  # dsa_k_indexer
-            self._indexer_scale_tensors.append(main_tuple[5] if len(main_tuple) >= 6 else None)
+            if is_offload_c8_kv_cache(main_tuple):
+                self._main_packed.append(True)
+                self._indexer_tensors.append(main_tuple[OFFLOAD_C8_INDEXER_K])
+                self._indexer_scale_tensors.append(main_tuple[OFFLOAD_C8_INDEXER_S])
+            else:
+                self._main_packed.append(False)
+                self._indexer_tensors.append(main_tuple[OFFLOAD_INDEXER_K])
+                self._indexer_scale_tensors.append(None)
 
         # Build layer_metadata (D's local addresses, for compatibility)
         for pool_idx, (iname, mname) in enumerate(zip(indexer_names, main_names)):
@@ -394,18 +423,30 @@ class SFAPDCpuOffloadConsumerWorker:
             cpu_pool = self._cpu_pools[pool_idx]
             if cpu_pool is not None:
                 k_cpu, v_cpu = cpu_pool
-                self.layer_metadata[mname] = LayerMetadata(
-                    tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
-                    kv_caches_base_addr=[k_cpu.data_ptr(), v_cpu.data_ptr()],
-                    block_len=[
-                        k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
-                        v_cpu.element_size() * math.prod(v_cpu.shape[1:]),
-                    ],
-                    block_size_scale=[
-                        k_cpu.shape[0] // num_blocks if num_blocks else 1,
-                        v_cpu.shape[0] // num_blocks if num_blocks else 1,
-                    ],
-                )
+                if self._main_packed[pool_idx]:
+                    self.layer_metadata[mname] = LayerMetadata(
+                        tensor_group_idx=[_MAIN_GROUP_IDX],
+                        kv_caches_base_addr=[k_cpu.data_ptr()],
+                        block_len=[
+                            k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
+                        ],
+                        block_size_scale=[
+                            k_cpu.shape[0] // num_blocks if num_blocks else 1,
+                        ],
+                    )
+                else:
+                    self.layer_metadata[mname] = LayerMetadata(
+                        tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
+                        kv_caches_base_addr=[k_cpu.data_ptr(), v_cpu.data_ptr()],
+                        block_len=[
+                            k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
+                            v_cpu.element_size() * math.prod(v_cpu.shape[1:]),
+                        ],
+                        block_size_scale=[
+                            k_cpu.shape[0] // num_blocks if num_blocks else 1,
+                            v_cpu.shape[0] // num_blocks if num_blocks else 1,
+                        ],
+                    )
 
         # Create memfabric engine (no registration)
         self._ensure_engine()

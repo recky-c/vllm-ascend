@@ -37,8 +37,10 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.kv_transfer import (
     KVTransferThread,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+    OFFLOAD_C8_INDEXER_S,
+    OFFLOAD_C8_MAIN_KV,
+    OFFLOAD_C8_RESIDENT_KV,
     OFFLOAD_C8_TUPLE_LEN,
-    OFFLOAD_INDEXER_S,
     OFFLOAD_MAIN_K,
     OFFLOAD_MAIN_V,
     OFFLOAD_RESIDENT_K,
@@ -277,11 +279,12 @@ class SFAKVOffloadWorker:
         }
         if len(tuple_lens) > 1:
             raise ValueError(
-                "SFA KV offload does not support mixed LIC8 / non-LIC8 layers: "
+                "SFA KV offload does not support mixed C8 / non-C8 layers: "
                 f"found tuple lengths {sorted(tuple_lens)} "
-                f"(five-tuple and six-tuple coexist). Under offload, C8 must be "
+                f"(five-tuple and four-tuple coexist). Under offload, C8 must be "
                 f"enabled uniformly across all sparse layers."
             )
+        self.offload_uses_sparse_c8 = OFFLOAD_C8_TUPLE_LEN in tuple_lens
 
         self.num_offload_layers = len(self.offload_layer_names)
         self.num_layers = self.num_offload_layers
@@ -347,28 +350,24 @@ class SFAKVOffloadWorker:
                         f"SFA KV offload layer {layer_name}: expected tuple length "
                         f"{OFFLOAD_TUPLE_LEN} or {OFFLOAD_C8_TUPLE_LEN}, got {tuple_len}"
                     )
-                self.k_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_K])
-                self.v_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_V])
-                self.topk_buffers_k.append(cache_or_caches[OFFLOAD_RESIDENT_K])
-                self.topk_buffers_v.append(cache_or_caches[OFFLOAD_RESIDENT_V])
                 if is_offload_c8_kv_cache(cache_or_caches):
-                    # Guard against the LIC8 scale tensor aliasing a resident
-                    # top-K buffer. Compare storage identity (data_ptr), NOT
-                    # `in`/`==`: those do element-wise comparison and raise a
-                    # shape-mismatch RuntimeError on the legitimate difference
-                    # (scale dim1 = dsa_block_size, resident dim1 =
-                    # resident_capacity).
+                    packed_main = cache_or_caches[OFFLOAD_C8_MAIN_KV]
+                    packed_resident = cache_or_caches[OFFLOAD_C8_RESIDENT_KV]
+                    self.k_caches_npu.append(packed_main)
+                    self.v_caches_npu.append(packed_main)
+                    self.topk_buffers_k.append(packed_resident)
+                    self.topk_buffers_v.append(packed_resident)
                     scale_storage_ptr = cache_or_caches[
-                        OFFLOAD_INDEXER_S].untyped_storage().data_ptr()
-                    if scale_storage_ptr in (
-                        cache_or_caches[OFFLOAD_RESIDENT_K]
-                        .untyped_storage().data_ptr(),
-                        cache_or_caches[OFFLOAD_RESIDENT_V]
-                        .untyped_storage().data_ptr(),
-                    ):
+                        OFFLOAD_C8_INDEXER_S].untyped_storage().data_ptr()
+                    if scale_storage_ptr == packed_resident.untyped_storage().data_ptr():
                         raise ValueError(
-                            f"LIC8 scale tensor must not alias resident buffer: {layer_name}"
+                            f"SFA C8 scale tensor must not alias resident buffer: {layer_name}"
                         )
+                else:
+                    self.k_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_K])
+                    self.v_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_V])
+                    self.topk_buffers_k.append(cache_or_caches[OFFLOAD_RESIDENT_K])
+                    self.topk_buffers_v.append(cache_or_caches[OFFLOAD_RESIDENT_V])
 
             if self.use_layerwise:
                 ready_event = threading.Event()
@@ -385,6 +384,14 @@ class SFAKVOffloadWorker:
             else:
                 raise ValueError("SFA KV Offload only support layerwise now.")
 
+            packed_token_dim = None
+            packed_dtype = torch.bfloat16
+            if self.offload_uses_sparse_c8:
+                packed_token_dim = self.topk_buffers_k[0].shape[-1]
+                packed_dtype = self.topk_buffers_k[0].dtype
+                self.token_size_bytes_k = packed_token_dim * self.topk_buffers_k[0].element_size()
+                self.token_size_bytes_v = 0
+
             if self.tp_rank == 0:
                 npu_block_num = self.num_blocks
                 # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
@@ -392,7 +399,10 @@ class SFAKVOffloadWorker:
                 # TODO remove this and directly compute from model config before merge
                 cpu_block_num_multiple = 4
                 cpu_block_num = npu_block_num * cpu_block_num_multiple
-                cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
+                if self.offload_uses_sparse_c8:
+                    cpu_cache_size = cpu_block_num * self.block_size * self.token_size_bytes_k * self.num_layers
+                else:
+                    cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
                 logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
                 if cpu_cache_size > self.allocate_dram_size:
                     raise ValueError(
@@ -400,14 +410,25 @@ class SFAKVOffloadWorker:
                         f"available cpu memory ({self.allocate_dram_size / 1024 / 1024 / 1024} GB), "
                         "try to decrease gpu_memory_utilization or allocate more cpu memory during init."
                     )
-                self.k_caches_cpu: list[torch.Tensor] = [
-                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16)
-                    for _ in range(self.num_layers)
-                ]
-                self.v_caches_cpu: list[torch.Tensor] = [
-                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
-                    for _ in range(self.num_layers)
-                ]
+                if self.offload_uses_sparse_c8:
+                    assert packed_token_dim is not None
+                    self.k_caches_cpu = [
+                        self._empty_aligned_cpu_tensor(
+                            [cpu_block_num, self.block_size, 1, packed_token_dim],
+                            dtype=packed_dtype,
+                        )
+                        for _ in range(self.num_layers)
+                    ]
+                    self.v_caches_cpu = self.k_caches_cpu
+                else:
+                    self.k_caches_cpu = [
+                        self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16)
+                        for _ in range(self.num_layers)
+                    ]
+                    self.v_caches_cpu = [
+                        self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
+                        for _ in range(self.num_layers)
+                    ]
 
             # topk cache reuse related
             self.lru_workspace_threads = 8

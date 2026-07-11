@@ -630,21 +630,25 @@ compute_lru_resident_addrs(
             const int32_t block_indice = block_table_ptr[req_idx * max_num_blocks + block_id];
             const int64_t gvas_k =
                 gvas_k_base + block_indice * block_size_bytes_k + offset_in_block * token_size_bytes_k;
-            const int64_t gvas_v =
-                gvas_v_base + block_indice * block_size_bytes_v + offset_in_block * token_size_bytes_v;
             const int64_t addr_k = addr_k_base + (req_idx * resident_capacity + slot) * token_size_bytes_k;
-            const int64_t addr_v = addr_v_base + (req_idx * resident_capacity + slot) * token_size_bytes_v;
             gvas_buffer_ptr[req_start_loc_k + idx] = gvas_k;
-            gvas_buffer_ptr[req_start_loc_v + idx] = gvas_v;
             addr_buffer_ptr[req_start_loc_k + idx] = addr_k;
-            addr_buffer_ptr[req_start_loc_v + idx] = addr_v;
+            if (token_size_bytes_v > 0) {
+                const int64_t gvas_v =
+                    gvas_v_base + block_indice * block_size_bytes_v + offset_in_block * token_size_bytes_v;
+                const int64_t addr_v = addr_v_base + (req_idx * resident_capacity + slot) * token_size_bytes_v;
+                gvas_buffer_ptr[req_start_loc_v + idx] = gvas_v;
+                addr_buffer_ptr[req_start_loc_v + idx] = addr_v;
+            }
         }
     }
 
     std::fill_n(size_buffer_ptr, num_tokens_to_load_sum, token_size_bytes_k);
-    std::fill_n(&(size_buffer_ptr[num_tokens_to_load_sum]), num_tokens_to_load_sum, token_size_bytes_v);
+    if (token_size_bytes_v > 0) {
+        std::fill_n(&(size_buffer_ptr[num_tokens_to_load_sum]), num_tokens_to_load_sum, token_size_bytes_v);
+    }
 
-    num_tokens_buffer_ptr[0] = num_tokens_to_load_sum * 2;
+    num_tokens_buffer_ptr[0] = num_tokens_to_load_sum * (token_size_bytes_v > 0 ? 2 : 1);
     return num_tokens_to_load_sum;
 }
 
