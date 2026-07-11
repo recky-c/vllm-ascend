@@ -37,6 +37,7 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.kv_usage_debug import log_kv_read, log_kv_write
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -1348,6 +1349,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 slot_mapping=slot_mapping,
                 num_input_tokens=num_input_tokens,
             )
+            log_kv_write(
+                layer_name=layer_name,
+                attn_state=attn_metadata.attn_state,
+                num_tokens=num_input_tokens,
+                slot_mapping=slot_mapping[:num_input_tokens],
+                key_cache_shape=None if not kv_cache else kv_cache[0].shape,
+                value_cache_shape=None if not kv_cache or len(kv_cache) < 2 else kv_cache[1].shape,
+                backend="SFA",
+            )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(
                     x=hidden_states,
@@ -1392,8 +1402,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 k_pe, k_nope, knope_scale = self.exec_kv(
                     kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata
                 )
+                write_slots = slot_mapping_cp
             else:
                 k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                write_slots = slot_mapping
+            log_kv_write(
+                layer_name=layer_name,
+                attn_state=attn_metadata.attn_state,
+                num_tokens=num_input_tokens,
+                slot_mapping=write_slots[:num_input_tokens] if write_slots is not None else write_slots,
+                key_cache_shape=None if not kv_cache else kv_cache[0].shape,
+                value_cache_shape=None if not kv_cache or len(kv_cache) < 2 else kv_cache[1].shape,
+                backend="SFA",
+            )
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -1621,6 +1642,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
+        log_kv_read(
+            layer_name=layer_name,
+            attn_state=attn_metadata.attn_state,
+            num_tokens=num_input_tokens,
+            block_table=attn_metadata.block_table,
+            key_cache_shape=None if not kv_cache else kv_cache[0].shape,
+            backend="SFA",
+        )
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )

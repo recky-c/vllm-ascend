@@ -121,6 +121,7 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
+from vllm_ascend.kv_usage_debug import begin_forward_step, current_step, log_slot_mapping
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -2127,6 +2128,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        begin_forward_step()
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -3332,6 +3334,15 @@ class NPUModelRunner(GPUModelRunner):
                     self.routed_experts_slot_mapping_device[:n].copy_(
                         slot_mapping
                     )
+            log_slot_mapping(
+                step=current_step(),
+                kv_cache_gid=kv_cache_gid,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                block_table=blk_table_tensor,
+                slot_mapping=slot_mapping,
+                block_size=getattr(kv_cache_spec, "block_size", None),
+            )
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)

@@ -65,6 +65,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_graph_params_workspaces,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.kv_usage_debug import log_kv_read, log_kv_write
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
@@ -1389,6 +1390,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
+        log_kv_read(
+            layer_name=getattr(self, "_kv_debug_layer_name", "?"),
+            attn_state=attn_metadata.attn_state,
+            num_tokens=query.shape[0],
+            block_table=attn_metadata.block_tables,
+            key_cache_shape=None if self.key_cache is None else self.key_cache.shape,
+            backend="Dense",
+        )
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -1440,6 +1449,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if self.key_cache is None:
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
 
+        log_kv_write(
+            layer_name=getattr(self, "_kv_debug_layer_name", "?"),
+            attn_state="do_kv_cache_update",
+            num_tokens=key.shape[0],
+            slot_mapping=slot_mapping,
+            key_cache_shape=None if self.key_cache is None else self.key_cache.shape,
+            value_cache_shape=None if self.value_cache is None else self.value_cache.shape,
+            backend="Dense",
+        )
         DeviceOperator.reshape_and_cache(
             key=key,
             value=value,
@@ -1464,6 +1482,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+            write_slots = (
+                slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32)
+            )
+            log_kv_write(
+                layer_name=getattr(self, "_kv_debug_layer_name", "?"),
+                attn_state=attn_metadata.attn_state,
+                num_tokens=attn_metadata.num_actual_tokens,
+                slot_mapping=write_slots,
+                key_cache_shape=None if self.key_cache is None else self.key_cache.shape,
+                value_cache_shape=None if self.value_cache is None else self.value_cache.shape,
+                backend="Dense",
+            )
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                 value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
@@ -1471,7 +1501,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 value_cache=self.value_cache,
                 # quick fix to make sure slots is int32 for cross attention case.
                 # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
-                slot_mapping=slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots.to(torch.int32),
+                slot_mapping=write_slots,
             )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
@@ -1495,6 +1525,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             output = self.forward_paged_attention(query, attn_metadata, output)
         else:
+            # FIA / PrefillCacheHit also gather history via block_tables when present.
+            if attn_metadata.attn_state != AscendAttentionState.PrefillNoCache:
+                log_kv_read(
+                    layer_name=getattr(self, "_kv_debug_layer_name", "?"),
+                    attn_state=attn_metadata.attn_state,
+                    num_tokens=num_tokens,
+                    block_table=attn_metadata.block_tables,
+                    key_cache_shape=(
+                        None
+                        if self.key_cache is None
+                        else self.key_cache.shape
+                    ),
+                    backend="Dense",
+                )
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
 
         return output
@@ -1523,6 +1567,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+        self._kv_debug_layer_name = layer.layer_name
         if self.enable_hamming_sparse:
             self.layerIndex = int(layer.layer_name.split(".")[2])
         if self._use_layer_aware_fia_graph_replay:

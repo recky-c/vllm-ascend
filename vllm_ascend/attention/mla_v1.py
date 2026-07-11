@@ -44,6 +44,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.kv_usage_debug import log_kv_read, log_kv_write
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -1688,9 +1689,29 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_metadata.reshape_cache_event = torch.npu.Event()
         if has_decode:
             decode_preprocess_res = self.mla_preprocess_decode(q_c, kv_no_split, kv_cache, attn_metadata)
+            log_kv_write(
+                layer_name=layer_name,
+                attn_state="MLA_Decode",
+                num_tokens=attn_metadata.num_decode_tokens,
+                slot_mapping=attn_metadata.slot_mapping[: attn_metadata.num_decode_tokens],
+                key_cache_shape=None if not kv_cache else kv_cache[0].shape,
+                value_cache_shape=None if not kv_cache or len(kv_cache) < 2 else kv_cache[1].shape,
+                backend="MLA",
+            )
         # Preprocess for prefill tokens
         if has_prefill:
             prefill_preprocess_res = self.mla_preprocess_prefill(q_c, kv_no_split, kv_cache, attn_metadata)
+            log_kv_write(
+                layer_name=layer_name,
+                attn_state="MLA_Prefill",
+                num_tokens=attn_metadata.num_actual_tokens - attn_metadata.num_decode_tokens,
+                slot_mapping=attn_metadata.slot_mapping[
+                    attn_metadata.num_decode_tokens : attn_metadata.num_actual_tokens
+                ],
+                key_cache_shape=None if not kv_cache else kv_cache[0].shape,
+                value_cache_shape=None if not kv_cache or len(kv_cache) < 2 else kv_cache[1].shape,
+                backend="MLA",
+            )
         if self.is_kv_producer and not self.is_kv_both:
             attn_metadata.reshape_cache_event.record()
         return decode_preprocess_res, prefill_preprocess_res
@@ -1766,6 +1787,17 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
+            decode_bt = None
+            if attn_metadata.decode is not None:
+                decode_bt = getattr(attn_metadata.decode, "block_table", None)
+            log_kv_read(
+                layer_name=layer_name,
+                attn_state="MLA_Decode",
+                num_tokens=num_decode_tokens,
+                block_table=decode_bt if decode_bt is not None else attn_metadata.block_tables,
+                key_cache_shape=None if not kv_cache else kv_cache[0].shape,
+                backend="MLA",
+            )
             output_decode = self._forward_decode(
                 decode_preprocess_res.ql_nope,
                 decode_preprocess_res.q_pe,

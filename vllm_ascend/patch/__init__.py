@@ -220,6 +220,21 @@
 #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
 #       non-CUDA backends, or exposes a platform hook for this behavior.
 #
+# ** 10ac. File: platform/patch_kv_cache_manager_debug.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.kv_cache_manager.KVCacheManager.allocate_slots`
+#      `vllm.v1.core.kv_cache_manager.KVCacheManager.free`
+#    Why:
+#       debug/kv-cache-memory-inspect: teach how Scheduler block pool
+#       allocate/free maps onto the tensors created by initialize_kv_cache.
+#    How：
+#       Wrap allocate_slots/free and emit [KV_DEBUG] usage.allocate /
+#       usage.free when VLLM_ASCEND_KV_USAGE_DEBUG=1.
+#    Related PR (if no, explain why):
+#       No. Debug-branch only instrumentation.
+#    Future Plan:
+#       Keep on the debug branch; do not merge to main without an opt-in gate.
+#
 # ** 10ab. File: worker/patch_v2/patch_attn_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.gpu.attn_utils.get_kv_cache_spec`
