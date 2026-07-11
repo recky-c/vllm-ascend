@@ -297,7 +297,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const c10::optional<at::Tensor> &key_rope, int64_t sparse_block_size,
     c10::string_view layout_query, c10::string_view layout_kv,
     int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens,
-    int64_t attention_mode, bool return_softmax_lse)
+    int64_t attention_mode, bool return_softmax_lse, bool sparse_indices_discrete)
 {
     constexpr int64_t DIM_0 = 0;
     constexpr int64_t DIM_1 = 1;

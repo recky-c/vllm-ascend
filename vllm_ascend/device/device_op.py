@@ -555,7 +555,7 @@ class BaseDeviceAdaptor:
         q_li_shape_ori: tuple[Any, ...] | None,
         weights: torch.Tensor,
         kv_cache: tuple,
-        attn_metadata,
+        block_table,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         use_sparse_c8_indexer: bool,
@@ -565,11 +565,23 @@ class BaseDeviceAdaptor:
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         packed_kv_cache = getattr(sfa_impl, "use_sparse_c8_sfa", False)
-        indexer_cache_idx = 1 if packed_kv_cache else 2
-        indexer_scale_cache_idx = 2 if packed_kv_cache else 3
+        use_offload = getattr(sfa_impl, "use_offload", False)
+        if use_offload:
+            indexer_cache_idx = 2
+            indexer_scale_cache_idx = 5
+        elif packed_kv_cache:
+            indexer_cache_idx = 1
+            indexer_scale_cache_idx = 2
+        else:
+            indexer_cache_idx = 2
+            indexer_scale_cache_idx = 3
 
         if use_sparse_c8_indexer:
-            assert len(kv_cache) == (3 if packed_kv_cache else 4)
+            # NOTE: use_sparse_c8_indexer is a global flag. Under offload the
+            # per-layer C8 layout (six-tuple) is enforced uniform across all
+            # sparse layers by SFAKVOffloadWorker._register_offload_layers
+            # (mixed 5/6 tuples raise there), so this global gate is safe.
+            assert len(kv_cache) == (6 if use_offload else (3 if packed_kv_cache else 4))
             assert q_li_scale is not None
             assert q_li_shape_ori is not None
             weights = weights.to(torch.float16)
@@ -581,7 +593,7 @@ class BaseDeviceAdaptor:
                 key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -596,7 +608,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -609,7 +621,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -1741,18 +1753,30 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         q_li_shape_ori: tuple[Any, ...] | None,
         weights: torch.Tensor,
         kv_cache: tuple,
-        attn_metadata,
+        block_table,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         use_sparse_c8_indexer: bool,
         use_torch_npu_lightning_indexer: bool,
     ) -> torch.Tensor:
         packed_kv_cache = getattr(sfa_impl, "use_sparse_c8_sfa", False)
-        indexer_cache_idx = 1 if packed_kv_cache else 2
-        indexer_scale_cache_idx = 2 if packed_kv_cache else 3
+        use_offload = getattr(sfa_impl, "use_offload", False)
+        if use_offload:
+            indexer_cache_idx = 2
+            indexer_scale_cache_idx = 5
+        elif packed_kv_cache:
+            indexer_cache_idx = 1
+            indexer_scale_cache_idx = 2
+        else:
+            indexer_cache_idx = 2
+            indexer_scale_cache_idx = 3
 
         if use_sparse_c8_indexer:
-            assert len(kv_cache) == (3 if packed_kv_cache else 4)
+            # NOTE: use_sparse_c8_indexer is a global flag. Under offload the
+            # per-layer C8 layout (six-tuple) is enforced uniform across all
+            # sparse layers by SFAKVOffloadWorker._register_offload_layers
+            # (mixed 5/6 tuples raise there), so this global gate is safe.
+            assert len(kv_cache) == (6 if use_offload else (3 if packed_kv_cache else 4))
             assert q_li_shape_ori is not None
 
             if q_li_scale is not None:
@@ -1767,7 +1791,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     key_dequant_scale=key_dequant_scale,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
-                    block_table=attn_metadata.block_table,
+                    block_table=block_table,
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -1782,7 +1806,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
-                    block_table=attn_metadata.block_table,
+                    block_table=block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=2048,
@@ -1795,7 +1819,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,

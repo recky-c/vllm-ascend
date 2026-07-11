@@ -9,9 +9,11 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend.device.utils import FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
+from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_config,
@@ -317,6 +319,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
     kvcomp_metadata: KVCompMetaData | None = None
 
+    indexer_block_table_tensor: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
+    num_offloaded_blocks: torch.Tensor | None = None
+    req_ids_tensor: torch.Tensor | None = None
+    token_to_req: torch.Tensor | None = None
+    tokens_per_req: torch.Tensor | None = None
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -348,6 +356,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
+            num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
+            req_ids_tensor=_slice_reqs(self.req_ids_tensor),
+            token_to_req=self.token_to_req[:num_actual_tokens]
+            if self.token_to_req is not None
+            else None,
+            tokens_per_req=_slice_reqs(self.tokens_per_req),
             seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
             if self.seq_lens_cpu_upper_bound is not None
             else None,
@@ -502,6 +518,20 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     connector.wait_for_layer_load(layer_name)
 
 
+def maybe_record_attention_compute_start():
+    """Record the compute-stream boundary immediately before the attention op.
+
+    Opens the per-layer ``AttentionComputeStartGate`` that layerwise KV-pool
+    prefetch threads wait on before submitting H2D loads for upcoming layers,
+    so those transfers overlap with this layer's attention compute. No-op
+    unless a v1 KV-transfer connector is registered and a gate has been armed
+    by the layerwise load path (otherwise the gate stays ``None``).
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    record_attention_compute_start()
+
+
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
     kv_cache_layer: list[torch.Tensor],
@@ -517,6 +547,77 @@ def maybe_save_kv_layer_to_connector(
         return
     # TODO: assert ascendMetadata
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+
+
+def set_connector_req_ids(req_ids):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, 'set_req_ids'):
+        return
+    connector.set_req_ids(req_ids)
+
+
+def maybe_prepare_lru_resident_and_load_graph(
+    layer_name: str,
+    num_tokens: int,
+    num_reqs: int,
+    topk_indices: torch.Tensor,
+    current_slots: torch.Tensor,
+    req_ids: torch.Tensor,
+    token_to_req: torch.Tensor | None = None,
+    capturing: bool = False,
+) -> bool:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "prepare_lru_resident_and_load"):
+        raise RuntimeError(
+            "LRU resident cache requires prepare_lru_resident_and_load connector method"
+        )
+    return connector.prepare_lru_resident_and_load(
+        layer_name,
+        num_tokens,
+        num_reqs,
+        topk_indices,
+        current_slots,
+        req_ids,
+        token_to_req,
+        capturing,
+    )
+
+
+def maybe_wait_for_layer_send(layer_idx: int) -> None:
+    """P-side buffer-reuse gate.
+
+    Blocks until the producer connector has finished RDMA-reading layer
+    ``layer_idx``'s KV buffer, so the buffer may be safely reused by a later
+    prefill layer. No-op for connectors that don't push (e.g. the D-side
+    consumer, or non-PD connectors).
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "wait_for_layer_send"):
+        return
+    connector.wait_for_layer_send(layer_idx)
+
+
+def maybe_get_num_cpu_blocks(req_ids):
+    """Return {req_id: num_main_mla_cpu_blocks} for remote-prefilled requests.
+
+    Used by the SFA decode threshold (``num_offloaded_blocks``) to mark the
+    entire prefill prefix as CPU-resident, so the NPU-hit attention path never
+    reads D's empty NPU main-MLA cache for remote-prefilled requests (solution
+    1). Returns ``None`` for connectors that don't supply it, in which case the
+    caller falls back to the ``computed // block_size - 1`` heuristic.
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return None
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "get_num_cpu_blocks"):
+        return None
+    return connector.get_num_cpu_blocks(req_ids)
 
 
 def round_up(val: int, align: int) -> int:

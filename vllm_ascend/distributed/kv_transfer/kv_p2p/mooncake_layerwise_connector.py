@@ -53,8 +53,15 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import extract_layer_index
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+    get_shared_layer_transfer_events,
+    get_shared_layer_transfer_pending_events,
+    set_shared_layer_transfer_events,
+    set_shared_layer_transfer_pending_events,
+)
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
@@ -224,6 +231,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
         callback_func: Callable[..., None] = lambda x: None,
+        layer_transfer_finished_events: list[threading.Event] | None = None,
+        layer_transfer_pending_events: list[threading.Event] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -262,6 +271,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.enable_c8_quant = enable_c8_quant
         self.ready_event = ready_event
         self.callback_func = callback_func
+        self.layer_transfer_finished_events = layer_transfer_finished_events
+        self.layer_transfer_pending_events = layer_transfer_pending_events
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -446,6 +457,10 @@ class KVCacheSendingLayerThread(threading.Thread):
 
     def _transfer_kv_cache(self, send_task: SendTask):
         layer_name = send_task.layer_name
+        if self.layer_transfer_finished_events is not None:
+            self.layer_transfer_finished_events[send_task.layer_idx].clear()
+        if self.layer_transfer_pending_events is not None and send_task.send_request:
+            self.layer_transfer_pending_events[send_task.layer_idx].set()
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
         value = send_task.v_cache
@@ -525,6 +540,10 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 self.failed_reqs.discard(req_id)
                             else:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+        if self.layer_transfer_finished_events is not None:
+            self.layer_transfer_finished_events[send_task.layer_idx].set()
+        if self.layer_transfer_pending_events is not None:
+            self.layer_transfer_pending_events[send_task.layer_idx].clear()
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
@@ -627,7 +646,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
 
                     msg = decoder.decode(payload[0])
                     if msg[0] == GET_META_MSG:
-                        logger.info("Got GET META INFO for request %s", msg[0])
+                        if envs.VLLM_ASCEND_SFA_DEBUG:
+                            logger.info("Got GET META INFO for request %s", msg[0])
                         sock.send_multipart((identity, b"", encoded_data))
                     elif msg[0] == DONE_SENDING_MSG:
                         logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
@@ -949,7 +969,12 @@ class MooncakeLayerwiseConnectorScheduler:
 
             params["do_remote_prefill"] = False
 
-            logger.info("Send request: %s to proxy metaserver: %s", request.request_id, params.get("metaserver", None))
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "Send request: %s to proxy metaserver: %s",
+                    request.request_id,
+                    params.get("metaserver", None),
+                )
             # All parameters here should appear in the returned dict of
             # request_finished in the scheduler side except "request_id".
             # change the format of request_id if vllm-version >= 0.14.0
@@ -989,6 +1014,21 @@ class MooncakeLayerwiseConnectorScheduler:
             remote_cache_tokens = params["remote_cached_tokens"]
             local_transferred_tokens = remote_cache_tokens
             local_computed_tokens = 0
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "MooncakeLayerwiseConnector P register remote-decode req %s: "
+                    "local_block_ids=%s, local_transferred_tokens=%s, "
+                    "local_computed_tokens=%s, remote_host=%s, remote_port=%s, "
+                    "remote_tp_size=%s, remote_cached_tokens=%s",
+                    request.request_id,
+                    local_block_ids,
+                    local_transferred_tokens,
+                    local_computed_tokens,
+                    params.get("remote_host"),
+                    params.get("remote_port"),
+                    params.get("remote_tp_size"),
+                    remote_cache_tokens,
+                )
             self._reqs_need_send_layerwise[request.request_id] = SendReqInfo(
                 local_block_ids=local_block_ids,
                 local_transferred_tokens=local_transferred_tokens,
@@ -1025,6 +1065,12 @@ class MooncakeLayerwiseConnectorScheduler:
             for req_id, new_blocks in zip(cached_reqs.req_ids, cached_reqs.new_block_ids):
                 if req_id in self._reqs_need_send_layerwise and new_blocks is not None:
                     self._reqs_need_send_layerwise[req_id].extend_local_block_ids(new_blocks)
+                    if envs.VLLM_ASCEND_SFA_DEBUG:
+                        logger.info(
+                            "MooncakeLayerwiseConnector P extend remote-decode req %s: new_blocks=%s",
+                            req_id,
+                            new_blocks,
+                        )
             computed_tokens = dict(
                 list(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
                 + [(x.req_id, x.num_computed_tokens) for x in new_reqs]
@@ -1043,6 +1089,18 @@ class MooncakeLayerwiseConnectorScheduler:
                     send_req_info.update_computed_tokens(
                         computed_tokens.get(req_id, 0) + scheduled_tokens - spec_decode_tokens
                     )
+                    if envs.VLLM_ASCEND_SFA_DEBUG:
+                        logger.info(
+                            "MooncakeLayerwiseConnector P build meta req %s: scheduled_tokens=%s, "
+                            "spec_decode_tokens=%s, computed_before=%s, local_computed_tokens=%s, "
+                            "local_transferred_tokens=%s",
+                            req_id,
+                            scheduled_tokens,
+                            spec_decode_tokens,
+                            computed_tokens.get(req_id, 0),
+                            send_req_info.local_computed_tokens,
+                            send_req_info.local_transferred_tokens,
+                        )
 
                     def add_transfer_task(req_id, send_req_info: SendReqInfo, chunk_finish=False):
                         (
@@ -1062,6 +1120,22 @@ class MooncakeLayerwiseConnectorScheduler:
                             local_computed_tokens=local_computed_tokens,
                             local_transed_tokens=local_transed_tokens,
                         )
+                        if envs.VLLM_ASCEND_SFA_DEBUG:
+                            logger.info(
+                                "MooncakeLayerwiseConnector P add transfer task req %s: "
+                                "local_block_ids=%s, local_transed_tokens=%s, "
+                                "local_computed_tokens=%s, remote_cache_tokens=%s, "
+                                "prompt_len=%s, chunk_finish=%s, remote_host=%s, remote_port=%s",
+                                req_id,
+                                local_block_ids,
+                                local_transed_tokens,
+                                local_computed_tokens,
+                                request.kv_transfer_params.get("remote_cached_tokens"),
+                                len(request.all_token_ids),
+                                chunk_finish,
+                                request.kv_transfer_params.get("remote_host"),
+                                request.kv_transfer_params.get("remote_port"),
+                            )
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
                                 "MooncakeLayerwiseConnector build_connector_meta: req_id=%r prompt_len=%s "
@@ -1151,6 +1225,13 @@ class MooncakeLayerwiseConnectorWorker:
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_ip()
         self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+
+        # Create and publish per-layer PD transfer-finished events so the
+        # co-located ascend_store save thread can wait for each layer's PD
+        # transfer. Only the producer sends KV, so only it needs events.
+        if vllm_config.kv_transfer_config.is_kv_producer:
+            set_shared_layer_transfer_events([threading.Event() for _ in range(self.total_layers)])
+            set_shared_layer_transfer_pending_events([threading.Event() for _ in range(self.total_layers)])
         self.use_mla = self.vllm_config.model_config.use_mla
         self.request_map = dict[str, str]()
         self.use_attn_mamba_hybrid = False
@@ -1378,6 +1459,8 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
                 callback_func=self.send_done_send_signal,
+                layer_transfer_finished_events=get_shared_layer_transfer_events(),
+                layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -1417,13 +1500,17 @@ class MooncakeLayerwiseConnectorWorker:
             if meta := self._recving_metadata.get(req_id):
                 self._invalid_block_ids.update(block_id for group in meta.local_block_ids for block_id in group)
         for req_id in done_recving.union(failed_recving):
-            org_req_id = req_id[:-9]
+            org_req_id = get_external_request_id(req_id)
             self.request_map.pop(org_req_id, None)
             self._recving_metadata.pop(req_id, None)
         if len(done_recving) > 0:
-            logger.info(
-                "Number of completed KV cache recv requests: %s, receive requests: %s", len(done_recving), done_recving
-            )
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "Number of completed KV cache recv requests: %s, "
+                    "receive requests: %s",
+                    len(done_recving),
+                    done_recving,
+                )
         return set(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -1827,6 +1914,13 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
+            if layer_send_task.send_request:
+                pending_events = self.kv_send_layer_thread.layer_transfer_pending_events
+                done_events = self.kv_send_layer_thread.layer_transfer_finished_events
+                if done_events is not None:
+                    done_events[self.current_layer].clear()
+                if pending_events is not None:
+                    pending_events[self.current_layer].set()
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
 
@@ -1914,13 +2008,14 @@ class MooncakeLayerwiseConnectorWorker:
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
         external_req_id = get_external_request_id(req_id)
         send_msg_type = DONE_SENDING_MSG if trans_flag else FAILED_SENDING_MSG
-        logger.info(
-            "Sending transmitting signal %s for request %s to %s:%d",
-            send_msg_type,
-            external_req_id,
-            req_meta.remote_host,
-            req_meta.remote_port,
-        )
+        if envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "Sending transmitting signal %s for request %s to %s:%d",
+                send_msg_type,
+                external_req_id,
+                req_meta.remote_host,
+                req_meta.remote_port,
+            )
         try:
             path = make_zmq_path("tcp", req_meta.remote_host, req_meta.remote_port)
             msg_encoder = msgspec.msgpack.Encoder()
@@ -2078,7 +2173,7 @@ def ensure_zmq_recv(
                 raise RuntimeError(f"Failed to receive data from {path} after {max_retries} retries: {e}")
 
 
-def get_external_request_id(request_id: str):
+def get_external_request_id(request_id: str) -> str:
     # NOTE(zxr): vLLM PR #27987 add additional suffix
     # to EngineCore request_id with len(suffix) == 9
-    return request_id[:-9]
+    return request_id[:-9] if len(request_id) > 9 else request_id
