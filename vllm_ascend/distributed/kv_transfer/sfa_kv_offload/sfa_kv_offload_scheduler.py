@@ -99,6 +99,7 @@ class SFAKVOffloadlScheduler:
         """
         local_block_ids: list[list[int]] = []
 
+        # TODO check whether these are useless now, delete them if so.
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
 
@@ -116,9 +117,11 @@ class SFAKVOffloadlScheduler:
             self._preempted_req_ids.discard(finished_req_id)
 
         for req_id in scheduler_output.preempted_req_ids:
+            self._free_request_cpu_blocks(req_id)
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
+            self._unfinished_request_ids.discard(req_id)
 
         meta = SFAKVOffloadConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
 
@@ -152,7 +155,19 @@ class SFAKVOffloadlScheduler:
             elif new_block_ids_npu is None:
                 new_block_ids_npu = []
             if req_id in self._preempted_req_ids:
-                raise ValueError('preempted reqs not implemented')
+                # treat as a new request
+                num_computed_tokens = cached_reqs.num_computed_tokens[i]
+                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
+                assert num_computed_tokens == 0
+                num_new_offload_blocks = num_new_tokens // self._block_size
+                block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
+                request_tracker = RequestTracker(
+                    req_id=req_id,
+                    allocated_block_ids_npu=new_block_ids_npu,
+                    allocated_block_ids_cpu=block_ids_cpu,
+                )
+                self._request_trackers[req_id] = request_tracker
+                self._preempted_req_ids.discard(req_id)
             # decode/chunked request
             else:
                 request_tracker = self._request_trackers[req_id]
@@ -172,10 +187,10 @@ class SFAKVOffloadlScheduler:
                 new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
                 request_tracker.update(new_block_ids_npu, new_block_ids_cpu)
 
-                req_meta = ReqMeta.from_request_tracker(
-                    request_tracker,
-                    num_new_offload_blocks=num_new_offload_blocks,
-                )
+            req_meta = ReqMeta.from_request_tracker(
+                request_tracker,
+                num_new_offload_blocks=num_new_offload_blocks,
+            )
             if req_meta is not None:
                 meta.add_request(req_meta)
         return meta
@@ -189,6 +204,12 @@ class SFAKVOffloadlScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
-        tracker = self._request_trackers.get(request.request_id)
-        self.cpu_block_manager.free(tracker.allocated_block_ids_cpu)
+        self._free_request_cpu_blocks(request.request_id)
         return False, None
+    
+    def _free_request_cpu_blocks(
+        self,
+        request_id: str,
+    ):
+        tracker = self._request_trackers.get(request_id)
+        self.cpu_block_manager.free(tracker.allocated_block_ids_cpu)

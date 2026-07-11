@@ -281,8 +281,6 @@ class SFAPDCpuOffloadScheduler:
         # req_ids awaiting their first build_connector_meta seed (so the worker
         # can build request_map for get_finished even while async-waiting KV).
         self._reqs_need_recv: set[str] = set()
-        # req_id -> CPU block ids pending delayed free (see build_connector_meta).
-        self._pending_free: dict[str, list[int]] = {}
         self.executor = ThreadPoolExecutor(32)
 
     # ------------------------------------------------------------------
@@ -378,13 +376,6 @@ class SFAPDCpuOffloadScheduler:
             )
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
-        # Delayed free: release CPU blocks of requests that finished in a prior
-        # step and have now fully left the batch. Keeping them one extra step
-        # avoids racing with an in-flight LRU H2D load (batch_copy) issued during
-        # the request's last decode step.
-        for req_id in list(self._pending_free):
-            if req_id not in scheduler_output.num_scheduled_tokens:
-                self.cpu_block_manager.free(self._pending_free.pop(req_id))
 
         meta = SFAKVOffloadConnectorMetadata(set(), scheduler_output.preempted_req_ids)
 
@@ -503,11 +494,12 @@ class SFAPDCpuOffloadScheduler:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        # Do NOT free the CPU blocks here — defer to the next build_connector_meta
-        # after the request has left the batch (see delayed free above).
+        # No need to delay free here: when we reach request_finished in D node here,
+        # the request is completely done, no more inference, no more kv transfer.
+        # Free cpu blocks immediately to make room for next step scheduling.
         tracker = self._request_trackers.pop(request.request_id, None)
         if tracker is not None:
-            self._pending_free[request.request_id] = tracker.allocated_block_ids_cpu
+            self.cpu_block_manager.free(tracker.allocated_block_ids_cpu)
         return False, None
 
     # ------------------------------------------------------------------

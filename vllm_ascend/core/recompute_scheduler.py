@@ -50,6 +50,8 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.ascend_config import get_ascend_config
+
 
 @dataclass
 class RecomputeSchedulerConfig(SchedulerConfig):
@@ -106,6 +108,7 @@ class RecomputeScheduler(Scheduler):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
         )
         self.is_kv_producer = self.vllm_config.kv_transfer_config and self.vllm_config.kv_transfer_config.is_kv_producer
+        self.use_sfa_offload = get_ascend_config().use_offload
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -313,6 +316,9 @@ class RecomputeScheduler(Scheduler):
                                     recomputed_num_computed_tokens,
                                 )
                             )
+                        if self.use_sfa_offload:
+                            # In sfa offload, we directly recompute.
+                            offloaded = False
                         if offloaded:
                             logger.info(
                                 "Recompute preemption offload enabled for request %s, computed_tokens=%d.",
@@ -342,6 +348,9 @@ class RecomputeScheduler(Scheduler):
                                     recomputed_req.client_index,
                                 )
                             )
+                        if self.use_sfa_offload:
+                            # In sfa offload, we also need to free cpu blocks here.
+                            self.connector.request_finished(recomputed_req, [])
                         if recomputed_req == request:
                             break
                     else:
