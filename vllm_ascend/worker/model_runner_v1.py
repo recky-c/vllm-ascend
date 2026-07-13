@@ -4091,15 +4091,32 @@ class NPUModelRunner(GPUModelRunner):
         layer_names: list[str] = []
         for t in old_tensors:
             layer_names.extend(t.shared_by)
-        if len(layer_names) != total_layers:
+        # MTP / spec-decode add extra attention layers beyond get_num_layers
+        # (total_layers). Group ALL `actual_layers` (main + MTP) together so the
+        # merge still runs. The default independent_layers = [0, actual-1] makes
+        # the MTP layer (the last) an independent buffer and pulls the previous
+        # main-last layer into the sharing pool, so the buffer count stays at
+        # num_shared_buffers shared + 2 independent (MTP owns one independent
+        # slot). Without this, the count mismatch would skip the merge -> every
+        # layer its own buffer -> OOM. Requires the MTP layer to share the main
+        # tuple layout (e.g. both MLA+sparse -> uniform after the PD workaround).
+        actual_layers = len(layer_names)
+        if actual_layers < total_layers:
             logger.warning(
-                "Layer reuse: expected %d layers, got %d; skipping tensor merge.",
+                "Layer reuse: expected >= %d layers, got %d; skipping tensor merge.",
                 total_layers,
-                len(old_tensors),
+                actual_layers,
             )
             return
-
-        storage_indices = get_layerwise_storage_indices(total_layers, extra_config)
+        if actual_layers > total_layers:
+            logger.info(
+                "Layer reuse: %d main + %d extra (MTP/spec-decode) layer(s); "
+                "grouping all %d (extra becomes the last independent slot).",
+                total_layers,
+                actual_layers - total_layers,
+                actual_layers,
+            )
+        storage_indices = get_layerwise_storage_indices(actual_layers, extra_config)
 
         # Build merged tensors: each slot's layers share ONE buffer.
         # Each buffer's size stays the same as a single layer's (time-multiplexed).
@@ -5370,7 +5387,14 @@ class NPUModelRunner(GPUModelRunner):
         if self.use_sparse and self.use_offload:
             # glm5.2, pad reused indexer module for kv allocating
             # TODO change to full hybrid (4 kv + 1 indexer)
-            num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+            # Pad an indexer for EVERY main MLA layer (incl MTP/spec-decode extra
+            # layers), not just num_hidden_layers. The D-side sfa_pd consumer
+            # pairs each main with an indexer to pull it; without a padded
+            # indexer the MTP layer is dropped (never pulled to D). MTP is
+            # MLA+sparse (else P-side would have hit a mixed-tuple break), so
+            # treating it as a regular sparse layer here is consistent with the
+            # P-side workaround.
+            num_layers = sum(1 for m in attn_layers.values() if isinstance(m, MLAAttention))
             indexer_module = attn_layers['model.layers.0.self_attn.indexer.k_cache']
             for layer_id in range(num_layers):
                 indexer_name = f'model.layers.{layer_id}.self_attn.indexer.k_cache'
@@ -5445,6 +5469,17 @@ class NPUModelRunner(GPUModelRunner):
                     has_indexer = bool(getattr(impl, "has_indexer", False))
                     use_sparse_c8_sfa_for_layer = bool(getattr(impl, "use_sparse_c8_sfa", False))
                     use_sparse_c8_indexer_for_layer = bool(getattr(impl, "use_sparse_c8_indexer", False))
+                    # PD-disaggregation workaround for ascend_store: its pool
+                    # addressing assumes a uniform per-layer tuple layout, but
+                    # #11065 makes sparse_head_dim per-layer variable (index>0
+                    # for indexer layers, 0 for top-k-reusing layers) to skip
+                    # allocating dsa_k for skipped indexers. That mixed 3/2-tuple
+                    # breaks ascend_store's caches_per_layer assumption. In PD
+                    # mode (kv_transfer active) force a uniform layout (always
+                    # include index_head_dim) so all sparse layers share one tuple
+                    # arity; the cost is dsa_k allocated for skipped-indexer
+                    # layers (exactly what #11065 saved). Single-node keeps #11065.
+                    pd_uniform_kv = self.vllm_config.kv_transfer_config is not None
 
                     if use_sparse_c8_sfa_for_layer:
                         packed_kv_head_dim = get_sfa_qsfa_packed_head_dim(
@@ -5456,11 +5491,11 @@ class NPUModelRunner(GPUModelRunner):
                             0,
                             (
                                 self.model_config.hf_text_config.index_head_dim
-                                if use_sparse_c8_indexer_for_layer
+                                if (use_sparse_c8_indexer_for_layer or pd_uniform_kv)
                                 else 0
                             ),
                         )
-                    elif has_indexer:
+                    elif has_indexer or pd_uniform_kv:
                         sparse_head_dim = self.sparse_head_dim
                     else:
                         # Layers that reuse another layer's top-k indices only
