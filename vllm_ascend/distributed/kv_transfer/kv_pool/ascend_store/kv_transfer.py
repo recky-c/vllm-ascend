@@ -1195,6 +1195,13 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         done_events = self.layer_transfer_finished_events
         if pending_events is None or done_events is None:
             return
+        # The shared PD-transfer events are sized to the main model layers
+        # (get_num_layers, excludes MTP/spec-decode). ascend_store may process
+        # extra layers (MTP) beyond that range; they own independent buffers
+        # (no reuse gating) and aren't exposed via the PD send path, so skip the
+        # wait for them instead of indexing out of range.
+        if layer_id >= len(pending_events) or layer_id >= len(done_events):
+            return
         if not pending_events[layer_id].is_set():
             return
         if not done_events[layer_id].wait(timeout=30):

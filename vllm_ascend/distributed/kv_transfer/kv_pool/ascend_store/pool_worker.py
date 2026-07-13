@@ -942,6 +942,13 @@ class KVPoolWorker:
                 submitted_layers += 1
 
     def wait_for_layer_load(self) -> None:
+        # MTP/spec-decode draft re-runs the base model's attention layers,
+        # producing extra wait_for_layer_load calls beyond num_layers (same
+        # reason save_kv_layer guards at current_layer >= num_layers). Out-of-
+        # range layers have no load task / event, so skip instead of indexing
+        # layer_load_tasks / layer_load_finished_events out of bounds.
+        if self.current_layer >= self.num_layers:
+            return
         assert self.layer_load_finished_events is not None
         reset_attention_compute_start_gate()
         # Submit current + prefetch (real loads and reused-no-load gate tasks).

@@ -827,7 +827,16 @@ class KVPoolScheduler:
                 )
         if new_block_ids is not None:
             request_tracker.update(new_block_ids)
-        load_spec = None
+        # Layer reuse: shared HBM buffers are overwritten by sibling layers each
+        # pass, so running/decode must reload the prefix from the pool every step.
+        if self.layerwise_offload and prev_token_count > 0:
+            load_spec = LoadSpec(
+                vllm_cached_tokens=prev_token_count,
+                kvpool_cached_tokens=prev_token_count,
+                can_load=True,
+            )
+        else:
+            load_spec = None
         return self._build_req_meta(
             request_tracker,
             request.block_hashes,
@@ -921,7 +930,9 @@ class KVPoolScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
+                # Layer reuse: decode steps allocate no new block but still need a
+                # prefix reload (shared layers) + partial-block save, so don't skip.
+                if not new_block_ids and not self.layerwise_offload:
                     continue
                 if req_id in self._preempted_req_ids:
                     req_meta = self._process_preempted_cached_request(
