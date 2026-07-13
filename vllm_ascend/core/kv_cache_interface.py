@@ -15,6 +15,8 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager, OffloadMLAAttentionManager
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+SFA_QSFA_TILE_SIZE = 128
+
 
 def _get_c8_k_cache_dtype() -> torch.dtype:
     return torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
@@ -24,16 +26,33 @@ def _get_c8_k_scale_cache_dtype() -> torch.dtype:
     return torch.float32 if get_ascend_device_type() == AscendDeviceType.A5 else torch.float16
 
 
-# GLM5.2 / DSV3.2 SFA offload + LIC8 unified pool layout (spec_0 / spec_1).
+def _get_sfa_qsfa_packed_head_dim(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    tile_size: int = SFA_QSFA_TILE_SIZE,
+) -> int:
+    if kv_lora_rank % tile_size != 0:
+        raise ValueError(
+            "kv_lora_rank must be divisible by tile_size for SFA QSFA "
+            f"packed cache, got {kv_lora_rank=} and {tile_size=}."
+        )
+    scale_metadata_bytes = (
+        kv_lora_rank // tile_size
+    ) * get_dtype_size(torch.float32)
+    return (
+        kv_lora_rank
+        + qk_rope_head_dim * get_dtype_size(torch.bfloat16)
+        + scale_metadata_bytes
+    )
+
+
+# GLM5.2 / DSV3.2 SFA offload + C8 unified pool layout (spec_0 / spec_1).
 # Per-token byte layout (DSV3.2 / GLM5.2 A3 example):
-#   spec_0: (k 512 + v 64 + pad 8) * 2 bytes (bf16)
-#   spec_1: (idx 128 + pad 16 + scale 2) * 1 byte (int8 byte-mix accounting)
-# scale is physically 1 fp16 element (2 bytes); it is counted as 2 in the
-# spec_1 formula so page_bytes matches the int8 + pad byte mix.
-# block_size=128 → page_bytes spec_0:spec_1 == 8:1 for unify_kv_cache_spec_page_size;
-# indexer kernel block_size = page_block_multiplier * main block_size (1024 tokens).
-# Pad and page_block_multiplier are derived from model dims via
-# ``compute_offload_sparse_c8_layout`` (not hardcoded).
+#   spec_0: packed CKV = 656 bytes/token, no main-side pad.
+#   spec_1: idx 128 bytes + scale 2 bytes + accounting pad 34 bytes = 164.
+# block_size=128 -> page_bytes spec_0/spec_1 unify with a 4:1 token mapping.
+# indexer kernel block_size = page_block_multiplier * main block_size (512 tokens).
+# Pad and page_block_multiplier are derived from packed CKV page bytes.
 
 
 def offload_indexer_pad_dim(
@@ -49,10 +68,10 @@ class OffloadSparseC8Layout:
     """Derived C8 unified-pool layout for SFA offload."""
 
     indexer_pad_dim: int
-    kv_pad_dim_bf16_slots: int
     page_block_multiplier: int
     main_bytes_per_token: int
     indexer_bytes_per_token: int
+    packed_head_dim: int
 
 
 def compute_offload_sparse_c8_layout(
@@ -63,60 +82,42 @@ def compute_offload_sparse_c8_layout(
     *,
     scale_dtype: torch.dtype | None = None,
 ) -> OffloadSparseC8Layout:
-    """Derive spec_0/spec_1 page layout from model dimensions.
-
-    ``page_block_multiplier`` enforces the main:indexer page ratio required by
-    ``unify_kv_cache_spec_page_size``. ``kv_pad_dim_bf16_slots`` pads spec_0 so
-    its per-token byte count fills that ratio against the spec_1 byte-mix layout.
-    """
+    """Derive the packed-CKV 4:1 page layout for SFA C8 offload."""
     scale_dtype = scale_dtype or _get_c8_k_scale_cache_dtype()
-    indexer_pad_dim = offload_indexer_pad_dim(
-        index_head_dim, qk_rope_head_dim, kv_lora_rank
-    )
-    indexer_bytes_per_token = offload_c8_indexer_bytes_per_token(
-        index_head_dim, indexer_pad_dim, scale_dtype
-    )
-    dtype_size = get_dtype_size(main_dtype)
-    non_c8_main_bytes = (kv_lora_rank + qk_rope_head_dim) * dtype_size
-    page_block_multiplier = 2 * kv_lora_rank // index_head_dim
-    main_bytes_per_token = page_block_multiplier * indexer_bytes_per_token
-    kv_pad_dim_bf16_slots = (
-        main_bytes_per_token - non_c8_main_bytes
-    ) // dtype_size
-    assert kv_pad_dim_bf16_slots >= 0
-    assert main_bytes_per_token == offload_c8_main_bytes_per_token(
+    packed_head_dim = _get_sfa_qsfa_packed_head_dim(
         kv_lora_rank,
         qk_rope_head_dim,
-        main_dtype,
-        kv_pad_dim_bf16_slots=kv_pad_dim_bf16_slots,
     )
-    assert main_bytes_per_token % indexer_bytes_per_token == 0
-    assert (
-        main_bytes_per_token // indexer_bytes_per_token
-        == page_block_multiplier
+    main_bytes_per_token = (
+        packed_head_dim * get_dtype_size(_get_c8_k_cache_dtype())
     )
+    page_block_multiplier = 4
+    assert main_bytes_per_token % page_block_multiplier == 0
+    indexer_bytes_per_token = main_bytes_per_token // page_block_multiplier
+    indexer_payload_bytes = (
+        index_head_dim * get_dtype_size(_get_c8_k_cache_dtype())
+        + get_dtype_size(scale_dtype)
+    )
+    indexer_pad_dim = indexer_bytes_per_token - indexer_payload_bytes
+    assert indexer_pad_dim >= 0
     return OffloadSparseC8Layout(
         indexer_pad_dim=indexer_pad_dim,
-        kv_pad_dim_bf16_slots=kv_pad_dim_bf16_slots,
         page_block_multiplier=page_block_multiplier,
         main_bytes_per_token=main_bytes_per_token,
         indexer_bytes_per_token=indexer_bytes_per_token,
+        packed_head_dim=packed_head_dim,
     )
 
 
 def offload_c8_main_bytes_per_token(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    dtype: torch.dtype,
-    *,
-    kv_pad_dim_bf16_slots: int,
+    _dtype: torch.dtype,
 ) -> int:
-    dtype_size = get_dtype_size(dtype)
-    return (
-        kv_lora_rank * dtype_size
-        + qk_rope_head_dim * dtype_size
-        + kv_pad_dim_bf16_slots * dtype_size
-    )
+    return _get_sfa_qsfa_packed_head_dim(
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ) * get_dtype_size(_get_c8_k_cache_dtype())
 
 
 def offload_main_kv_head_dims_for_pool_split(
@@ -125,10 +126,7 @@ def offload_main_kv_head_dims_for_pool_split(
     *,
     c8_layout: OffloadSparseC8Layout | None = None,
 ) -> list[int]:
-    dims = [kv_lora_rank, qk_rope_head_dim]
-    if c8_layout is not None:
-        dims.append(c8_layout.kv_pad_dim_bf16_slots)
-    return dims
+    return [kv_lora_rank, qk_rope_head_dim]
 
 
 def offload_indexer_kernel_block_size(
@@ -203,7 +201,7 @@ def offload_c8_indexer_page_size_bytes(
     Byte-mix per token: ``index_head_dim`` int8 bytes + ``indexer_pad_dim``
     pad bytes + ``get_dtype_size(scale_dtype)`` for one scale element (e.g. 2
     bytes for fp16). The sum is not multiplied by a single dtype size; each
-    term is already in bytes so spec_1 can 8:1-unify with spec_0.
+    term is already in bytes so spec_1 can 4:1-unify with packed CKV.
     """
     return _offload_page_size_bytes(
         block_size,
@@ -565,7 +563,16 @@ def make_offload_indexer_mla_spec(
     scale_dim = 0
     if c8_unified_pool:
         assert sparse_head_dim is not None
+        assert kv_lora_rank is not None and qk_rope_head_dim is not None
         scale_dtype = scale_dtype or _get_c8_k_scale_cache_dtype()
+        layout = compute_offload_sparse_c8_layout(
+            kv_lora_rank,
+            qk_rope_head_dim,
+            index_head_dim,
+            dtype,
+            scale_dtype=scale_dtype,
+        )
+        indexer_pad_dim = layout.indexer_pad_dim
         page_bytes_per_token = offload_c8_indexer_bytes_per_token(
             index_head_dim, indexer_pad_dim, scale_dtype
         )

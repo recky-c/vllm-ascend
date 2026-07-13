@@ -1049,3 +1049,216 @@ C:\Users\程\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\pyt
 2. `torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention(..., return_softmax_lse=True)` 的返回值顺序和可用 namespace 需要在带算子包环境验证。
 3. PD C8 MembPull 需要至少跑一次 P no-offload C8 三元组 -> D offload C8 四元组，确认 full CPU block、partial HBM block、indexer scale 三类 descriptor 都正确。
 4. 当前本地网络 fetch 失败，尚未从远端重新拉取最新提交；后续需在网络可用后重新 `git fetch upstream main` 和 `git fetch ader47 feat/sfa-offload-layerwise-reuse` 复核。
+
+## 14. SFA C8 下 OFFLOAD 内存切分方案
+
+### 14.1 当前结论
+
+当前代码应收敛到 **packed CKV + indexer 独立物理分配 + 4:1 page accounting**：
+
+```text
+main group:
+  block_size = 128 tokens
+  physical bytes/token = 656
+  page_bytes = 128 * 656 = 83,968
+
+indexer group:
+  kernel block_size = 512 tokens
+  accounting bytes/token = 164
+  page_bytes = 512 * 164 = 83,968
+
+page_block_multiplier = 4
+kernel_block_sizes = [[512], [128]]
+```
+
+这里的 `kernel_block_sizes = [[512], [128]]` 遵循当前代码里的 KV cache group 顺序：indexer group 在前，main group 在后。概念上仍然是 main 128 tokens、indexer 512 tokens 的 4:1 token 映射。
+
+### 14.2 三层内存语义
+
+SFA C8 OFFLOAD 需要分清三层：
+
+| 层级 | 负责内容 | C8 OFFLOAD 结论 |
+| --- | --- | --- |
+| KVCacheManager / block table | 两个 KV cache group 的 page size unify | main page 与 indexer page 都是 83,968 bytes；token 映射为 4:1 |
+| Main 物理层 | attention 真正消费的 main KV | `kv_cache[0]` 是 packed CKV，656 bytes/token，不加 main pad |
+| Indexer 物理层 | TopK 粗筛用的 indexer cache | `kv_cache[1]` 是 indexer_k，`kv_cache[2]` 是 indexer_scale；34 bytes/token pad 只存在于 page accounting |
+
+关键点：**main 侧不再为了 page unify 分配 bf16 raw_k/raw_v/pad，也不再额外分配一份 packed CKV**。main paged pool 本身就是 packed CKV。
+
+### 14.3 CKV 定义
+
+CKV 是 SFA C8 下 packed main KV，存在 `kv_cache[0]`。A3 GLM5.2 的 packed head dim 来自 `get_sfa_qsfa_packed_head_dim`：
+
+```text
+packed_head_dim = kv_lora_rank
+                + qk_rope_head_dim * sizeof(bf16)
+                + (kv_lora_rank / tile_size) * sizeof(fp32)
+
+packed_head_dim = 512 + 64 * 2 + (512 / 128) * 4
+                = 656
+```
+
+单 token 内部 layout：
+
+```text
+kv_cache[0][..., 0:656]
+
+| 0..511 | 512..639 | 640..655 |
+| k_nope | k_rope   | scale    |
+| int8   | bf16 bytes | fp32 bytes |
+```
+
+写入时需要按 byte-packed 语义拼接，不是混 dtype 直接 `torch.cat`。attention 读取时仍按 packed tensor 传给 C8 SFA 算子：
+
+```text
+npu_kv_quant_sparse_flash_attention(key=kv_cache[0], value=kv_cache[0])
+```
+
+### 14.4 Page 计算
+
+main page：
+
+```text
+main_bytes_per_token = 656
+main_block_size = 128
+main_page_bytes = 128 * 656 = 83,968
+```
+
+indexer 真实 payload：
+
+```text
+indexer_k bytes/token = 128 * sizeof(int8) = 128
+indexer_scale bytes/token = 1 * sizeof(fp16) = 2
+indexer_payload_bytes/token = 130
+```
+
+indexer page accounting：
+
+```text
+page_block_multiplier = 4
+indexer_block_size = 128 * 4 = 512
+indexer_accounting_bytes/token = 83,968 / 512 = 164
+indexer_accounting_pad/token = 164 - 130 = 34
+```
+
+最终 page 对齐：
+
+| Group | block tokens | physical tensor | physical bytes/token | accounting pad/token | accounting bytes/token | page bytes |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| main | 128 | packed CKV | 656 | 0 | 656 | 83,968 |
+| indexer | 512 | indexer_k + indexer_scale | 130 | 34 | 164 | 83,968 |
+
+### 14.5 四元组 layout
+
+每层 C8 OFFLOAD `kv_cache` 固定为四元组：
+
+```text
+kv_cache[0] = packed_main_ckv
+kv_cache[1] = indexer_k
+kv_cache[2] = indexer_scale
+kv_cache[3] = resident_packed_ckv
+```
+
+推荐 shape：
+
+| 下标 | 名称 | shape | 说明 |
+| --- | --- | --- | --- |
+| `[0]` | `packed_main_ckv` | `[main_num_blocks, 128, 1, 656] int8` | HBM main paged pool；CPU 前缀保存同 layout |
+| `[1]` | `indexer_k` | `[indexer_num_blocks, 512, 1, 128] int8` | indexer TopK key，常驻 HBM |
+| `[2]` | `indexer_scale` | `[indexer_num_blocks, 512, 1, 1] fp16` | indexer key 的量化 scale |
+| `[3]` | `resident_packed_ckv` | `[topk_rows, resident_capacity, 1, 656] int8` | CPU TopK 命中后 H2D 拉回的 LRU resident buffer |
+
+表里的 `main_num_blocks` 和 `indexer_num_blocks` 不应混为同一个概念。由于 block token 数不同，同样 token 容量下 indexer block 数约为 main block 数的 1/4；当前实现为了 page unify 和 group 管理，会按各自 group 的 block size 解释 block table / slot mapping。
+
+### 14.6 ModelRunner 分配逻辑
+
+当前代码需要按以下方式分配 C8 OFFLOAD：
+
+```text
+packed_main_raw:
+  num_blocks * 128 * 1 * 656 * sizeof(int8)
+
+indexer_k_raw:
+  num_blocks * 512 * 1 * 128 * sizeof(int8)
+
+indexer_scale_raw:
+  num_blocks * 512 * 1 * 1 * sizeof(fp16)
+
+resident_packed_ckv:
+  topk_rows * resident_capacity * 1 * 656 * sizeof(int8)
+```
+
+也就是说，C8 OFFLOAD 不再走历史 LIC8 的三段 main raw split：
+
+```text
+不再使用：
+  raw_k_tensor:     [num_blocks, 128, 1, 512] bf16
+  raw_v_tensor:     [num_blocks, 128, 1, 64]  bf16
+  raw_scale/pad:    [num_blocks, 128, 1, 8]   bf16
+  packed_main_ckv:  额外 torch.zeros(...)
+
+改为：
+  raw main pool 直接 view 成 packed_main_ckv
+```
+
+对应代码落点：
+
+| 文件 | 需要保证的行为 |
+| --- | --- |
+| `vllm_ascend/core/kv_cache_interface.py` | `compute_offload_sparse_c8_layout` 返回 4:1：`packed_head_dim=656`, `main_bytes_per_token=656`, `indexer_bytes_per_token=164`, `indexer_pad_dim=34` |
+| `vllm_ascend/worker/model_runner_v1.py` | C8 OFFLOAD main raw tensor 直接分配 packed CKV；indexer_k/indexer_scale 单独分配；reshape 时不再额外创建 packed main zeros |
+| `vllm_ascend/distributed/kv_transfer/sfa_kv_offload/offload_kv_cache_layout.py` | C8 四元组下标固定为 `[0] main_ckv, [1] indexer_k, [2] indexer_scale, [3] resident` |
+
+### 14.7 resident 与 CPU pool
+
+`resident_packed_ckv` 不是另一份持久 main KV，而是 decode 阶段 CPU TopK 命中后的 LRU 驻留缓冲区：
+
+```text
+CPU pool:
+  [cpu_blocks, 128, 1, 656] int8
+
+H2D resident target:
+  [topk_rows, resident_capacity, 1, 656] int8
+
+H2D descriptor:
+  token_size_bytes_k = 656
+  token_size_bytes_v = 0
+```
+
+`token_size_bytes_v = 0` 表示 C8 main KV 是 packed 单路，不存在单独 V tensor。
+
+### 14.8 与历史 LIC8 8:1 的区别
+
+历史 LIC8 方案：
+
+```text
+main accounting = (512 + 64 + 8) * sizeof(bf16) = 1168 bytes/token
+indexer accounting = 128 + 16 + 2 = 146 bytes/token
+ratio = 1168 / 146 = 8
+indexer block = 1024 tokens
+```
+
+这套方案现在只作为历史背景，不再作为 C8 OFFLOAD 目标。新方案的核心变化是：
+
+```text
+main accounting = packed CKV = 656 bytes/token
+indexer accounting = 164 bytes/token
+ratio = 656 / 164 = 4
+indexer block = 512 tokens
+```
+
+因此旧的 `kv_pad_dim_bf16_slots=8`、`indexer_pad_dim=16`、`page_block_multiplier=8` 都不应继续用于 SFA C8 OFFLOAD。
+
+### 14.9 验收数字
+
+```text
+packed_head_dim = 656
+main_bytes_per_token = 656
+indexer_payload_bytes_per_token = 130
+indexer_pad_bytes_per_token = 34
+indexer_bytes_per_token = 164
+page_block_multiplier = 4
+
+128 * 656 = 83,968
+512 * 164 = 83,968
+```
