@@ -591,6 +591,16 @@ class SFAPDCpuOffloadProducerWorker:
 
         if self.total_layers < len(self.layer_metadata):
             self.total_layers = len(self.layer_metadata)
+            # The shared PD-transfer events were created in __init__ sized to
+            # get_num_layers() (excludes MTP/spec-decode). kv_caches now shows
+            # the real count (incl MTP); re-create the events so the MTP layer
+            # gets a coordination slot. sfa_pd registers before ascend_store in
+            # the MultiConnector, so ascend_store / the send thread read these
+            # correctly-sized events when they start.
+            set_shared_layer_transfer_events([threading.Event() for _ in range(self.total_layers)])
+            set_shared_layer_transfer_pending_events(
+                [threading.Event() for _ in range(self.total_layers)]
+            )
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)
