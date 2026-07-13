@@ -11,6 +11,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     MooncakeLayerwiseConnector,
     MooncakeLayerwiseConnectorScheduler,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_gva_layerwise_config,
+    get_layerwise_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -31,6 +35,22 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager or self._all_support_hma, (
             "HMA should not be enabled unless all sub-connectors support it"
         )
+        self._configure_gva_layerwise_reuse(vllm_config.kv_transfer_config, kv_cache_config)
+
+    def _configure_gva_layerwise_reuse(self, kv_transfer_config, kv_cache_config: "KVCacheConfig") -> None:
+        """Share AscendStore's supported reuse plan with sibling connectors."""
+
+        extra_config = get_gva_layerwise_config(kv_transfer_config)
+        if extra_config is None or len(kv_cache_config.kv_cache_groups) != 1:
+            return
+        num_layers = len(kv_cache_config.kv_cache_groups[0].layer_names)
+        layerwise_config = get_layerwise_config(num_layers, extra_config)
+        if not layerwise_config.has_layer_reuse:
+            return
+        for connector in self._connectors:
+            set_reuse_plan = getattr(connector, "set_gva_layerwise_reuse_plan", None)
+            if set_reuse_plan is not None:
+                set_reuse_plan(layerwise_config.prefetch_layer_map)
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)

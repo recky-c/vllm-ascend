@@ -21,6 +21,7 @@ import logging
 import math
 import sys
 import time
+import zlib
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -29,8 +30,6 @@ from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
-import time
-import zlib
 
 import numpy as np
 import torch
@@ -115,8 +114,8 @@ from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
-    set_connector_req_ids,
     maybe_get_num_cpu_blocks,
+    set_connector_req_ids,
     using_paged_attention,
 )
 
@@ -129,6 +128,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_gva_layerwise_config,
     get_layerwise_kv_cache_reuse_layers,
     get_layerwise_storage_indices,
 )
@@ -908,7 +908,7 @@ class NPUModelRunner(GPUModelRunner):
         ]
         """
         if envs.VLLM_ASCEND_SFA_DEBUG and torch.distributed.get_rank() == 0:
-            logger.info(f'>>>>> input tokens = {len(num_scheduled_tokens)}, {num_scheduled_tokens}')
+            logger.info(">>>>> input tokens = %d, %s", len(num_scheduled_tokens), num_scheduled_tokens)
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1512,8 +1512,6 @@ class NPUModelRunner(GPUModelRunner):
             self.req_ids_tensor.np[:num_reqs] = np.array(req_ids_uint32, dtype=np.uint32)
             self.req_ids_tensor.copy_to_gpu()
             set_connector_req_ids(self.input_batch.req_ids)
-            # if torch.distributed.get_rank() == 0:
-            #     logger.info(f'>>>>> computed tokens = {self.input_batch.num_computed_tokens_cpu[:num_reqs]}, num_scheduled_tokens={num_scheduled_tokens}, num_offloaded_blocks={self.num_offloaded_blocks.gpu[:num_reqs]}, req_ids_tensor={self.req_ids_tensor.gpu[:num_reqs]}')
 
         return (
             logits_indices,
@@ -4078,19 +4076,23 @@ class NPUModelRunner(GPUModelRunner):
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is None:
             return
-        extra_config = kv_transfer_config.kv_connector_extra_config
-        total_layers = self.model_config.get_num_layers(self.parallel_config)
-        if get_layerwise_kv_cache_reuse_layers(total_layers, extra_config) is None:
+        extra_config = get_gva_layerwise_config(kv_transfer_config)
+        if extra_config is None:
             return
+        if len(kv_cache_config.kv_cache_groups) != 1:
+            raise NotImplementedError("GVA layerwise KV cache reuse does not support hybrid KV cache groups.")
+        total_layers = self.model_config.get_num_layers(self.parallel_config)
 
         old_tensors = kv_cache_config.kv_cache_tensors
         if len(old_tensors) <= 1:
             return
 
-        # Ordered layer names (flattened from shared_by).
-        layer_names: list[str] = []
-        for t in old_tensors:
-            layer_names.extend(t.shared_by)
+        # GVA layerwise currently supports one uniform KV cache group, whose
+        # tensor order is the transformer layer order.
+        layer_names = [layer_name for tensor in old_tensors for layer_name in tensor.shared_by]
+        actual_layers = len(layer_names)
+        if get_layerwise_kv_cache_reuse_layers(actual_layers, extra_config) is None:
+            return
         # MTP / spec-decode add extra attention layers beyond get_num_layers
         # (total_layers). Group ALL `actual_layers` (main + MTP) together so the
         # merge still runs. The default independent_layers = [0, actual-1] makes
@@ -4100,7 +4102,6 @@ class NPUModelRunner(GPUModelRunner):
         # slot). Without this, the count mismatch would skip the merge -> every
         # layer its own buffer -> OOM. Requires the MTP layer to share the main
         # tuple layout (e.g. both MLA+sparse -> uniform after the PD workaround).
-        actual_layers = len(layer_names)
         if actual_layers < total_layers:
             logger.warning(
                 "Layer reuse: expected >= %d layers, got %d; skipping tensor merge.",
@@ -4122,8 +4123,7 @@ class NPUModelRunner(GPUModelRunner):
         # Each buffer's size stays the same as a single layer's (time-multiplexed).
         new_tensors: list[KVCacheTensor] = []
         for slot in storage_indices:
-            slot_names = [layer_names[idx] for idx in slot]
-            # All layers in a slot share one buffer; size = first member's size.
+            slot_names = [layer_names[index] for index in slot]
             slot_size = old_tensors[slot[0]].size
             new_tensors.append(KVCacheTensor(shared_by=slot_names, size=slot_size))
 
@@ -4273,7 +4273,7 @@ class NPUModelRunner(GPUModelRunner):
         return layer_kv_cache_spec
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
-        if isinstance(kv_cache_spec, AscendMLAAttentionSpec) or isinstance(kv_cache_spec, OffloadMLAAttentionSpec):
+        if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, OffloadMLAAttentionSpec)):
             attn_layers = get_layers_from_vllm_config(
                 self.vllm_config,
                 AttentionLayerBase,
@@ -4415,14 +4415,11 @@ class NPUModelRunner(GPUModelRunner):
         # have only linear or attention layers, for example, the mtp layer.
         self.hybrid_with_attn_and_mamba = False
         kv_transfer_config = self.vllm_config.kv_transfer_config
-        extra_config = (
-            kv_transfer_config.kv_connector_extra_config
-            if kv_transfer_config is not None
+        extra_config = get_gva_layerwise_config(kv_transfer_config)
+        reuse_layers = (
+            get_layerwise_kv_cache_reuse_layers(len(layer_kv_cache_spec), extra_config)
+            if extra_config is not None
             else None
-        )
-        reuse_layers = get_layerwise_kv_cache_reuse_layers(
-            self.model_config.get_num_layers(self.parallel_config),
-            extra_config,
         )
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             use_mamba, use_attn = False, False
@@ -4755,8 +4752,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-                            num_blocks, current_kv_cache_spec.block_size, current_kv_cache_spec.num_kv_heads, current_kv_cache_spec.head_size
-                        )
+                        num_blocks,
+                        current_kv_cache_spec.block_size,
+                        current_kv_cache_spec.num_kv_heads,
+                        current_kv_cache_spec.head_size,
+                    )
                     dtype = current_kv_cache_spec.dtype
                     # k_cache: nope_cache    v_cache: rope_cache
                     mla_num_blocks, mla_block_size, num_kv_heads, _ = kv_cache_shape
@@ -5379,11 +5379,23 @@ class NPUModelRunner(GPUModelRunner):
 
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        gva_layerwise_config = get_gva_layerwise_config(self.vllm_config.kv_transfer_config)
+        actual_mla_layers = (
+            sum(isinstance(module, MLAAttention) for module in attn_layers.values())
+            if gva_layerwise_config is not None
+            else 0
+        )
+        gva_layerwise_reuse_enabled = (
+            gva_layerwise_config is not None
+            and actual_mla_layers > 0
+            and get_layerwise_kv_cache_reuse_layers(actual_mla_layers, gva_layerwise_config) is not None
+        )
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
-        # >>>>> attn_layers={'model.layers.0.self_attn.indexer.k_cache': DeepseekV32IndexerCache(), 'model.layers.0.self_attn.attn': MLAAttention()}
+        # Sparse offload exposes both the per-layer indexer cache and the MLA
+        # attention cache in attn_layers.
         if self.use_sparse and self.use_offload:
             # glm5.2, pad reused indexer module for kv allocating
             # TODO change to full hybrid (4 kv + 1 indexer)
@@ -5469,17 +5481,13 @@ class NPUModelRunner(GPUModelRunner):
                     has_indexer = bool(getattr(impl, "has_indexer", False))
                     use_sparse_c8_sfa_for_layer = bool(getattr(impl, "use_sparse_c8_sfa", False))
                     use_sparse_c8_indexer_for_layer = bool(getattr(impl, "use_sparse_c8_indexer", False))
-                    # PD-disaggregation workaround for ascend_store: its pool
-                    # addressing assumes a uniform per-layer tuple layout, but
-                    # #11065 makes sparse_head_dim per-layer variable (index>0
-                    # for indexer layers, 0 for top-k-reusing layers) to skip
-                    # allocating dsa_k for skipped indexers. That mixed 3/2-tuple
-                    # breaks ascend_store's caches_per_layer assumption. In PD
-                    # mode (kv_transfer active) force a uniform layout (always
-                    # include index_head_dim) so all sparse layers share one tuple
-                    # arity; the cost is dsa_k allocated for skipped-indexer
-                    # layers (exactly what #11065 saved). Single-node keeps #11065.
-                    pd_uniform_kv = self.vllm_config.kv_transfer_config is not None
+                    # GVA layerwise reuse requires a uniform per-layer tuple
+                    # layout, but #11065 makes sparse_head_dim per-layer
+                    # variable to skip allocating dsa_k for layers that reuse
+                    # another layer's top-k. When GVA layer reuse is active,
+                    # always include index_head_dim so every shared layer has
+                    # the same tuple arity. Single-node keeps #11065's saving.
+                    gva_uniform_kv = gva_layerwise_reuse_enabled
 
                     if use_sparse_c8_sfa_for_layer:
                         packed_kv_head_dim = get_sfa_qsfa_packed_head_dim(
@@ -5491,11 +5499,11 @@ class NPUModelRunner(GPUModelRunner):
                             0,
                             (
                                 self.model_config.hf_text_config.index_head_dim
-                                if (use_sparse_c8_indexer_for_layer or pd_uniform_kv)
+                                if (use_sparse_c8_indexer_for_layer or gva_uniform_kv)
                                 else 0
                             ),
                         )
-                    elif has_indexer or pd_uniform_kv:
+                    elif has_indexer or gva_uniform_kv:
                         sparse_head_dim = self.sparse_head_dim
                     else:
                         # Layers that reuse another layer's top-k indices only

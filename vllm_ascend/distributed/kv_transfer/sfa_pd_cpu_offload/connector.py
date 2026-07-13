@@ -8,9 +8,9 @@ HBM. The D-side load path (LRU-resident H2D) is reused from
 :class:`SFAKVOffloadWorker`.
 """
 
-import re
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -23,9 +23,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
-    get_layerwise_config,
-)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler import (
     SFAPDCpuOffloadScheduler,
     SFAPDProducerScheduler,
@@ -72,11 +69,7 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # reading before this layer may overwrite the slot. ``prefetch_layer_map``
         # maps each reusing layer -> its mate; empty when layer reuse is disabled
         # (so the gate below becomes a no-op, matching the no-reuse behavior).
-        lw_config = get_layerwise_config(
-            vllm_config.model_config.get_num_layers(vllm_config.parallel_config),
-            vllm_config.kv_transfer_config.kv_connector_extra_config,
-        )
-        self._reuse_mate_map = lw_config.prefetch_layer_map
+        self._reuse_mate_map: dict[int, int | None] = {}
 
         # Guard the asymmetric use_offload assumption (the launch scripts must
         # set it via --additional-config). Fail fast at startup rather than
@@ -165,6 +158,12 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+
+    def set_gva_layerwise_reuse_plan(self, reuse_mate_map: dict[int, int | None]) -> None:
+        """Install the AscendStore GVA reuse gates on the producer connector."""
+
+        if self.is_producer:
+            self._reuse_mate_map = reuse_mate_map
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None

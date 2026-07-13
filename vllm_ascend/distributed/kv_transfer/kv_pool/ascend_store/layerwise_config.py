@@ -21,6 +21,43 @@ class LayerwiseConfig:
     has_layer_reuse: bool
 
 
+def get_gva_layerwise_config(kv_transfer_config: Any) -> dict[str, Any] | None:
+    """Return the config for the supported GVA layerwise KV pool path.
+
+    Layer reuse is implemented by AscendStore's memcache layerwise path.  In a
+    MultiConnector setup the relevant settings belong to the AscendStore child,
+    not to the MultiConnector or any sibling connector.
+    """
+
+    if kv_transfer_config is None:
+        return None
+
+    connector_name = getattr(kv_transfer_config, "kv_connector", None)
+    root_extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if connector_name in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
+        connector_configs = [
+            {
+                "kv_connector": connector_name,
+                "kv_connector_extra_config": root_extra_config,
+            }
+        ]
+    elif connector_name == "MultiConnector":
+        connector_configs = root_extra_config.get("connectors", [])
+    else:
+        return None
+
+    for connector_config in connector_configs:
+        if not isinstance(connector_config, dict):
+            continue
+        if connector_config.get("kv_connector") not in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
+            continue
+        extra_config = connector_config.get("kv_connector_extra_config") or {}
+        backend = str(extra_config.get("backend", "mooncake")).lower()
+        if backend == "memcache" and extra_config.get("use_layerwise", False):
+            return extra_config
+    return None
+
+
 def _parse_int_config(value: Any, name: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be an integer, got bool")

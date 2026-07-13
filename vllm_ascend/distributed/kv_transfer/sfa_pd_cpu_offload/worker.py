@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import math
 import os
-import re
 import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -35,6 +35,7 @@ from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
     get_shared_layer_transfer_events,
     get_shared_layer_transfer_pending_events,
+    resize_shared_layer_transfer_events,
     set_shared_layer_transfer_events,
     set_shared_layer_transfer_pending_events,
 )
@@ -591,16 +592,9 @@ class SFAPDCpuOffloadProducerWorker:
 
         if self.total_layers < len(self.layer_metadata):
             self.total_layers = len(self.layer_metadata)
-            # The shared PD-transfer events were created in __init__ sized to
-            # get_num_layers() (excludes MTP/spec-decode). kv_caches now shows
-            # the real count (incl MTP); re-create the events so the MTP layer
-            # gets a coordination slot. sfa_pd registers before ascend_store in
-            # the MultiConnector, so ascend_store / the send thread read these
-            # correctly-sized events when they start.
-            set_shared_layer_transfer_events([threading.Event() for _ in range(self.total_layers)])
-            set_shared_layer_transfer_pending_events(
-                [threading.Event() for _ in range(self.total_layers)]
-            )
+            # Resize in place so a connector that already captured the shared
+            # list keeps observing the same event objects.
+            resize_shared_layer_transfer_events(self.total_layers)
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)

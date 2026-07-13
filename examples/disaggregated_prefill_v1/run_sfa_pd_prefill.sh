@@ -67,7 +67,6 @@ exec vllm serve "$MODEL_PATH" \
       \"kv_connector\": \"MultiConnector\",
       \"kv_role\": \"kv_producer\",
       \"kv_connector_extra_config\": {
-          \"layerwise_num_shared_buffers\":\"2\",
           \"connectors\": [
               {
                   \"kv_connector\": \"SFAPDCpuOffloadConnector\",
@@ -81,7 +80,7 @@ exec vllm serve "$MODEL_PATH" \
               {
                   \"kv_connector\": \"AscendStoreConnector\",
                   \"kv_role\": \"kv_producer\",
-                  \"kv_connector_extra_config\": {\"backend\": \"memcache\",\"use_layerwise\": \"true\",\"mooncake_rpc_port\":\"0\"}
+                  \"kv_connector_extra_config\": {\"backend\": \"memcache\",\"use_layerwise\": \"true\",\"mooncake_rpc_port\":\"0\",\"layerwise_num_shared_buffers\":\"2\",\"layerwise_prefetch_layers\":\"2\"}
               }
           ]
       }

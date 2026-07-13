@@ -95,6 +95,27 @@ def set_shared_layer_transfer_pending_events(events: list[threading.Event] | Non
     _shared_layer_transfer_pending_events = events
 
 
+def resize_shared_layer_transfer_events(num_layers: int) -> None:
+    """Resize shared PD event arrays without invalidating existing references."""
+
+    if num_layers < 0:
+        raise ValueError("num_layers must be non-negative")
+
+    def resize(events: list[threading.Event] | None) -> list[threading.Event]:
+        if events is None:
+            events = []
+        if len(events) < num_layers:
+            events.extend(threading.Event() for _ in range(num_layers - len(events)))
+        elif len(events) > num_layers:
+            del events[num_layers:]
+        return events
+
+    global _shared_layer_transfer_events
+    global _shared_layer_transfer_pending_events
+    _shared_layer_transfer_events = resize(_shared_layer_transfer_events)
+    _shared_layer_transfer_pending_events = resize(_shared_layer_transfer_pending_events)
+
+
 class KVPoolWorker:
     # The main class for the cache engine.
 
@@ -628,11 +649,15 @@ class KVPoolWorker:
         else:
             self._infer_cache_group_metadata(0, list(kv_caches.keys()))
 
-        # group_num_layers is computed from the actual kv_caches dict which
-        # includes ALL attention layers (main + MTP), so it is the authoritative
-        # layer count for this worker.
+        # The registered single cache group includes MTP/draft layers, while
+        # model_config.get_num_layers() only reports the base model layers.
         original_num_layers = self.num_layers
         self.num_layers = sum(self.group_num_layers.values())
+        if self.use_gva_layerwise:
+            layerwise_config = get_layerwise_config(self.num_layers, self._extra_config)
+            self.independent_layers = layerwise_config.independent_layers
+            self.prefetch_layer_map = layerwise_config.prefetch_layer_map
+            self.layerwise_offload = layerwise_config.has_layer_reuse
         if self.num_layers != original_num_layers:
             logger.info(
                 "KVPoolWorker: updated num_layers %d -> %d (includes MTP/spec-decode draft layers).",
@@ -643,6 +668,13 @@ class KVPoolWorker:
             # from the pre-recalc count) so layer_id indexing stays in-bounds.
             self.layer_load_tasks = [[] for _ in range(self.num_layers)]
             self.layer_save_tasks = [[] for _ in range(self.num_layers)]
+        if self.use_gva_layerwise and self.layerwise_offload:
+            logger.info(
+                "GVA layerwise reuse plan: %d layers, %d reused layers, %d independent layers",
+                self.num_layers,
+                len(self.prefetch_layer_map),
+                len(self.independent_layers),
+            )
 
         self.page_size_bytes = sum(self.block_len)
         self.token_database.set_group_buffers(
@@ -996,9 +1028,7 @@ class KVPoolWorker:
             # Step-end drain: send thread is FIFO, so save_finished[last] means
             # all saves landed -> buffers/GVAs safe to reuse next step.
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=30):
-                logger.warning(
-                    "Layerwise %d save drain not done, keep waiting", self.current_layer
-                )
+                logger.warning("Layerwise %d save drain not done, keep waiting", self.current_layer)
             for layer_id in range(self.num_layers):
                 if self.layer_save_finished_events[layer_id].is_set():
                     logger.debug(">>>>>>>>>>>>>>>>>>>> clear save layer %d", layer_id)

@@ -1,9 +1,12 @@
 """Unit tests for layerwise KV cache reuse config parsing."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     _DEFAULT_MAX_PREFETCH_LAYERS,
+    get_gva_layerwise_config,
     get_layer_load_start_block,
     get_layerwise_config,
     get_layerwise_independent_layers,
@@ -107,6 +110,54 @@ class TestLayerwiseConfig:
 
     def test_reuse_layers_value_when_reuse(self):
         assert get_layerwise_kv_cache_reuse_layers(27, {"layerwise_num_shared_buffers": 6}) == 6
+
+    def test_mtp_layer_can_enable_reuse(self):
+        config = {"layerwise_num_shared_buffers": 2}
+
+        assert get_layerwise_config(4, config).has_layer_reuse is False
+        assert get_layerwise_config(5, config).has_layer_reuse is True
+
+
+class TestGVALayerwiseConfig:
+    def test_reads_ascend_store_child_config(self):
+        ascend_store_config = {
+            "backend": "memcache",
+            "use_layerwise": True,
+            "layerwise_num_shared_buffers": "2",
+        }
+        config = SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_connector_extra_config={
+                "layerwise_num_shared_buffers": "99",
+                "connectors": [
+                    {
+                        "kv_connector": "SFAPDCpuOffloadConnector",
+                        "kv_connector_extra_config": {"use_layerwise": True},
+                    },
+                    {
+                        "kv_connector": "AscendStoreConnector",
+                        "kv_connector_extra_config": ascend_store_config,
+                    },
+                ],
+            },
+        )
+
+        assert get_gva_layerwise_config(config) is ascend_store_config
+
+    @pytest.mark.parametrize(
+        "extra_config",
+        [
+            {"backend": "mooncake", "use_layerwise": True},
+            {"backend": "memcache", "use_layerwise": False},
+        ],
+    )
+    def test_rejects_unsupported_layerwise_path(self, extra_config):
+        config = SimpleNamespace(
+            kv_connector="AscendStoreConnector",
+            kv_connector_extra_config=extra_config,
+        )
+
+        assert get_gva_layerwise_config(config) is None
 
 
 class TestNumTensors:

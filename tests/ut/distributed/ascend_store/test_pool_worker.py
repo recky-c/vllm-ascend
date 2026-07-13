@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,29 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
         return KVPoolWorker
+
+    def test_resize_shared_events_preserves_list_references(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            get_shared_layer_transfer_events,
+            resize_shared_layer_transfer_events,
+            set_shared_layer_transfer_events,
+            set_shared_layer_transfer_pending_events,
+        )
+
+        events = [threading.Event()]
+        set_shared_layer_transfer_events(events)
+        set_shared_layer_transfer_pending_events([threading.Event()])
+        try:
+            resize_shared_layer_transfer_events(3)
+            self.assertIs(events, get_shared_layer_transfer_events())
+            self.assertEqual(3, len(events))
+
+            resize_shared_layer_transfer_events(1)
+            self.assertIs(events, get_shared_layer_transfer_events())
+            self.assertEqual(1, len(events))
+        finally:
+            set_shared_layer_transfer_events(None)
+            set_shared_layer_transfer_pending_events(None)
 
     def test_check_all_layers_exists_all_present(self):
         cls = self._make_worker_class()

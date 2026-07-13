@@ -169,6 +169,11 @@ class KVPoolScheduler:
         else:
             self.put_step = 1
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        if self.use_gva_layerwise:
+            if len(kv_cache_config.kv_cache_groups) != 1:
+                raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
+            # The cache group is authoritative and includes MTP/draft layers.
+            self.num_layers = len(kv_cache_config.kv_cache_groups[0].layer_names)
         self.model_name = model_config.model.split("/")[-1]
 
         if self.use_gva_layerwise:

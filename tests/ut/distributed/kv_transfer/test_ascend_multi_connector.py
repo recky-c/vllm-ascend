@@ -48,3 +48,31 @@ def test_update_state_after_alloc_forwards_real_blocks_to_marked_sender():
         blocks.empty_blocks,
         0,
     )
+
+
+def test_configures_sibling_with_ascend_store_gva_reuse_plan():
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    sibling = SimpleNamespace(set_gva_layerwise_reuse_plan=MagicMock())
+    connector._connectors = [sibling]
+    kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_connector_extra_config={
+            "connectors": [
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_connector_extra_config": {
+                        "backend": "memcache",
+                        "use_layerwise": True,
+                        "layerwise_num_shared_buffers": 2,
+                    },
+                }
+            ]
+        },
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=[f"model.layers.{i}.attn" for i in range(6)])]
+    )
+
+    connector._configure_gva_layerwise_reuse(kv_transfer_config, kv_cache_config)
+
+    sibling.set_gva_layerwise_reuse_plan.assert_called_once_with({3: 1, 4: 2})
