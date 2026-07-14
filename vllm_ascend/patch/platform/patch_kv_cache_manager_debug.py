@@ -19,9 +19,8 @@
 from __future__ import annotations
 
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.kv_debug import kv_block_ids_summary
 
-from vllm_ascend.kv_usage_debug import log_alloc, log_free
+from vllm_ascend.kv_usage_debug import kv_block_ids_summary, log_alloc, log_free
 
 _original_allocate_slots = KVCacheManager.allocate_slots
 _original_free = KVCacheManager.free

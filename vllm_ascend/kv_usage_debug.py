@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from typing import Any
 
 from vllm_ascend import envs
@@ -29,6 +30,26 @@ _MAX_ATTN_LOGS = 24
 
 def kv_usage_debug_enabled() -> bool:
     return bool(envs.VLLM_ASCEND_KV_USAGE_DEBUG)
+
+
+def kv_block_ids_summary(blocks: Any, max_items: int = 16) -> Any:
+    """Summarize block ids for logs (vLLM 0.23.0 lacks vllm.v1.kv_debug)."""
+    if blocks is None:
+        return None
+    if hasattr(blocks, "get_block_ids"):
+        try:
+            return blocks.get_block_ids(allow_none=True)
+        except TypeError:
+            return blocks.get_block_ids()
+    if isinstance(blocks, Iterable) and not isinstance(blocks, (str, bytes, dict)):
+        ids = []
+        for idx, block in enumerate(blocks):
+            if idx >= max_items:
+                ids.append("...")
+                break
+            ids.append(getattr(block, "block_id", block))
+        return ids
+    return blocks
 
 
 def begin_forward_step() -> int:
