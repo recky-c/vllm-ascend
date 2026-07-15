@@ -17,12 +17,20 @@ if not hasattr(memfabric_hybrid, "offload"):
 
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload import read_thread as read_thread_module  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload import worker as worker_module  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (  # noqa: E402
+    READ_READY_BATCH,
+    LayerMetadata,
+    SendTask,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread import (  # noqa: E402
     ConsumerReadState,
     MembPullReadThread,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler import (  # noqa: E402
     SFAPDProducerScheduler,
+)
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.send_thread import (  # noqa: E402
+    MembPullSendingThread,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (  # noqa: E402
     SFAPDCpuOffloadConsumerWorker,
@@ -250,6 +258,48 @@ def test_producer_scheduler_keeps_all_block_groups_and_finishes_chunk():
     assert req_meta.local_computed_tokens == 128
     assert req_meta.chunk_finish is True
     assert request.request_id not in scheduler._reqs_need_send_layerwise
+
+
+def test_producer_send_thread_uses_layer_block_group():
+    layer_name = "model.layers.0.self_attn.attn"
+    thread = MembPullSendingThread.__new__(MembPullSendingThread)
+    thread._state = SimpleNamespace(
+        layer_metadata={
+            layer_name: LayerMetadata(
+                tensor_group_idx=[1, 1],
+                kv_caches_base_addr=[1000, 2000],
+                block_len=[10, 20],
+                block_size_scale=[1, 1],
+            )
+        }
+    )
+    thread._p_save_events = {}
+    thread.layer_send_done_events = [MagicMock()]
+    thread.layer_transfer_finished_events = None
+    thread._mf_meta_sent = True
+    dealer = MagicMock()
+    thread._ensure_dealer = MagicMock(return_value=dealer)
+    encoder = MagicMock()
+    encoder.encode.side_effect = lambda value: value
+    req_meta = SimpleNamespace(
+        local_block_ids=[[7], [3, 4]],
+        remote_host="127.0.0.1",
+        remote_port=1234,
+        chunk_finish=False,
+    )
+
+    thread._process_send_task(
+        SendTask(
+            send_request={"req-0": req_meta},
+            layer_idx=0,
+            layer_name=layer_name,
+        ),
+        encoder,
+    )
+
+    sent_message = dealer.send.call_args.args[0]
+    assert sent_message[0] == READ_READY_BATCH
+    assert sent_message[3] == [("req-0", [3, 4])]
 
 
 def test_producer_worker_preserves_transfer_timeout_setup(monkeypatch):
