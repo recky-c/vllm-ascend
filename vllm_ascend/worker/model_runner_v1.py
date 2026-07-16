@@ -1490,6 +1490,14 @@ class NPUModelRunner(GPUModelRunner):
             assert num_offloaded_blocks is not None
             assert is_prefill is not None
 
+            print(
+                f"[SFA-PD-LEARN][⑧mask] model_runner 写入 num_offloaded_blocks: "
+                f"req_ids={list(self.input_batch.req_ids[:num_reqs])} "
+                f"num_offloaded={num_offloaded_blocks.tolist()} "
+                f"is_prefill={is_prefill.tolist()} "
+                f"cpu_blocks_map={'yes' if cpu_blocks_map else 'None(启发式)'} "
+                f"（attention 用 threshold=offloaded*block_size 切 NPU/CPU 双路）"
+            )
             if envs.VLLM_ASCEND_SFA_DEBUG and torch.distributed.get_rank() == 0:
                 logger.info(
                     ">>>>> offload threshold: req_ids=%s, num_offloaded_blocks=%s, "
@@ -4128,6 +4136,12 @@ class NPUModelRunner(GPUModelRunner):
             new_tensors.append(KVCacheTensor(shared_by=slot_names, size=slot_size))
 
         kv_cache_config.kv_cache_tensors = new_tensors
+        print(
+            f"[SFA-PD-LEARN][②槽合并] _merge_kv_cache_tensors_for_layer_reuse: "
+            f"{len(old_tensors)} tensors → {len(new_tensors)} "
+            f"(num_blocks={kv_cache_config.num_blocks} 不变); "
+            f"slots={[t.shared_by for t in new_tensors]}"
+        )
         logger.info(
             "Layerwise KV cache reuse: merged %d tensors → %d (num_blocks=%d unchanged)",
             len(old_tensors),
@@ -4142,12 +4156,21 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        print(
+            f"[SFA-PD-LEARN][②启动] initialize_kv_cache: 开始 "
+            f"(num_blocks={kv_cache_config.num_blocks}, "
+            f"n_tensors_before_merge={len(kv_cache_config.kv_cache_tensors)})"
+        )
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self._merge_kv_cache_tensors_for_layer_reuse(kv_cache_config)
+        print(
+            f"[SFA-PD-LEARN][②启动] initialize_kv_cache: merge 后 "
+            f"n_tensors={len(kv_cache_config.kv_cache_tensors)}"
+        )
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
@@ -4159,6 +4182,10 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        print(
+            f"[SFA-PD-LEARN][②启动] initialize_kv_cache: 已分配物理 KV buffers, "
+            f"layers={len(kv_caches)}"
+        )
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4177,6 +4204,11 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
+            print(
+                "[SFA-PD-LEARN][②注册] initialize_kv_cache → "
+                "get_kv_transfer_group().register_kv_caches "
+                "（Multi 会转发到 AscendStore + SFAPD Producer）"
+            )
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:
@@ -5397,6 +5429,11 @@ class NPUModelRunner(GPUModelRunner):
         # Sparse offload exposes both the per-layer indexer cache and the MLA
         # attention cache in attn_layers.
         if self.use_sparse and self.use_offload:
+            print(
+                f"[SFA-PD-LEARN][④Spec] get_kv_cache_spec: "
+                f"use_sparse∧use_offload=True → 走 Offload Spec 分支 "
+                f"(D 侧 main=OffloadMLA / indexer=AscendMLA)"
+            )
             # glm5.2, pad reused indexer module for kv allocating
             # TODO change to full hybrid (4 kv + 1 indexer)
             # Pad an indexer for EVERY main MLA layer (incl MTP/spec-decode extra
@@ -5412,6 +5449,13 @@ class NPUModelRunner(GPUModelRunner):
                 indexer_name = f'model.layers.{layer_id}.self_attn.indexer.k_cache'
                 if indexer_name not in attn_layers:
                     attn_layers[indexer_name] = deepcopy(indexer_module)
+            print(
+                f"[SFA-PD-LEARN][④Spec] pad indexer modules: "
+                f"num_main_mla_layers={num_layers} "
+                f"（保证每层 main 都有配对 indexer 供 D pull）"
+            )
+        n_offload_main = 0
+        n_offload_indexer = 0
         for layer_name, attn_module in attn_layers.items():
             if self.use_sparse and self.use_offload:
                 if isinstance(attn_module, MLAAttention):
@@ -5431,6 +5475,7 @@ class NPUModelRunner(GPUModelRunner):
                             else None
                         ),
                     )
+                    n_offload_main += 1
                 else:
                     hf_cfg = self.model_config.hf_text_config
                     kv_cache_spec[layer_name] = make_offload_indexer_mla_spec(
@@ -5455,6 +5500,7 @@ class NPUModelRunner(GPUModelRunner):
                             else None
                         ),
                     )
+                    n_offload_indexer += 1
             elif (isinstance(attn_module, Attention)
                     and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):
                 # The layer doesn't need its own KV cache and will use that of
@@ -5575,6 +5621,12 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        if n_offload_main or n_offload_indexer:
+            print(
+                f"[SFA-PD-LEARN][④Spec] get_kv_cache_spec 汇总: "
+                f"offload_main={n_offload_main} offload_indexer={n_offload_indexer} "
+                f"total_specs={len(kv_cache_spec)}"
+            )
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(

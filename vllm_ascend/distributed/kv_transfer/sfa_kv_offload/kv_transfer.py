@@ -93,6 +93,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         f'cpu block num ({len(block_ids_cpu)}) size mismatch'
                     )
                 if self.tp_rank == 0 and layer_id == 0:
+                    print(
+                        f"[SFA-PD-LEARN][⑦拷贝] SendingThread HBM→CPU: "
+                        f"layer={layer_id} req={req_id} "
+                        f"n_blocks={len(block_ids_npu)} "
+                        f"hbm={block_ids_npu} → cpu={block_ids_cpu}"
+                    )
                     if envs.VLLM_ASCEND_SFA_DEBUG:
                         logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
                 if len(block_ids_npu) > 1:
@@ -106,3 +112,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         req_metas.clear()
         self.request_queue.task_done()
         self.layer_save_finished_events[layer_id].set()
+        if self.tp_rank == 0 and layer_id == 0:
+            print(
+                f"[SFA-PD-LEARN][⑦拷贝] layer={layer_id} synchronize OK → "
+                f"layer_save_finished_events.set()"
+            )

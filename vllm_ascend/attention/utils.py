@@ -515,6 +515,11 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
+    print(
+        f"[SFA-PD-LEARN][③层前钩子] wait_for_kv_layer_from_connector: "
+        f"layer={layer_name} → connector.wait_for_layer_load "
+        f"（SFAPD mate READ_DONE + AscendStore mate save/load）"
+    )
     connector.wait_for_layer_load(layer_name)
 
 
@@ -546,6 +551,11 @@ def maybe_save_kv_layer_to_connector(
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
+    print(
+        f"[SFA-PD-LEARN][③层后钩子] maybe_save_kv_layer_to_connector: "
+        f"layer={layer_name} → connector.save_kv_layer "
+        f"（AscendStore HBM→GVA + SFAPD READ_READY）"
+    )
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 
@@ -574,6 +584,16 @@ def maybe_prepare_lru_resident_and_load_graph(
     if not hasattr(connector, "prepare_lru_resident_and_load"):
         raise RuntimeError(
             "LRU resident cache requires prepare_lru_resident_and_load connector method"
+        )
+    # Hot path: only first few calls (decode × layers is otherwise too noisy).
+    n = getattr(maybe_prepare_lru_resident_and_load_graph, "_learn_n", 0)
+    if n < 3:
+        maybe_prepare_lru_resident_and_load_graph._learn_n = n + 1  # type: ignore[attr-defined]
+        print(
+            f"[SFA-PD-LEARN][⑧钩子] maybe_prepare_lru_resident_and_load_graph: "
+            f"layer={layer_name} num_tokens={num_tokens} num_reqs={num_reqs} "
+            f"capturing={capturing} → connector.prepare_lru "
+            f"（#{n + 1}/3）"
         )
     return connector.prepare_lru_resident_and_load(
         layer_name,
@@ -617,7 +637,14 @@ def maybe_get_num_cpu_blocks(req_ids):
     connector = get_kv_transfer_group()
     if not hasattr(connector, "get_num_cpu_blocks"):
         return None
-    return connector.get_num_cpu_blocks(req_ids)
+    result = connector.get_num_cpu_blocks(req_ids)
+    if result:
+        print(
+            f"[SFA-PD-LEARN][⑧mask] maybe_get_num_cpu_blocks: "
+            f"{result} "
+            f"（→ num_offloaded_blocks，mask null 前缀 / CPU 前缀）"
+        )
+    return result
 
 
 def round_up(val: int, align: int) -> int:

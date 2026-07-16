@@ -82,6 +82,15 @@ class SFAKVOffloadConnectorMetadata(KVConnectorMetadata):
         self.preempted_req_ids = preempted_req_ids
 
     def add_request(self, req_meta: ReqMeta) -> None:
+        if req_meta.num_new_offload_blocks > 0:
+            print(
+                f"[SFA-PD-LEARN][⑦meta] ReqMeta: req={req_meta.req_id} "
+                f"num_new_offload_blocks={req_meta.num_new_offload_blocks} "
+                f"offload_src_hbm={req_meta.offload_src_hbm_ids} "
+                f"offload_dst_cpu={req_meta.offload_dst_cpu_ids} "
+                f"cpu_total={len(req_meta.block_ids_cpu)} "
+                f"hbm_total={len(req_meta.block_ids_npu)}"
+            )
         self.requests.append(req_meta)
 
 

@@ -84,11 +84,22 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # time; init_ascend_config is idempotent (no-op if already done).
         init_ascend_config(vllm_config)
         ascend_use_offload = get_ascend_config().use_offload
+        node = "P(producer)" if self.is_producer else "D(consumer)"
+        print(
+            f"[SFA-PD-LEARN][①SFAPD] SFAPDCpuOffloadConnector.__init__ "
+            f"node={node} role={role} kv_role={self.kv_role} "
+            f"use_offload={ascend_use_offload} use_layerwise={self.use_layerwise} "
+            f"engine_id={self.engine_id}"
+        )
         if self.is_producer:
             assert not ascend_use_offload, (
                 "SFAPDCpuOffloadConnector producer (P) must run with "
                 "use_offload=false (set --additional-config "
                 "'{\"use_offload\": false}')."
+            )
+            print(
+                "[SFA-PD-LEARN][①SFAPD] PD不对称断言通过: "
+                "P 必须 use_offload=false（标准 paged HBM，非 5-tuple）"
             )
         if self.is_consumer:
             assert ascend_use_offload, (
@@ -96,29 +107,38 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "use_offload=true (set --additional-config "
                 "'{\"use_offload\": true, ...}')."
             )
+            print(
+                "[SFA-PD-LEARN][①SFAPD] PD不对称断言通过: "
+                "D 必须 use_offload=true（5/6-tuple + CPU池 + LRU）"
+            )
 
         if role == KVConnectorRole.SCHEDULER:
             # Producer scheduler prepares P-side metadata; consumer scheduler
             # allocates and advertises D-side CPU blocks.
             if self.is_producer:
                 self.connector_scheduler = SFAPDProducerScheduler(vllm_config, kv_cache_config, str(self.engine_id))
+                quad = "SCHEDULER×producer → SFAPDProducerScheduler"
             else:
                 self.connector_scheduler = SFAPDCpuOffloadScheduler(
                     vllm_config,
                     self.use_layerwise,
                     kv_cache_config,
                 )
+                quad = "SCHEDULER×consumer → SFAPDCpuOffloadScheduler"
             self.connector_worker = None
         else:
             self.connector_scheduler = None
             if self.is_producer:
                 self.connector_worker = SFAPDCpuOffloadProducerWorker(vllm_config, kv_cache_config, str(self.engine_id))
+                quad = "WORKER×producer → SFAPDCpuOffloadProducerWorker"
             else:
                 self.connector_worker = SFAPDCpuOffloadConsumerWorker(
                     vllm_config,
                     self.use_layerwise,
                     kv_cache_config,
                 )
+                quad = "WORKER×consumer → SFAPDCpuOffloadConsumerWorker"
+        print(f"[SFA-PD-LEARN][①SFAPD] 四象限分支: {quad}")
 
     # ------------------------------------------------------------------
     # Scheduler side
@@ -142,6 +162,11 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        print(
+            f"[SFA-PD-LEARN][⑨释放] connector.request_finished: "
+            f"req={request.request_id} → scheduler 释放 CPU tracker "
+            f"（正常结束或 preempt）"
+        )
         return self.connector_scheduler.request_finished(request, block_ids)
 
     def request_finished_all_groups(
@@ -164,6 +189,16 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         if self.is_producer:
             self._reuse_mate_map = reuse_mate_map
+            print(
+                f"[SFA-PD-LEARN][①SFAPD] set_gva_layerwise_reuse_plan(P): "
+                f"mate_map={dict(reuse_mate_map)} "
+                f"（复用层进场前须等 mate 的 READ_DONE）"
+            )
+        else:
+            print(
+                "[SFA-PD-LEARN][①SFAPD] set_gva_layerwise_reuse_plan(D): "
+                "忽略（mate 门控只挂在 P producer）"
+            )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
@@ -202,7 +237,17 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         layer_idx = int(match.group(1))
         mate = self._reuse_mate_map.get(layer_idx)
         if mate is None:
+            print(
+                f"[SFA-PD-LEARN][③SFAPD门控] wait_for_layer_load: "
+                f"layer={layer_idx}({layer_name}) mate=None → skip "
+                f"（独立层/槽内首占，无需等 READ_DONE）"
+            )
             return  # independent / first occupant of its slot: nothing to gate.
+        print(
+            f"[SFA-PD-LEARN][③SFAPD门控] wait_for_layer_load: "
+            f"layer={layer_idx}({layer_name}) → wait mate={mate} READ_DONE "
+            f"（复用槽：D 必须先读走旧层再允许本层覆盖）"
+        )
         self.wait_for_layer_send(mate)
 
     def save_kv_layer(
@@ -217,7 +262,16 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # capture where no per-step connector metadata is bound. Nothing to save
         # then; skip rather than trip _get_connector_metadata's assert.
         if not self.has_connector_metadata():
+            print(
+                f"[SFA-PD-LEARN][③SFAPD-READY] save_kv_layer: "
+                f"layer={layer_name} skip（无 connector metadata，profiling/capture）"
+            )
             return
+        print(
+            f"[SFA-PD-LEARN][③SFAPD-READY] save_kv_layer: "
+            f"layer={layer_name} → ProducerWorker "
+            f"（记 NPU event + 入队 SendTask → READ_READY）"
+        )
         self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, self._get_connector_metadata())
 
     def wait_for_save(self):
@@ -246,6 +300,14 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         capturing: bool = False,
     ) -> bool:
         assert self.connector_worker is not None
+        n = getattr(self, "_learn_8_lru_n", 0)
+        if n < 3:
+            self._learn_8_lru_n = n + 1
+            print(
+                f"[SFA-PD-LEARN][⑧转交] connector.prepare_lru_resident_and_load: "
+                f"layer={layer_name} tokens={num_tokens} reqs={num_reqs} "
+                f"→ worker （#{n + 1}/3）"
+            )
         return self.connector_worker.prepare_lru_resident_and_load(
             layer_name,
             num_tokens,
@@ -269,4 +331,8 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         worker = self.connector_worker
         if worker is None or not hasattr(worker, "wait_for_layer_send"):
             return
+        print(
+            f"[SFA-PD-LEARN][③SFAPD门控] wait_for_layer_send: "
+            f"delegate → ProducerWorker.wait_for_layer_send(mate={layer_idx})"
+        )
         worker.wait_for_layer_send(layer_idx)

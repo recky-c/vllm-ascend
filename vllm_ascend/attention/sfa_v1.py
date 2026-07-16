@@ -1585,6 +1585,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             num_decodes = attn_metadata.num_decodes
             num_prefills = attn_metadata.num_prefills
             num_decode_tokens = attn_metadata.num_decode_tokens
+            n = getattr(self, "_learn_8_sparse_fa_n", 0)
+            if n < 3:
+                self._learn_8_sparse_fa_n = n + 1
+                print(
+                    f"[SFA-PD-LEARN][⑧双路FA] _execute_sparse_flash_attention_process: "
+                    f"layer={layer_name} use_offload=True "
+                    f"decodes={num_decodes} prefills={num_prefills} "
+                    f"decode_tokens={num_decode_tokens} "
+                    f"（decode: NPU resident + CPU topk_buffer → attention_update；"
+                    f"#{n + 1}/3）"
+                )
             ql_nope_decode = ql_nope[:num_decode_tokens]
             ql_nope_prefill = ql_nope[num_decode_tokens:]
             # key_rope_decode = key_rope[:num_decode_tokens]
@@ -2065,6 +2076,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         # indexer_select_post_process also runs an attention kernel, so record
         # ahead of it (and the main sparse flash attention) to overlap H2D.
         maybe_record_attention_compute_start()
+        if self.use_offload:
+            n_fwd = getattr(self, "_learn_8_fwd_n", 0)
+            if n_fwd < 3:
+                self._learn_8_fwd_n = n_fwd + 1
+                nob = getattr(attn_metadata, "num_offloaded_blocks", None)
+                nob_s = (
+                    nob[: attn_metadata.num_decodes].tolist()
+                    if nob is not None and attn_metadata.num_decodes > 0
+                    else None
+                )
+                print(
+                    f"[SFA-PD-LEARN][⑧forward] SFA.forward: layer={layer_name} "
+                    f"use_offload=True kv_tuple_len={len(kv_cache) if kv_cache is not None else 0} "
+                    f"decodes={attn_metadata.num_decodes} "
+                    f"num_offloaded_blocks={nob_s} "
+                    f"→ indexer → sparse FA → maybe_save （#{n_fwd + 1}/3）"
+                )
         if self.enable_dsa_cp and attn_metadata.dsa_cp_context is not None:
             topk_num_tokens = attn_metadata.dsa_cp_context.local_end_with_pad - attn_metadata.dsa_cp_context.local_start
         else:
@@ -2162,6 +2190,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         token_to_req_index = token_to_req.long()
         num_offloaded_blocks = attn_metadata.num_offloaded_blocks[:num_reqs]
         offload_thresholds = (num_offloaded_blocks * self.block_size)[token_to_req_index].unsqueeze(1)
+
+        n = getattr(self, "_learn_8_topk_n", 0)
+        if n < 3:
+            self._learn_8_topk_n = n + 1
+            # .tolist() syncs NPU→CPU intentionally for learning visibility.
+            print(
+                f"[SFA-PD-LEARN][⑧topk] _get_topk_buffer: "
+                f"layer={layer_name} tokens={num_tokens} reqs={num_reqs} "
+                f"mtp={is_mtp_decode} "
+                f"num_offloaded_blocks={num_offloaded_blocks.tolist()} "
+                f"threshold_tok≈offloaded*block_size={self.block_size} "
+                f"→ npu_mask(>=th) | cpu_mask(<th) → LRU load （#{n + 1}/3）"
+            )
 
         # compute npu attn (kv which are not offloaded yet)
         side_compute_stream = get_side_compute_stream()

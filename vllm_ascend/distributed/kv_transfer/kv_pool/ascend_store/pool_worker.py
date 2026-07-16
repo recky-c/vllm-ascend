@@ -330,12 +330,24 @@ class KVPoolWorker:
 
         self.next_layer_to_submit = 0
         self.sync_save_events: list[torch.npu.Event] | None = None
+        print(
+            f"[SFA-PD-LEARN][②GVA线程] _init_layerwise_config: "
+            f"num_layers={self.num_layers} layerwise_offload={self.layerwise_offload} "
+            f"num_prefetch={self.num_prefetch_layers} "
+            f"independent={self.independent_layers} "
+            f"mate_map={dict(self.prefetch_layer_map)}"
+        )
 
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
             return
 
         if self.use_layerwise:
+            print(
+                f"[SFA-PD-LEARN][②GVA线程] _start_kv_transfer_threads: "
+                f"use_layerwise=True use_gva_layerwise={self.use_gva_layerwise} "
+                f"kv_role={self.kv_role} num_layers={self.num_layers}"
+            )
             self.get_event = threading.Event()
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
@@ -364,6 +376,10 @@ class KVPoolWorker:
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
+                print(
+                    "[SFA-PD-LEARN][②GVA线程] 已启动 KVCacheStoreLayerSendingThread "
+                    "（P: HBM→GVA / COPY_L2G save）"
+                )
             elif self.kv_role in ["kv_producer", "kv_both"]:
                 ready_event_sending = threading.Event()
                 self.kv_send_thread = KVCacheStoreKeyLayerSendingThread(
@@ -418,6 +434,11 @@ class KVPoolWorker:
                 )
             self.kv_recv_thread.start()
             ready_event.wait()
+            if self.use_gva_layerwise:
+                print(
+                    "[SFA-PD-LEARN][②GVA线程] 已启动 KVCacheStoreLayerRecvingThread "
+                    "（P: GVA→HBM / COPY_G2L load，复用槽进场前）"
+                )
         else:
             if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put:
                 ready_event_sending = threading.Event()
@@ -450,6 +471,7 @@ class KVPoolWorker:
                 self.kv_recv_thread.start()
                 ready_event.wait()
         self._transfer_threads_started = True
+        print("[SFA-PD-LEARN][②GVA线程] _start_kv_transfer_threads: 完成")
 
     def _build_cache_coordinator(self, vllm_config: VllmConfig) -> AscendStoreCoordinator | None:
         if self.kv_cache_config is None or not self.use_hybrid:
@@ -588,6 +610,11 @@ class KVPoolWorker:
         self.group_num_layers[group_id] = len(layer_names)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        print(
+            f"[SFA-PD-LEARN][②注册-AscendStore] register_kv_caches: "
+            f"layers={len(kv_caches)} use_gva_layerwise={self.use_gva_layerwise} "
+            f"kv_role={self.kv_role}"
+        )
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
         first_kv_cache = first_kv_cache_tuple[0]
@@ -642,6 +669,11 @@ class KVPoolWorker:
 
         ptrs = [start for start, _ in registered_regions.values()]
         lengths = [end - start for start, end in registered_regions.values()]
+        print(
+            f"[SFA-PD-LEARN][②注册-AscendStore] memcache 注册区域: "
+            f"n_regions={len(ptrs)} total_bytes={sum(lengths)} "
+            f"num_blocks={self.num_blocks}"
+        )
 
         if self.kv_cache_config is not None and self.use_hybrid:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
@@ -669,6 +701,11 @@ class KVPoolWorker:
             self.layer_load_tasks = [[] for _ in range(self.num_layers)]
             self.layer_save_tasks = [[] for _ in range(self.num_layers)]
         if self.use_gva_layerwise and self.layerwise_offload:
+            print(
+                f"[SFA-PD-LEARN][②注册-AscendStore] GVA reuse plan 确认: "
+                f"N={self.num_layers} mate_entries={len(self.prefetch_layer_map)} "
+                f"independent={self.independent_layers}"
+            )
             logger.info(
                 "GVA layerwise reuse plan: %d layers, %d reused layers, %d independent layers",
                 self.num_layers,
@@ -690,6 +727,10 @@ class KVPoolWorker:
         if hasattr(self.m_store, "init_store"):
             self.m_store.init_store()
         self.m_store.register_buffer(ptrs, lengths)
+        print(
+            "[SFA-PD-LEARN][②注册-AscendStore] m_store.register_buffer 完成 → "
+            "_start_kv_transfer_threads"
+        )
         self._start_kv_transfer_threads()
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
@@ -986,6 +1027,13 @@ class KVPoolWorker:
         # Submit current + prefetch (real loads and reused-no-load gate tasks).
         # layer_load_tasks is safe to read here: recv no longer clears it (reowned
         # per step in process_layer_data).
+        mate = self.prefetch_layer_map.get(self.current_layer)
+        print(
+            f"[SFA-PD-LEARN][③GVA门控] AscendStore.wait_for_layer_load: "
+            f"layer={self.current_layer} mate={mate} "
+            f"has_load_tasks={bool(self.layer_load_tasks[self.current_layer])} "
+            f"（mate save 完成 + 可选 COPY_G2L）"
+        )
         self._submit_ready_layer_loads()
         needs_wait = (
             bool(self.layer_load_tasks[self.current_layer])
@@ -993,10 +1041,18 @@ class KVPoolWorker:
         )
         if not needs_wait:
             # Independent / first-occupant with no load: no gate, no H2D.
+            print(
+                f"[SFA-PD-LEARN][③GVA门控] layer={self.current_layer} "
+                f"无需 wait（独立/首占且无 load）"
+            )
             self.layer_load_finished_events[self.current_layer].clear()
             return
         while not self.layer_load_finished_events[self.current_layer].wait(timeout=30):
             logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
+        print(
+            f"[SFA-PD-LEARN][③GVA门控] AscendStore.wait_for_layer_load: "
+            f"layer={self.current_layer} load/gate DONE → 可开始本层 compute"
+        )
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)
         self.layer_load_finished_events[self.current_layer].clear()
 
@@ -1018,15 +1074,29 @@ class KVPoolWorker:
         assert self.kv_send_thread is not None
         send_thread = self.kv_send_thread
         self.sync_save_events[self.current_layer].record()
+        n_save = len(self.layer_save_tasks[self.current_layer])
         if self.layer_save_tasks[self.current_layer]:
+            print(
+                f"[SFA-PD-LEARN][③GVA-save] AscendStore.save_kv_layer: "
+                f"layer={self.current_layer} n_tasks={n_save} "
+                f"→ send_thread（HBM→GVA / COPY_L2G）"
+            )
             for block_range in self.layer_save_tasks[self.current_layer][0].block_ranges:
                 send_thread.add_stored_request(block_range.request.req_id)
             send_thread.add_request(self.layer_save_tasks[self.current_layer])  # type: ignore[arg-type]
         else:
+            print(
+                f"[SFA-PD-LEARN][③GVA-save] AscendStore.save_kv_layer: "
+                f"layer={self.current_layer} 无 save task → 直接 set finished"
+            )
             self.layer_save_finished_events[self.current_layer].set()
         if self.current_layer == self.num_layers - 1:
             # Step-end drain: send thread is FIFO, so save_finished[last] means
             # all saves landed -> buffers/GVAs safe to reuse next step.
+            print(
+                f"[SFA-PD-LEARN][③GVA-save] 最后一层 drain: "
+                f"wait layer_save_finished[{self.num_layers - 1}]"
+            )
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=30):
                 logger.warning("Layerwise %d save drain not done, keep waiting", self.current_layer)
             for layer_id in range(self.num_layers):

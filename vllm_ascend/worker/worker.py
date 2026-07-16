@@ -612,6 +612,10 @@ class NPUWorker(WorkerBase):
             return available
         extra_config = get_gva_layerwise_config(kv_transfer_config)
         if extra_config is None:
+            print(
+                "[SFA-PD-LEARN][②虚增] determine_available_memory: "
+                "无 GVA layerwise 配置，跳过内存虚增"
+            )
             return available
         total_layers = getattr(
             self,
@@ -621,7 +625,14 @@ class NPUWorker(WorkerBase):
         num_tensors = get_layerwise_kv_cache_num_tensors(total_layers, extra_config)
         if num_tensors is not None and num_tensors < total_layers:
             factor = total_layers / num_tensors
+            before = available
             available = int(available * factor)
+            print(
+                f"[SFA-PD-LEARN][②虚增] determine_available_memory: "
+                f"available {before} → {available} bytes "
+                f"(×{factor:.2f}; N={total_layers} layers → M_phys={num_tensors} buffers); "
+                f"目的：让 num_blocks 仍按长序列够用，真实 HBM 只占少量共享槽"
+            )
             logger.info(
                 "Layerwise KV cache reuse: inflating available memory by %.2fx (%d layers -> %d buffers)",
                 factor,

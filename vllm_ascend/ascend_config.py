@@ -34,6 +34,11 @@ class LRUResidentCacheConfig:
         self.enabled = bool(config.get("enabled", False))
         self.buffer_size = int(config.get("buffer_size", 2048))
         self.topk = int(config.get("topk", 2048))
+        print(
+            f"[SFA-PD-LEARN][①配置] LRUResidentCacheConfig: "
+            f"enabled={self.enabled} buffer_size={self.buffer_size} topk={self.topk} "
+            f"（D 侧 sparse attn 工作集常驻 HBM）"
+        )
 
         if self.buffer_size <= 0:
             raise ValueError("lru_resident_cache_config.buffer_size must be positive")
@@ -347,6 +352,10 @@ class AscendConfig:
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
 
         self.use_offload = bool(additional_config.get("use_offload", False))
+        print(
+            f"[SFA-PD-LEARN][①配置] AscendConfig.use_offload={self.use_offload} "
+            f"（来自 additional_config；P=false / D=true 为 PD 硬约束）"
+        )
         self.lru_resident_cache_config = LRUResidentCacheConfig(
             additional_config.get("lru_resident_cache_config", {})
         )

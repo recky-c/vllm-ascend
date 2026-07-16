@@ -112,6 +112,11 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
         if get_ascend_config().short_request_first_config.enabled:
             self._init_short_request_first_waiting_queue()
         self.use_sfa_offload = get_ascend_config().use_offload
+        if self.use_sfa_offload:
+            print(
+                "[SFA-PD-LEARN][⑨preempt] RecomputeScheduler: use_sfa_offload=True "
+                "→ preempt 强制直接 recompute，并 request_finished 释放 CPU blocks"
+            )
 
     def _pop_waiting_request(
         self,
@@ -343,6 +348,13 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                             )
                         if self.use_sfa_offload:
                             # In sfa offload, we directly recompute.
+                            print(
+                                f"[SFA-PD-LEARN][⑨preempt] SFA offload 覆盖: "
+                                f"req={recomputed_req_id} "
+                                f"preempt_hook_offloaded→False "
+                                f"computed_tokens={recomputed_num_computed_tokens} "
+                                f"（不走 preempt offload，直接 recompute）"
+                            )
                             offloaded = False
                         if offloaded:
                             logger.info(
@@ -375,6 +387,11 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                             )
                         if self.use_sfa_offload:
                             # In sfa offload, we also need to free cpu blocks here.
+                            print(
+                                f"[SFA-PD-LEARN][⑨preempt] 释放 CPU 池: "
+                                f"req={recomputed_req_id} → connector.request_finished "
+                                f"（避免 CPU block 泄漏）"
+                            )
                             self.connector.request_finished(recomputed_req, [])
                         if recomputed_req == request:
                             break

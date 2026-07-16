@@ -180,6 +180,14 @@ class SFAPDProducerScheduler:
                 local_computed_tokens=send_req_info.local_computed_tokens,
                 local_transed_tokens=send_req_info.local_transferred_tokens,
             )
+            print(
+                f"[SFA-PD-LEARN][③调度] SFAPDProducerScheduler.build_connector_meta: "
+                f"req={req_id} chunk_finish={chunk_finish} "
+                f"local_computed={send_req_info.local_computed_tokens} "
+                f"prompt_len={len(request.all_token_ids)} "
+                f"remote={request.kv_transfer_params.get('remote_host')}:"
+                f"{request.kv_transfer_params.get('remote_port')}"
+            )
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
                     "SFAPD P add transfer task req %s: local_block_ids=%s, "
@@ -198,6 +206,11 @@ class SFAPDProducerScheduler:
                 )
             if chunk_finish:
                 self._reqs_need_send_layerwise.pop(req_id)
+        if meta.requests:
+            print(
+                f"[SFA-PD-LEARN][③调度] build_connector_meta 本 step: "
+                f"n_reqs={len(meta.requests)}"
+            )
         return meta
 
     def request_finished(
@@ -293,6 +306,13 @@ class SFAPDCpuOffloadScheduler:
         if params is not None and params.get("do_remote_prefill"):
             assert num_computed_tokens % min(self.block_size) == 0
             count = max(len(request.prompt_token_ids) - num_computed_tokens, 0)
+            print(
+                f"[SFA-PD-LEARN][④调度] get_num_new_matched_tokens: "
+                f"req={request.request_id} do_remote_prefill=True "
+                f"prompt_len={len(request.prompt_token_ids)} "
+                f"computed={num_computed_tokens} → claim={count} async={count > 0} "
+                f"（认领远程 KV，触发后续 null-pad + CPU/HBM 分配）"
+            )
             return count, count > 0
         return 0, False
 
@@ -324,6 +344,17 @@ class SFAPDCpuOffloadScheduler:
         has_partial = (prompt_len % self._main_block_size) != 0
         main_cpu_ids = self.cpu_block_manager.allocate_block(num_main_cpu_blocks) if num_main_cpu_blocks > 0 else []
         partial_hbm_bid = main_hbm_ids[-1] if (has_partial and main_hbm_ids) else None
+
+        print(
+            f"[SFA-PD-LEARN][④调度] update_state_after_alloc: "
+            f"req={request.request_id} prompt_len={prompt_len} "
+            f"main_block_size={self._main_block_size} "
+            f"num_full(cpu)={num_main_cpu_blocks} has_partial={has_partial} "
+            f"indexer_hbm={len(indexer_npu_ids)} main_hbm={len(main_hbm_ids)} "
+            f"main_cpu={len(main_cpu_ids)} partial_hbm={partial_hbm_bid} "
+            f"ext_tokens={num_external_tokens} "
+            f"不变量: num_full == null-pad宽 == num_offloaded_blocks"
+        )
 
         tracker = RequestTracker(
             req_id=request.request_id,
@@ -357,6 +388,12 @@ class SFAPDCpuOffloadScheduler:
         params["do_remote_prefill"] = False
         metaserver = params.get("metaserver")
         if metaserver is not None and not params.get("do_virtual", False):
+            print(
+                f"[SFA-PD-LEARN][④调度] metaserver 会合: "
+                f"req={request.request_id} → {metaserver} "
+                f"do_remote_decode=True host={self.side_channel_host}:"
+                f"{self.side_channel_port}（不传 block ids，仅联系信息）"
+            )
             future = self.executor.submit(self._access_metaserver, url=metaserver, message=kv_transfer_params)
             future.add_done_callback(self._on_metaserver_done)
         if envs.VLLM_ASCEND_SFA_DEBUG:
@@ -461,12 +498,22 @@ class SFAPDCpuOffloadScheduler:
             end = min(num_blocks_after_step, len(tracker.main_hbm_ids))
             offload_src = tracker.main_hbm_ids[num_offloaded:end] if end > num_offloaded else []
             offload_dst = self.cpu_block_manager.allocate_block(len(offload_src)) if offload_src else []
+            # Show the slice arithmetic so a hardware run can confirm the
+            # offload range skips the null-padded prefix ([0:N]) and catches
+            # real decode blocks ([N:end]). main_hbm_ids includes the null
+            # prefix (get_block_ids does not filter nulls), so num_offloaded
+            # (=N from Part A) correctly offsets past it.
+            if offload_src or envs.VLLM_ASCEND_SFA_DEBUG:
+                print(
+                    f"[SFA-PD-LEARN][⑦调度] B1 切满块: req={req_id} "
+                    f"num_computed={num_computed} num_new={num_new_tokens} "
+                    f"blocks_after={num_blocks_after_step} "
+                    f"slice=[{num_offloaded}:{end}] "
+                    f"n_offload={len(offload_src)} "
+                    f"null_prefix(num_full)={tracker.num_full} "
+                    f"src_hbm={offload_src} dst_cpu={offload_dst}"
+                )
             if envs.VLLM_ASCEND_SFA_DEBUG:
-                # Show the slice arithmetic so a hardware run can confirm the
-                # offload range skips the null-padded prefix ([0:N]) and catches
-                # real decode blocks ([N:end]). main_hbm_ids includes the null
-                # prefix (get_block_ids does not filter nulls), so num_offloaded
-                # (=N from Part A) correctly offsets past it.
                 logger.info(
                     "SFAPD B1 offload slice req %s: num_blocks_after_step=%d, "
                     "len(main_hbm_ids)=%d, slice=[%d:%d] -> %d blocks (null_prefix=%d)",
@@ -489,6 +536,13 @@ class SFAPDCpuOffloadScheduler:
                         num_offloaded + len(offload_src),
                     )
             _add_req(req_id, offload_src, offload_dst)
+        n_b1 = sum(1 for r in meta.requests if r.num_new_offload_blocks > 0)
+        if n_b1:
+            print(
+                f"[SFA-PD-LEARN][⑦调度] build_connector_meta 本 step: "
+                f"n_reqs={len(meta.requests)} n_with_B1_offload={n_b1} "
+                f"（num_new_offload_blocks>0 → worker process_layer_data）"
+            )
         return meta
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
@@ -504,7 +558,14 @@ class SFAPDCpuOffloadScheduler:
         # Free cpu blocks immediately to make room for next step scheduling.
         tracker = self._request_trackers.pop(request.request_id, None)
         if tracker is not None:
+            n_cpu = len(tracker.allocated_block_ids_cpu)
             self.cpu_block_manager.free(tracker.allocated_block_ids_cpu)
+            print(
+                f"[SFA-PD-LEARN][⑨释放] SFAPDScheduler.request_finished: "
+                f"req={request.request_id} freed_cpu_blocks={n_cpu} "
+                f"ids={tracker.allocated_block_ids_cpu} "
+                f"（正常结束或 preempt）"
+            )
         return False, None
 
     # ------------------------------------------------------------------

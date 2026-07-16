@@ -576,6 +576,17 @@ class BaseDeviceAdaptor:
             indexer_cache_idx = 2
             indexer_scale_cache_idx = 3
 
+        if use_offload:
+            n = getattr(BaseDeviceAdaptor.indexer_select_post_process, "_learn_n", 0)
+            if n < 3:
+                BaseDeviceAdaptor.indexer_select_post_process._learn_n = n + 1  # type: ignore[attr-defined]
+                print(
+                    f"[SFA-PD-LEARN][⑧indexer] indexer_select_post_process: "
+                    f"use_offload=True kv_len={len(kv_cache)} "
+                    f"indexer_idx={indexer_cache_idx} scale_idx={indexer_scale_cache_idx} "
+                    f"（5/6-tuple：main≠indexer 下标；#{n + 1}/3）"
+                )
+
         if use_sparse_c8_indexer:
             # NOTE: use_sparse_c8_indexer is a global flag. Under offload the
             # per-layer C8 layout (six-tuple) is enforced uniform across all
@@ -1770,6 +1781,17 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         else:
             indexer_cache_idx = 2
             indexer_scale_cache_idx = 3
+
+        if use_offload:
+            n = getattr(A5DeviceAdaptor.indexer_select_post_process, "_learn_n", 0)
+            if n < 3:
+                A5DeviceAdaptor.indexer_select_post_process._learn_n = n + 1  # type: ignore[attr-defined]
+                print(
+                    f"[SFA-PD-LEARN][⑧indexer] A5.indexer_select_post_process: "
+                    f"use_offload=True kv_len={len(kv_cache)} "
+                    f"indexer_idx={indexer_cache_idx} scale_idx={indexer_scale_cache_idx} "
+                    f"（#{n + 1}/3）"
+                )
 
         if use_sparse_c8_indexer:
             # NOTE: use_sparse_c8_indexer is a global flag. Under offload the

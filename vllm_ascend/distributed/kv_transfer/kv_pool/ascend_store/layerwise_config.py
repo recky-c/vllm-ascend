@@ -54,6 +54,12 @@ def get_gva_layerwise_config(kv_transfer_config: Any) -> dict[str, Any] | None:
         extra_config = connector_config.get("kv_connector_extra_config") or {}
         backend = str(extra_config.get("backend", "mooncake")).lower()
         if backend == "memcache" and extra_config.get("use_layerwise", False):
+            print(
+                f"[SFA-PD-LEARN][②GVA配置] get_gva_layerwise_config: 命中 "
+                f"parent={connector_name} backend=memcache use_layerwise=True "
+                f"M=layerwise_num_shared_buffers="
+                f"{extra_config.get('layerwise_num_shared_buffers')}"
+            )
             return extra_config
     return None
 
@@ -157,13 +163,21 @@ def get_layerwise_config(
         for next_index in range(num_shared_buffers, len(reused_layers)):
             prefetch_layer_map[reused_layers[next_index]] = reused_layers[next_index - num_shared_buffers]
 
-    return LayerwiseConfig(
+    cfg = LayerwiseConfig(
         num_shared_buffers=num_shared_buffers,
         num_prefetch_layers=num_prefetch_layers,
         independent_layers=independent_layers,
         prefetch_layer_map=prefetch_layer_map,
         has_layer_reuse=has_layer_reuse,
     )
+    print(
+        f"[SFA-PD-LEARN][②GVA配置] get_layerwise_config: "
+        f"N={num_layers} M={num_shared_buffers} "
+        f"independent={independent_layers} reused={reused_layers} "
+        f"has_layer_reuse={has_layer_reuse} "
+        f"prefetch_layer_map={dict(prefetch_layer_map)}"
+    )
+    return cfg
 
 
 def get_layerwise_kv_cache_reuse_layers(
@@ -191,7 +205,14 @@ def get_layerwise_kv_cache_num_tensors(
     config = get_layerwise_config(num_layers, extra_config)
     if not config.has_layer_reuse:
         return None
-    return len(config.independent_layers) + config.num_shared_buffers
+    num_tensors = len(config.independent_layers) + config.num_shared_buffers
+    print(
+        f"[SFA-PD-LEARN][②虚增分母] get_layerwise_kv_cache_num_tensors: "
+        f"N={num_layers} → num_tensors={num_tensors} "
+        f"(= independent {len(config.independent_layers)} + M={config.num_shared_buffers}); "
+        f"inflate_factor≈{num_layers / num_tensors:.2f}x"
+    )
+    return num_tensors
 
 
 def get_layerwise_storage_indices(
@@ -215,6 +236,10 @@ def get_layerwise_storage_indices(
         members = list(range(slot, len(reused_layers), config.num_shared_buffers))
         if members:
             storage_indices.append([reused_layers[m] for m in members])
+    print(
+        f"[SFA-PD-LEARN][②槽合并] get_layerwise_storage_indices: "
+        f"N={num_layers} → {len(storage_indices)} slots {storage_indices}"
+    )
     return storage_indices
 
 

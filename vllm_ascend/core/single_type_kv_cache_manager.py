@@ -316,6 +316,12 @@ class OffloadMLAAttentionManager(FullAttentionManager):
         # to N = null-prefix length at admission, advances by 1 per free).
         self.req_is_remote_prefilled: set[str] = set()
         self.req_to_real_free_cursor: defaultdict[str, int] = defaultdict(int)
+        print(
+            f"[SFA-PD-LEARN][④Manager] OffloadMLAAttentionManager.__init__: "
+            f"block_size={kv_cache_spec.block_size} "
+            f"page_size_bytes={kv_cache_spec.page_size_bytes} "
+            f"（支持 remote-prefill null-pad + decode 原地 free）"
+        )
 
     def free(self, request_id: str) -> None:
         """Override: drop the per-req offload bookkeeping the base free() does
@@ -418,6 +424,14 @@ class OffloadMLAAttentionManager(FullAttentionManager):
             0,
         )
 
+        if num_external_blocks > 0:
+            print(
+                f"[SFA-PD-LEARN][④分配] get_num_blocks_to_allocate: "
+                f"req={request_id} external_blocks={num_external_blocks} "
+                f"required={num_required_blocks} → new_hbm={num_new_blocks} "
+                f"（远程前缀不占 HBM，只为 resident 尾部预留）"
+            )
+
         # Among the `new_computed_blocks`, the first `num_skipped_blocks` worth
         # of blocks are skipped; `num_req_blocks` of those may already be in
         # `req_to_blocks`, so only skip the remainder from `new_computed_blocks`.
@@ -497,6 +511,14 @@ class OffloadMLAAttentionManager(FullAttentionManager):
             # can cross-check manager null-pad width vs kernel mask width.
             self.req_is_remote_prefilled.add(request_id)
             num_external_blocks = num_external_computed_tokens // self.block_size
+            print(
+                f"[SFA-PD-LEARN][④null-pad] allocate_new_computed_blocks: "
+                f"req={request_id} null_pad={num_external_blocks} blocks "
+                f"(external_tokens={num_external_computed_tokens} "
+                f"// block_size={self.block_size}); "
+                f"free_cursor={num_external_blocks} "
+                f"不变量: null-pad宽 == num_full == num_offloaded_blocks"
+            )
             logger.info(
                 "OffloadMLA null-pad req %s: %d external blocks (block_size=%d, "
                 "external_tokens=%d)",
@@ -593,6 +615,13 @@ class OffloadMLAAttentionManager(FullAttentionManager):
                 to_free_blocks.append(to_free_block)
         if to_free_blocks:
             self.block_pool.free_blocks(to_free_blocks)
+            print(
+                f"[SFA-PD-LEARN][⑦free] allocate_new_blocks: "
+                f"req={request_id} remote_prefilled={is_remote_prefilled} "
+                f"freed={len(to_free_blocks)} "
+                f"ids={[b.block_id for b in to_free_blocks]} "
+                f"{'（卸完后原地换 null，不 pop；HBM 还池）' if is_remote_prefilled else '（pop 队头还池）'}"
+            )
             logger.info(f'>>>>> kv cache manager, req {request_id} free {len(to_free_blocks)} offloaded blocks: {[block.block_id for block in to_free_blocks]}')
 
         # allocate new blocks. PD remote-prefilled: freed decode blocks stay in
@@ -612,6 +641,14 @@ class OffloadMLAAttentionManager(FullAttentionManager):
             return []
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            print(
+                f"[SFA-PD-LEARN][⑦分配] allocate_new_blocks: "
+                f"req={request_id} new_hbm={num_new_blocks} "
+                f"ids={[b.block_id for b in new_blocks]} "
+                f"row_len_after={len(req_blocks) + num_new_blocks} "
+                f"required={num_required_blocks} "
+                f"{'（decode 续写 HBM 尾；前缀仍是 null）' if is_remote_prefilled else ''}"
+            )
             req_blocks.extend(new_blocks)
             return new_blocks
 

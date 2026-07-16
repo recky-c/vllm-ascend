@@ -40,6 +40,9 @@ class MemcacheBackend(Backend):
         self._store_init_lock = threading.Lock()
         self._registered_buffers: tuple[list[int], list[int]] | None = None
         self._buffers_registered = False
+        # Learning prints: only first few put/get to avoid prefill spam.
+        self._learn_put_prints_left = 3
+        self._learn_get_prints_left = 3
 
         if not self._lazy_init:
             self.store = self._setup_store()
@@ -153,6 +156,13 @@ class MemcacheBackend(Backend):
             logger.debug("Failed to get key details. keys=%s", key)
             return
         assert self.store is not None
+        if self._learn_get_prints_left > 0:
+            self._learn_get_prints_left -= 1
+            print(
+                f"[SFA-PD-LEARN][②拷贝] MemcacheBackend.get COPY_G2L "
+                f"(GVA/DRAM→HBM): n_keys={len(key)} "
+                f"remaining_learn_prints={self._learn_get_prints_left}"
+            )
         try:
             res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
             failed_codes = [int(value) for value in res if value != 0]
@@ -185,6 +195,13 @@ class MemcacheBackend(Backend):
         try:
             self._ensure_initialized()
             assert self.store is not None
+            if self._learn_put_prints_left > 0:
+                self._learn_put_prints_left -= 1
+                print(
+                    f"[SFA-PD-LEARN][②拷贝] MemcacheBackend.put COPY_L2G "
+                    f"(HBM→GVA/DRAM): n_keys={len(key)} "
+                    f"remaining_learn_prints={self._learn_put_prints_left}"
+                )
             res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)

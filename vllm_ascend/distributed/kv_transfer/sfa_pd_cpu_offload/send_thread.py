@@ -136,6 +136,11 @@ class MembPullSendingThread(threading.Thread):
         elif send_task.wait_event is not None:
             send_task.wait_event.synchronize()
         layer_name = send_task.layer_name
+        print(
+            f"[SFA-PD-LEARN][③协议] send_thread._process_send_task: "
+            f"layer={layer_idx}({layer_name}) NPU sync done, "
+            f"n_reqs={len(send_task.send_request)}"
+        )
 
         read_reqs: list[tuple[str, list[int]]] = []
         done_ext_ids: list[str] = []
@@ -181,6 +186,12 @@ class MembPullSendingThread(threading.Thread):
             if not self._mf_meta_sent:
                 self._send_mf_meta(dealer, encoder)
             dealer.send(encoder.encode((READ_READY_BATCH, layer_idx, layer_name, read_reqs, done_ext_ids)))
+            print(
+                f"[SFA-PD-LEARN][③协议] 发送 READ_READY_BATCH: "
+                f"layer={layer_idx}({layer_name}) "
+                f"read_reqs={len(read_reqs)} done_reqs={len(done_ext_ids)} "
+                f"→ D@{remote_host}:{remote_port}"
+            )
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
                     "MembPull P send READ_READY_BATCH: layer=%d (%s), reqs=%d, done_reqs=%d",
@@ -200,6 +211,11 @@ class MembPullSendingThread(threading.Thread):
                 "block_len": list(meta.block_len),
                 "block_size_scale": list(meta.block_size_scale),
             }
+        print(
+            f"[SFA-PD-LEARN][③协议] 发送 MF_META: "
+            f"session={self._state.p_session} layers={len(p_meta_dict)} "
+            f"（一次会话交换 P 各层基址/block_len）"
+        )
         dealer.send(encoder.encode((MF_META, self._state.p_session, encoder.encode(p_meta_dict))))
         if dealer.poll(timeout=int(self.timeout * 1000)):
             frames = dealer.recv_multipart()
@@ -207,6 +223,7 @@ class MembPullSendingThread(threading.Thread):
             if payload != [b"ACK"]:
                 raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")
             self._mf_meta_sent = True
+            print("[SFA-PD-LEARN][③协议] MF_META ACK 已收到")
             logger.info(
                 "MembPull P sent MF_META: session=%s, layers=%d",
                 self._state.p_session,
@@ -232,10 +249,18 @@ class MembPullSendingThread(threading.Thread):
                 except Exception:
                     continue
                 if len(msg) >= 2 and msg[0] == READ_DONE:
+                    print(
+                        f"[SFA-PD-LEARN][③协议] 收到 READ_DONE: layer={msg[1]} "
+                        f"→ _signal_layer_done（mate 门控可放行）"
+                    )
                     self._signal_layer_done(msg[1])
                 elif len(msg) >= 2 and msg[0] == READ_FAILED:
                     layer_idx = msg[1]
                     error = msg[2] if len(msg) > 2 else ""
+                    print(
+                        f"[SFA-PD-LEARN][③协议] 收到 READ_FAILED: "
+                        f"layer={layer_idx} error={error}"
+                    )
                     logger.error(
                         "MembPull P received READ_FAILED: layer=%s, error=%s",
                         layer_idx,
@@ -252,5 +277,9 @@ class MembPullSendingThread(threading.Thread):
             self.layer_transfer_finished_events[layer_idx].set()
         if self.layer_transfer_pending_events is not None and 0 <= layer_idx < len(self.layer_transfer_pending_events):
             self.layer_transfer_pending_events[layer_idx].clear()
+        print(
+            f"[SFA-PD-LEARN][③协议] _signal_layer_done: layer={layer_idx} "
+            f"（layer_send_done_events.set）"
+        )
         if envs.VLLM_ASCEND_SFA_DEBUG:
             logger.info("MembPull P layer send complete: layer=%d", layer_idx)

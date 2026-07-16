@@ -25,10 +25,19 @@ if TYPE_CHECKING:
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole, kv_cache_config: "KVCacheConfig"):
+        print(
+            f"[SFA-PD-LEARN][①Multi] AscendMultiConnector.__init__ "
+            f"role={role} kv_role={getattr(vllm_config.kv_transfer_config, 'kv_role', None)}"
+        )
         super().__init__(
             vllm_config=vllm_config,
             role=role,
             kv_cache_config=kv_cache_config,
+        )
+        sub_names = [type(c).__name__ for c in self._connectors]
+        print(
+            f"[SFA-PD-LEARN][①Multi] 子 connector 组合完成: {sub_names} "
+            f"（期望含 SFAPDCpuOffloadConnector + AscendStoreConnector）"
         )
 
         self._all_support_hma = all(supports_hma(c) for c in self._connectors)
@@ -42,14 +51,31 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
         extra_config = get_gva_layerwise_config(kv_transfer_config)
         if extra_config is None or len(kv_cache_config.kv_cache_groups) != 1:
+            print(
+                "[SFA-PD-LEARN][①Multi] _configure_gva_layerwise_reuse: "
+                f"跳过（extra_config={extra_config is not None}, "
+                f"kv_cache_groups={len(kv_cache_config.kv_cache_groups)}）"
+            )
             return
         num_layers = len(kv_cache_config.kv_cache_groups[0].layer_names)
         layerwise_config = get_layerwise_config(num_layers, extra_config)
         if not layerwise_config.has_layer_reuse:
+            print(
+                f"[SFA-PD-LEARN][①Multi] _configure_gva_layerwise_reuse: "
+                f"无层复用（num_layers={num_layers}, has_layer_reuse=False）"
+            )
             return
+        print(
+            f"[SFA-PD-LEARN][①Multi] 注入 GVA mate map → SFAPD.set_gva_layerwise_reuse_plan: "
+            f"num_layers={num_layers}, prefetch_layer_map={dict(layerwise_config.prefetch_layer_map)}"
+        )
         for connector in self._connectors:
             set_reuse_plan = getattr(connector, "set_gva_layerwise_reuse_plan", None)
             if set_reuse_plan is not None:
+                print(
+                    f"[SFA-PD-LEARN][①Multi] → 调用 {type(connector).__name__}"
+                    f".set_gva_layerwise_reuse_plan"
+                )
                 set_reuse_plan(layerwise_config.prefetch_layer_map)
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):

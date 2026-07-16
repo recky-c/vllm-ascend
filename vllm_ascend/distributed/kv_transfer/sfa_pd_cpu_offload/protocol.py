@@ -12,6 +12,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 GET_META_MSG = b"get_meta_msg"
+# Wire opcodes (学习对照):
+#   MF_META          — 会话首包：P 各层 HBM 基址 / block_len
+#   READ_READY_BATCH — 某层 KV 写完，D 可 pull
+#   READ_DONE        — D 拉完该层；P 复用共享槽前必须看到 mate 的 DONE
+#   READ_FAILED      — D 拉失败（仍会放行 P 侧 done event，避免死锁）
 MF_META = b"mf_meta"
 READ_READY_BATCH = b"read_ready_batch"
 READ_DONE = b"read_done"

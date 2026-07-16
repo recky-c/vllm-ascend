@@ -44,6 +44,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout 
     OFFLOAD_RESIDENT_K,
     OFFLOAD_RESIDENT_V,
     OFFLOAD_TUPLE_LEN,
+    describe_offload_tuple_layout,
     is_offload_c8_kv_cache,
 )
 
@@ -293,6 +294,12 @@ class SFAKVOffloadWorker:
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
 
+        sample_tuple = self._as_cache_tuple(kv_caches[self.offload_layer_names[0]])
+        print(
+            f"[SFA-PD-LEARN][⑤SFA] _register_offload_layers: "
+            f"n_layers={self.num_layers} "
+            f"{describe_offload_tuple_layout(len(sample_tuple))}"
+        )
         logger.info(
             "SFA KV offload registered %s layers (%s target layers).",
             self.num_layers,
@@ -317,6 +324,12 @@ class SFAKVOffloadWorker:
         return layer_id
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        print(
+            f"[SFA-PD-LEARN][⑤SFA] SFAKVOffloadWorker.register_kv_caches: "
+            f"tp_rank={self.tp_rank} use_offload={self.use_offload} "
+            f"use_sparse={self.use_sparse} use_layerwise={self.use_layerwise} "
+            f"input_layers={len(kv_caches)}"
+        )
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
         first_kv_cache = first_kv_cache_tuple[0]
@@ -370,6 +383,14 @@ class SFAKVOffloadWorker:
                             f"LIC8 scale tensor must not alias resident buffer: {layer_name}"
                         )
 
+            print(
+                f"[SFA-PD-LEARN][⑤SFA] 已绑定 HBM 槽位: "
+                f"main_k/v={len(self.k_caches_npu)} "
+                f"resident_k/v={len(self.topk_buffers_k)} "
+                f"main_k_shape={tuple(self.k_caches_npu[0].shape) if self.k_caches_npu else None} "
+                f"resident_shape={tuple(self.topk_buffers_k[0].shape) if self.topk_buffers_k else None}"
+            )
+
             if self.use_layerwise:
                 ready_event = threading.Event()
                 self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
@@ -382,6 +403,11 @@ class SFAKVOffloadWorker:
                 )
                 self.kv_send_thread.start()
                 ready_event.wait()
+                print(
+                    f"[SFA-PD-LEARN][⑤SFA] KVCacheStoreLayerSendingThread ready: "
+                    f"num_layers={self.num_layers} "
+                    f"（D decode 满块 HBM→CPU 异步卸）"
+                )
             else:
                 raise ValueError("SFA KV Offload only support layerwise now.")
 
@@ -393,6 +419,13 @@ class SFAKVOffloadWorker:
                 cpu_block_num_multiple = 4
                 cpu_block_num = npu_block_num * cpu_block_num_multiple
                 cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
+                print(
+                    f"[SFA-PD-LEARN][⑤SFA] TP0 分配 pinned CPU 池: "
+                    f"npu_blocks={npu_block_num} ×{cpu_block_num_multiple} "
+                    f"→ cpu_blocks={cpu_block_num} "
+                    f"size≈{cpu_cache_size / 1024 / 1024 / 1024:.2f} GiB "
+                    f"(K=512+V=64 bf16, layers={self.num_layers})"
+                )
                 logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
                 if cpu_cache_size > self.allocate_dram_size:
                     raise ValueError(
@@ -408,9 +441,25 @@ class SFAKVOffloadWorker:
                     self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
                     for _ in range(self.num_layers)
                 ]
+                print(
+                    f"[SFA-PD-LEARN][⑤SFA] pinned CPU 分配完成: "
+                    f"k_shape={tuple(self.k_caches_cpu[0].shape)} "
+                    f"v_shape={tuple(self.v_caches_cpu[0].shape)}"
+                )
+            else:
+                print(
+                    f"[SFA-PD-LEARN][⑤SFA] tp_rank={self.tp_rank} 跳过 CPU 池分配 "
+                    f"（共享 TP0 pinned 池；本 rank 只收 indexer/partial→HBM）"
+                )
 
             # topk cache reuse related
             self.lru_workspace_threads = 8
+            print(
+                f"[SFA-PD-LEARN][⑤SFA] 开始分配 LRU resident 工作区: "
+                f"capacity={self.lru_resident_capacity} "
+                f"topk={self.sfa_sparse_topk} "
+                f"max_rows={self.max_num_topk_rows}"
+            )
             self.lru_topk_indices_cpu = torch.empty(
                 [self.max_num_topk_rows, self.sfa_sparse_topk],
                 dtype=torch.int32,
@@ -563,6 +612,13 @@ class SFAKVOffloadWorker:
             assert self.addr_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_npu.shape == torch.Size([1])
+            print(
+                f"[SFA-PD-LEARN][⑤SFA] register_kv_caches 完成: "
+                f"tp_rank={self.tp_rank} layers={self.num_layers} "
+                f"has_cpu_pool={hasattr(self, 'k_caches_cpu')} "
+                f"LRU+sparse_copy args 已就绪 "
+                f"（供 PD pull 落点 + decode sparse 回灌）"
+            )
 
     def start_load_kv(self, metadata: SFAKVOffloadConnectorMetadata):
         # return
@@ -575,14 +631,23 @@ class SFAKVOffloadWorker:
         self.submitted_save_layer_ids.clear()
         for event in getattr(self, "layer_save_finished_events", []):
             event.clear()
+        n_b1 = 0
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
             if self.tp_rank > 0 or request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
+            n_b1 += 1
             self.process_layer_data(request)
         num_save_layers = sum(1 for layer_save_task in self.layer_save_tasks if layer_save_task)
         self.num_save_tasks = sum(len(layer_save_task) for layer_save_task in self.layer_save_tasks)
         if self.tp_rank == 0:
+            if n_b1 or self.num_save_tasks:
+                print(
+                    f"[SFA-PD-LEARN][⑦组任务] SFA.start_load_kv: "
+                    f"n_reqs={len(metadata.requests)} n_B1={n_b1} "
+                    f"save_layers={num_save_layers} save_tasks={self.num_save_tasks} "
+                    f"（每层×每 B1-req 一条 LayerMultiBlockReqMeta）"
+                )
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
                     f'>>>>> start load kv, reqs num: {len(metadata.requests)}, '
@@ -613,6 +678,12 @@ class SFAKVOffloadWorker:
         if layer_id in self.submitted_save_layer_ids:
             return
         assert self.kv_send_thread is not None
+        n_tasks = len(self.layer_save_tasks[layer_id])
+        print(
+            f"[SFA-PD-LEARN][⑦提交] save_cpu: layer_id={layer_id} "
+            f"n_tasks={n_tasks} → kv_send_thread "
+            f"（异步 HBM→CPU）"
+        )
         self.pending_save_layer_ids.add(layer_id)
         self.submitted_save_layer_ids.add(layer_id)
         self.kv_send_thread.add_request(list(self.layer_save_tasks[layer_id]))
@@ -627,6 +698,11 @@ class SFAKVOffloadWorker:
         if not self.pending_save_layer_ids:
             # no save tasks, no need to wait
             return
+        print(
+            f"[SFA-PD-LEARN][⑦等待] wait_for_save: "
+            f"pending_layers={sorted(self.pending_save_layer_ids)} "
+            f"（等 SendingThread 各层 synchronize）"
+        )
         for layer_id in sorted(self.pending_save_layer_ids):
             event = self.layer_save_finished_events[layer_id]
             # Block until the HBM->CPU copy for this layer has actually landed
@@ -639,6 +715,10 @@ class SFAKVOffloadWorker:
                     layer_id,
                 )
             event.clear()
+        print(
+            f"[SFA-PD-LEARN][⑦等待] wait_for_save 完成: "
+            f"cleared {len(self.pending_save_layer_ids)} layers"
+        )
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
  
@@ -723,6 +803,14 @@ class SFAKVOffloadWorker:
         )
 
         if not do_offload and layer_id == 0 and self.tp_rank == 0:
+            n = getattr(self, "_learn_8_load_n", 0)
+            if n < 3:
+                self._learn_8_load_n = n + 1
+                print(
+                    f"[SFA-PD-LEARN][⑧LRU] compact+addrs: layer={layer_id} "
+                    f"num_tokens_to_load={num_tokens_to_load} "
+                    f"（miss → sparse_copy CPU→topk_buffer；#{n + 1}/3）"
+                )
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(f'>>>>> load_kv_token_wise, num_tokens_to_load={num_tokens_to_load}')
 
@@ -748,6 +836,15 @@ class SFAKVOffloadWorker:
             raise ValueError(
                 "SFA offload topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
+            )
+        n = getattr(self, "_learn_8_prep_n", 0)
+        if n < 3 and layer_id == 0 and self.tp_rank == 0:
+            self._learn_8_prep_n = n + 1
+            print(
+                f"[SFA-PD-LEARN][⑧LRU] prepare_lru_resident_and_load: "
+                f"layer={layer_name}(id={layer_id}) tokens={num_tokens} "
+                f"reqs={num_reqs} capturing={capturing} "
+                f"→ compact → compute_addrs → sparse_copy H2D （#{n + 1}/3）"
             )
         cpu_block_table_reqs = self.cpu_block_table_host_buffer[:num_reqs]
         cpu_block_table_reqs.copy_(self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing)
@@ -817,6 +914,14 @@ class SFAKVOffloadWorker:
             self.prepare_lru_resident_and_load_cpu(args)
 
         self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=capturing)
+        n_sc = getattr(self, "_learn_8_sparse_n", 0)
+        if n_sc < 3 and layer_id == 0 and self.tp_rank == 0:
+            self._learn_8_sparse_n = n_sc + 1
+            print(
+                f"[SFA-PD-LEARN][⑧sparse_copy] offload.sparse_copy: "
+                f"layer={layer_id} → topk_buffers HBM "
+                f"（CPU pool miss token 回灌；#{n_sc + 1}/3）"
+            )
         offload.sparse_copy(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
@@ -844,6 +949,12 @@ class SFAKVOffloadWorker:
         block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
         block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
 
+        print(
+            f"[SFA-PD-LEARN][⑦组任务] process_layer_data: "
+            f"req={request.req_id} n_blocks={num_new_offload_blocks} "
+            f"hbm={block_ids_npu} → cpu={block_ids_cpu} "
+            f"×{self.num_layers} layers"
+        )
         for layer_id in range(self.num_layers):
             req_meta_save = LayerMultiBlockReqMeta(
                 request.req_id,

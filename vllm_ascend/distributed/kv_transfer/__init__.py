@@ -20,8 +20,16 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
 def register_connector():
     # override multi_connector as ascend_multi_connector
+    print(
+        "[SFA-PD-LEARN][①注册] register_connector() 开始："
+        "向 KVConnectorFactory 注册 Ascend 侧全部 connector"
+    )
     if "MultiConnector" in KVConnectorFactory._registry:
         KVConnectorFactory._registry.pop("MultiConnector")
+        print(
+            "[SFA-PD-LEARN][①注册] 覆盖上游 MultiConnector → "
+            "AscendMultiConnector（PD 方案固定外壳）"
+        )
     KVConnectorFactory.register_connector(
         "MultiConnector", "vllm_ascend.distributed.kv_transfer.ascend_multi_connector", "AscendMultiConnector"
     )
@@ -96,4 +104,9 @@ def register_connector():
         "SFAPDCpuOffloadConnector",
         "vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector",
         "SFAPDCpuOffloadConnector",
+    )
+    print(
+        "[SFA-PD-LEARN][①注册] 已注册 SFAPDCpuOffloadConnector "
+        f"+ MultiConnector/AscendStore 等；当前 registry keys="
+        f"{sorted(KVConnectorFactory._registry.keys())}"
     )

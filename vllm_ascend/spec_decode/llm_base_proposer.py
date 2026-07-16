@@ -251,6 +251,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
             for _ in range(self.num_speculative_tokens)
         ] if self.runner.use_offload else []
+        if self.runner.use_offload:
+            print(
+                f"[SFA-PD-LEARN][⑨MTP] proposer 初始化 indexer_slot_mapping_group: "
+                f"n_spec={self.num_speculative_tokens} "
+                f"slot_lens={slot_mapping_lens} "
+                f"（draft 图捕获 / 步进需独立 indexer slot）"
+            )
 
         # dsv32 needs seq_lens and query_start_loc persistent tensors for full graph mode
         self.seq_lens_group = [
@@ -579,6 +586,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.runner.token_to_req.np[:num_tokens] = token_to_req
         self.runner.token_to_req.copy_to_gpu(num_tokens)
 
+        n = getattr(self, "_learn_9_dummy_n", 0)
+        if n < 3:
+            self._learn_9_dummy_n = n + 1
+            print(
+                f"[SFA-PD-LEARN][⑨MTP] _prepare_dummy_offload_metadata: "
+                f"tokens={num_tokens} reqs={num_reqs} "
+                f"num_offloaded_blocks=全0（graph capture 铺零） "
+                f"token_to_req_len={len(token_to_req)} "
+                f"+ indexer block_table/slot （#{n + 1}/3）"
+            )
+
         return self._get_dummy_block_table_and_slot_mapping(0, num_reqs)
 
     def _get_indexer_slot_mapping_for_positions(
@@ -688,6 +706,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_attn_metadata.req_ids_tensor = self.runner.req_ids_tensor.gpu[:num_reqs]
                 common_attn_metadata.token_to_req = self.runner.token_to_req.gpu[:num_tokens]
                 common_attn_metadata.tokens_per_req = self.runner.tokens_per_req.gpu[:num_reqs]
+                n = getattr(self, "_learn_9_dummy_run_n", 0)
+                if n < 3:
+                    self._learn_9_dummy_run_n = n + 1
+                    print(
+                        f"[SFA-PD-LEARN][⑨MTP] dummy_run 挂载 offload 字段: "
+                        f"reqs={num_reqs} tokens={num_tokens} "
+                        f"has_indexer_table={indexer_block_table_tensor is not None} "
+                        f"has_indexer_slot={indexer_slot_mapping is not None} "
+                        f"n_spec_steps={self.num_speculative_tokens} （#{n + 1}/3）"
+                    )
             if self.pcp_size * self.dcp_size > 1:
                 # update long_seq related params and flatten block_table
                 common_attn_metadata.prefill_context_parallel_metadata = self.runner.pcp_manager.long_seq_metadata
@@ -718,6 +746,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     self.indexer_slot_mapping_group[draft_index][:indexer_slot_mapping_lens].copy_(indexer_slot_mapping)
                     self.indexer_slot_mapping_group[draft_index][indexer_slot_mapping_lens:].fill_(-1)
                     common_attn_metadata.indexer_slot_mapping = self.indexer_slot_mapping_group[draft_index]
+                    if draft_index == 0:
+                        n = getattr(self, "_learn_9_slot_n", 0)
+                        if n < 3:
+                            self._learn_9_slot_n = n + 1
+                            print(
+                                f"[SFA-PD-LEARN][⑨MTP] dummy_run 填 indexer_slot_mapping_group"
+                                f"[draft={draft_index}]: lens={indexer_slot_mapping_lens} "
+                                f"（#{n + 1}/3）"
+                            )
                 common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][:num_reqs]
                 self.query_start_loc_group[draft_index][: num_reqs + 1].copy_(common_attn_metadata.query_start_loc)
                 self.query_start_loc_group[draft_index][num_reqs + 1 :].fill_(0)
@@ -2074,6 +2111,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if common_attn_metadata.token_to_req is not None:
             token_to_req = common_attn_metadata.token_to_req[token_indices]
 
+        if self.runner.use_offload and common_attn_metadata.num_offloaded_blocks is not None:
+            n = getattr(self, "_learn_9_prep_n", 0)
+            if n < 3:
+                self._learn_9_prep_n = n + 1
+                print(
+                    f"[SFA-PD-LEARN][⑨MTP] prepare_inputs(拒稿裁剪): "
+                    f"reqs={common_attn_metadata.num_reqs} "
+                    f"tokens_after={total_num_tokens} "
+                    f"has_num_offloaded={True} "
+                    f"has_token_to_req={token_to_req is not None} "
+                    f"has_indexer_slot={common_attn_metadata.indexer_slot_mapping is not None} "
+                    f"（传播 offload 字段到 draft；#{n + 1}/3）"
+                )
+
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
         # we should fixed them.
@@ -2211,6 +2262,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             tokens_per_req=common_attn_metadata.tokens_per_req,
             max_seq_len=0,
         )
+
+        if self.runner.use_offload and common_attn_metadata.num_offloaded_blocks is not None:
+            n = getattr(self, "_learn_9_pad_n", 0)
+            if n < 3:
+                self._learn_9_pad_n = n + 1
+                print(
+                    f"[SFA-PD-LEARN][⑨MTP] prepare_inputs_padded: "
+                    f"reqs={common_attn_metadata.num_reqs} "
+                    f"has_num_offloaded={True} "
+                    f"has_token_to_req={common_attn_metadata.token_to_req is not None} "
+                    f"has_indexer_slot={common_attn_metadata.indexer_slot_mapping is not None} "
+                    f"（padded draft 同步携带 offload 字段；#{n + 1}/3）"
+                )
 
         return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu
 

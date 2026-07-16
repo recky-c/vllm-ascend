@@ -115,6 +115,12 @@ class MembPullReadThread(threading.Thread):
                     if msg_type == MF_META:
                         self._p_session = msg[1]
                         self._p_layer_meta = msgspec.msgpack.decode(msg[2])
+                        print(
+                            f"[SFA-PD-LEARN][⑥收包] MembPull 收到 MF_META: "
+                            f"p_session={self._p_session} "
+                            f"layers={len(self._p_layer_meta)} "
+                            f"→ ACK（一次会话交换 P 各层基址）"
+                        )
                         logger.info(
                             "Received MF_META: P session=%s, %d layers", self._p_session, len(self._p_layer_meta)
                         )
@@ -135,6 +141,12 @@ class MembPullReadThread(threading.Thread):
                         layer_name = msg[2]
                         read_reqs = [(entry[0], list(entry[1])) for entry in msg[3]]
                         done_ext_ids = list(msg[4]) if len(msg) > 4 else []
+                        print(
+                            f"[SFA-PD-LEARN][⑥收包] READ_READY_BATCH: "
+                            f"layer={layer_idx}({layer_name}) "
+                            f"n_reqs={len(read_reqs)} done_reqs={len(done_ext_ids)} "
+                            f"→ _do_read_batch → READ_DONE"
+                        )
                         if envs.VLLM_ASCEND_SFA_DEBUG:
                             logger.info(
                                 "MembPull D recv READ_READY_BATCH: layer=%d (%s), reqs=%d, done_reqs=%d",
@@ -147,6 +159,11 @@ class MembPullReadThread(threading.Thread):
                             if read_reqs:
                                 self._do_read_batch(layer_name, read_reqs)
                             sock.send_multipart((identity, b"", encoder.encode((READ_DONE, layer_idx))))
+                            print(
+                                f"[SFA-PD-LEARN][⑥回包] 发送 READ_DONE: "
+                                f"layer={layer_idx}({layer_name}) "
+                                f"（P mate 门控可放行）"
+                            )
                             if envs.VLLM_ASCEND_SFA_DEBUG:
                                 logger.info(
                                     "MembPull D sent READ_DONE: layer=%d (%s), reqs=%d, done_reqs=%d",
@@ -163,11 +180,20 @@ class MembPullReadThread(threading.Thread):
                                 len(read_reqs),
                                 e,
                             )
+                            print(
+                                f"[SFA-PD-LEARN][⑥回包] 发送 READ_FAILED: "
+                                f"layer={layer_idx}({layer_name}) err={e}"
+                            )
                             payload = encoder.encode((READ_FAILED, layer_idx, str(e)))
                             sock.send_multipart((identity, b"", payload))
                         if done_ext_ids:
                             with self._lock:
                                 self._done_requests.update(done_ext_ids)
+                            print(
+                                f"[SFA-PD-LEARN][⑥完成] chunk_done 标记: "
+                                f"done_ext_ids={done_ext_ids} "
+                                f"（待 get_finished 映射为内部 req_id）"
+                            )
 
                     elif msg_type == GET_META_MSG:
                         meta_bytes = encoder.encode(
@@ -267,7 +293,7 @@ class MembPullReadThread(threading.Thread):
                         "scale_factor": d_scale_len // p_scale_len,
                     }
 
-        return {
+        result = {
             "layer_name": layer_name,
             "pool_idx": pool_idx,
             "offload_id": offload_id,
@@ -282,6 +308,16 @@ class MembPullReadThread(threading.Thread):
             "indexer": indexer,
             "scale": scale,
         }
+        print(
+            f"[SFA-PD-LEARN][⑥解析] _resolve_read_layer: {layer_name} "
+            f"offload_id={offload_id} "
+            f"cpu_dest={'yes' if k_cpu_ptr is not None else 'no'} "
+            f"hbm_partial={'yes' if k_hbm_ptr is not None else 'no'} "
+            f"indexer={'yes' if indexer is not None else 'no'} "
+            f"scale={'yes' if scale is not None and 'error' not in (scale or {}) else 'no'} "
+            f"p_k_len={p_block_len[0]} p_v_len={p_block_len[1]}"
+        )
+        return result
 
     def _build_req_descriptors(
         self,
@@ -442,6 +478,17 @@ class MembPullReadThread(threading.Thread):
         local_ptrs = np.concatenate(local_chunks).tolist()
         lengths = np.concatenate(length_chunks).tolist()
 
+        print(
+            f"[SFA-PD-LEARN][⑥描述符] _build_req_descriptors: "
+            f"layer={layer_name} req={ext_req_id} "
+            f"p_blocks={len(p_block_ids)} num_full={num_full} "
+            f"n_main_xfer={n_main} n_indexer_xfer={n_indexer} "
+            f"partial_hbm={partial_hbm_bid} "
+            f"coalesced_xfers={len(local_ptrs)} "
+            f"落点: 满块→CPU={'yes' if has_cpu_destination else 'no(非TP0)'} "
+            f"partial→HBM={'yes' if partial_hbm_bid is not None else 'no'}"
+        )
+
         info = None
         if want_info:
             info = {
@@ -516,8 +563,16 @@ class MembPullReadThread(threading.Thread):
         if self._p_session is None:
             raise RuntimeError("MF_META not received before READ_READY_BATCH")
 
+        print(
+            f"[SFA-PD-LEARN][⑥pull] _do_read_batch 开始: "
+            f"layer={layer_name} n_reqs={len(read_reqs)} "
+            f"p_session={self._p_session}"
+        )
         layer = self._resolve_read_layer(layer_name)
         if layer is None:
+            print(
+                f"[SFA-PD-LEARN][⑥pull] _resolve_read_layer 失败，跳过: {layer_name}"
+            )
             return
 
         want_info = bool(envs.VLLM_ASCEND_MF_VERIFY or envs.VLLM_ASCEND_SFA_DEBUG)
@@ -552,6 +607,10 @@ class MembPullReadThread(threading.Thread):
                 layer_name,
                 len(read_reqs),
             )
+            print(
+                f"[SFA-PD-LEARN][⑥pull] 无可传描述符，跳过 batch_transfer: "
+                f"layer={layer_name}"
+            )
             return
 
         if envs.VLLM_ASCEND_SFA_DEBUG:
@@ -565,8 +624,20 @@ class MembPullReadThread(threading.Thread):
                 len(all_local_ptrs),
                 atomic_total,
             )
+        total_bytes = sum(all_lengths)
+        print(
+            f"[SFA-PD-LEARN][⑥pull] batch_transfer_sync_read: "
+            f"layer={layer_name} n_xfers={len(all_local_ptrs)} "
+            f"total_bytes≈{total_bytes} "
+            f"peer=P_session={self._p_session} "
+            f"（local←peer：满块→CPU / indexer+partial→HBM）"
+        )
         ret = self.engine.batch_transfer_sync_read(self._p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
         if ret != 0:
             raise RuntimeError(f"memfabric batch read failed for layer {layer_name}, ret={ret}")
+        print(
+            f"[SFA-PD-LEARN][⑥pull] batch_transfer_sync_read OK: "
+            f"layer={layer_name} ret={ret}"
+        )
         for read_info in read_infos:
             self._log_read_result(read_info)

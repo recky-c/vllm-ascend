@@ -489,12 +489,29 @@ class OffloadMLAAttentionSpec(AttentionSpec):
             # handoff block per request for the must-fit check.
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             blocks_per_req = 2
-            return blocks_per_req * max_num_seqs * self.page_size_bytes
+            result = blocks_per_req * max_num_seqs * self.page_size_bytes
+            print(
+                f"[SFA-PD-LEARN][④Spec] OffloadMLAAttentionSpec.max_memory_usage_bytes "
+                f"D(kv_consumer): ~{blocks_per_req} blocks/req × max_num_seqs={max_num_seqs} "
+                f"× page={self.page_size_bytes} → {result} bytes "
+                f"（不按 max_model_len 估满表，避免假 OOM）"
+            )
+            return result
         # Producer (P) or local offload (kv_both) or no kv-transfer: the prefix
         # transits HBM during prefill before being offloaded, so the peak is the
         # full max_model_len.
         max_model_len = vllm_config.model_config.max_model_len
-        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        result = cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        print(
+            f"[SFA-PD-LEARN][④Spec] OffloadMLAAttentionSpec.max_memory_usage_bytes "
+            f"非D角色: max_model_len={max_model_len} block_size={self.block_size} "
+            f"→ {result} bytes"
+        )
+        return result
+
+
+_LEARN_OFFLOAD_MAIN_SPEC_PRINTED = False
+_LEARN_OFFLOAD_INDEXER_SPEC_PRINTED = False
 
 
 def make_offload_main_mla_spec(
@@ -514,6 +531,7 @@ def make_offload_main_mla_spec(
     When ``c8_unified_pool`` is set, page accounting uses the shared
     ``page_bytes_per_token`` path (same formula as both offload groups).
     """
+    global _LEARN_OFFLOAD_MAIN_SPEC_PRINTED
     page_bytes_per_token = None
     if c8_unified_pool:
         assert kv_lora_rank is not None and qk_rope_head_dim is not None
@@ -526,13 +544,22 @@ def make_offload_main_mla_spec(
             scale_dtype=scale_dtype,
         )
         page_bytes_per_token = layout.main_bytes_per_token
-    return OffloadMLAAttentionSpec(
+    spec = OffloadMLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         dtype=dtype,
         page_bytes_per_token=page_bytes_per_token,
     )
+    if not _LEARN_OFFLOAD_MAIN_SPEC_PRINTED:
+        _LEARN_OFFLOAD_MAIN_SPEC_PRINTED = True
+        print(
+            f"[SFA-PD-LEARN][④Spec] make_offload_main_mla_spec (首层样例): "
+            f"block_size={block_size} head_size={head_size} "
+            f"c8_unified={c8_unified_pool} page_bytes_per_token={page_bytes_per_token} "
+            f"→ OffloadMLAAttentionSpec（main MLA，D 侧可 null-pad）"
+        )
+    return spec
 
 
 def make_offload_indexer_mla_spec(
@@ -555,6 +582,7 @@ def make_offload_indexer_mla_spec(
     Non-C8 uses nominal ``head_size`` (index + pad) with bf16 page accounting.
     C8 unified pool sets ``page_bytes_per_token`` to the spec_1 byte-mix layout.
     """
+    global _LEARN_OFFLOAD_INDEXER_SPEC_PRINTED
     if indexer_pad_dim is None:
         assert kv_lora_rank is not None and qk_rope_head_dim is not None
         indexer_pad_dim = offload_indexer_pad_dim(
@@ -571,7 +599,7 @@ def make_offload_indexer_mla_spec(
         )
         cache_sparse_c8 = True
         scale_dim = indexer_pad_dim
-    return AscendMLAAttentionSpec(
+    spec = AscendMLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -582,9 +610,23 @@ def make_offload_indexer_mla_spec(
         cache_sparse_c8=cache_sparse_c8,
         page_bytes_per_token=page_bytes_per_token,
     )
+    if not _LEARN_OFFLOAD_INDEXER_SPEC_PRINTED:
+        _LEARN_OFFLOAD_INDEXER_SPEC_PRINTED = True
+        print(
+            f"[SFA-PD-LEARN][④Spec] make_offload_indexer_mla_spec (首层样例): "
+            f"block_size={block_size} head_size={head_size} "
+            f"index_head_dim={index_head_dim} pad={indexer_pad_dim} "
+            f"c8_unified={c8_unified_pool} → AscendMLAAttentionSpec（indexer 常驻 HBM）"
+        )
+    return spec
 
 
 def register_ascend_kv_cache_specs() -> None:
+    print(
+        "[SFA-PD-LEARN][④注册] register_ascend_kv_cache_specs: "
+        "OffloadMLAAttentionSpec → OffloadMLAAttentionManager "
+        "(+ AscendMLA / SlidingWindow)"
+    )
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendMLAAttentionSpec,
         manager_class=CompressAttentionManager,

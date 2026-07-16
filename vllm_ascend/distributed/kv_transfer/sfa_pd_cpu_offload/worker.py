@@ -168,8 +168,20 @@ class SFAPDCpuOffloadConsumerWorker:
         The sfa model runner hands a 5-tuple per layer:
         ``(k_nope, v_rope, dsa_k_indexer, topk_buf_k, topk_buf_v)``.
         """
+        sample = next(iter(kv_caches.values()), None)
+        sample_len = len(sample) if isinstance(sample, (list, tuple)) else 1
+        print(
+            f"[SFA-PD-LEARN][⑤组合] ConsumerWorker.register_kv_caches: "
+            f"tp_rank={self.tp_rank} layers={len(kv_caches)} "
+            f"sample_tuple_len={sample_len} "
+            f"→ 组合 SFAKVOffloadWorker + memfabric pull"
+        )
         # --- D side: compose the SFA worker for LRU load + CPU pool ---
         self.sfa_worker = SFAKVOffloadWorker(self.vllm_config, self.use_layerwise, self.kv_cache_config)
+        print(
+            "[SFA-PD-LEARN][⑤组合] 已创建 SFAKVOffloadWorker → "
+            "register_kv_caches（pinned CPU 池 + LRU resident）"
+        )
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
@@ -178,6 +190,11 @@ class SFAPDCpuOffloadConsumerWorker:
         # land in rank-local HBM.
         k_caches_cpu = getattr(self.sfa_worker, "k_caches_cpu", None)
         v_caches_cpu = getattr(self.sfa_worker, "v_caches_cpu", None)
+        print(
+            f"[SFA-PD-LEARN][⑤组合] SFA worker 返回: "
+            f"k_caches_cpu={'yes×'+str(len(k_caches_cpu)) if k_caches_cpu is not None else 'None(非TP0)'} "
+            f"v_caches_cpu={'yes×'+str(len(v_caches_cpu)) if v_caches_cpu is not None else 'None(非TP0)'}"
+        )
 
         # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
         # last block lands here instead of the CPU pool. Keyed by main layer name
@@ -185,6 +202,11 @@ class SFAPDCpuOffloadConsumerWorker:
         self._hbm_kv = {
             n: (t[0], t[1]) for n, t in kv_caches.items() if isinstance(t, (list, tuple)) and len(t) in (5, 6)
         }
+        print(
+            f"[SFA-PD-LEARN][⑤组合] _hbm_kv partial 落点: "
+            f"n_main_layers={len(self._hbm_kv)} "
+            f"（满块→CPU；不满块→本 HBM）"
+        )
 
         # memfabric pull mode only.
         assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
@@ -225,6 +247,17 @@ class SFAPDCpuOffloadConsumerWorker:
         # forward the load kickoff to the SFA worker (which also builds offload
         # tasks via process_layer_data when num_new_offload_blocks > 0).
         self._refresh_cpu_blocks_by_req(metadata)
+        n_b1 = sum(
+            1
+            for r in getattr(metadata, "requests", [])
+            if getattr(r, "num_new_offload_blocks", 0) > 0
+        )
+        if n_b1:
+            print(
+                f"[SFA-PD-LEARN][⑦入口] ConsumerWorker.start_load_kv: "
+                f"n_reqs={len(getattr(metadata, 'requests', []))} "
+                f"n_B1_offload={n_b1} → sfa_worker.start_load_kv"
+            )
         self.sfa_worker.start_load_kv(metadata)
 
     def set_req_ids(self, req_ids: list):
@@ -295,6 +328,12 @@ class SFAPDCpuOffloadConsumerWorker:
             self._pending_done = still_pending
 
             if done or done_recving or self._pending_done:
+                print(
+                    f"[SFA-PD-LEARN][⑥完成] ConsumerWorker.get_finished: "
+                    f"done_ext={done} → done_recving(内部)={done_recving} "
+                    f"pending_done_ext={self._pending_done} "
+                    f"（ext→internal 经 request_map）"
+                )
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
                         "MembPull D get_finished: done_ext=%s, done_recving_internal=%s, pending_done_ext=%s",
@@ -348,6 +387,12 @@ class SFAPDCpuOffloadConsumerWorker:
         """memfabric pull mode: D does NOT register anything. Only P registers
         its HBM. Every D rank reads local HBM legs; TP0 also reads full Main KV
         into the shared CPU pool."""
+        print(
+            f"[SFA-PD-LEARN][⑤memfabric] _register_memfabric_pull: "
+            f"tp_rank={self.tp_rank} "
+            f"port={self.side_channel_port + self.tp_rank} "
+            f"（D 不 register_buffer；只起 ZMQ ROUTER + pull 读线程）"
+        )
         num_blocks = self.kv_cache_config.num_blocks
         indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
 
@@ -374,6 +419,13 @@ class SFAPDCpuOffloadConsumerWorker:
             main_tuple = list(kv_caches[main_name])
             self._indexer_tensors.append(main_tuple[2])  # dsa_k_indexer
             self._indexer_scale_tensors.append(main_tuple[5] if len(main_tuple) >= 6 else None)
+
+        print(
+            f"[SFA-PD-LEARN][⑤memfabric] 目的地映射: "
+            f"indexer_layers={len(indexer_names)} main_layers={len(main_names)} "
+            f"has_cpu_pool(TP0)={has_cpu_pool} "
+            f"lic8_scale={self._indexer_scale_tensors[0] is not None if self._indexer_scale_tensors else False}"
+        )
 
         # Build layer_metadata (D's local addresses, for compatibility)
         for pool_idx, (iname, mname) in enumerate(zip(indexer_names, main_names)):
@@ -414,6 +466,10 @@ class SFAPDCpuOffloadConsumerWorker:
 
         # Create memfabric engine (no registration)
         self._ensure_engine()
+        print(
+            f"[SFA-PD-LEARN][⑤memfabric] transfer engine ready: "
+            f"role=DECODE host={self.side_channel_host}"
+        )
         read_state = self._build_consumer_read_state()
         # Start MembPullReadThread (ZMQ ROUTER + memfabric read)
         self._mf_read_thread = MembPullReadThread(
@@ -424,6 +480,13 @@ class SFAPDCpuOffloadConsumerWorker:
         )
         self._mf_read_thread.start()
         self._mf_read_thread.ready_event.wait()
+        print(
+            f"[SFA-PD-LEARN][⑤memfabric] MembPullReadThread READY: "
+            f"tp_rank={self.tp_rank} "
+            f"listen_port={self.side_channel_port + self.tp_rank} "
+            f"indexer={len(indexer_names)} main={len(main_names)} "
+            f"full_main_cpu_dest={has_cpu_pool}"
+        )
         logger.info(
             "SFAPDCpuOffload D-side registered (memfabric pull): "
             "%d indexer + %d main layers, full-main CPU destination=%s",
@@ -565,6 +628,11 @@ class SFAPDCpuOffloadProducerWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only.
         assert self._backend == BACKEND_MEMFABRIC, "SFAPDCpuOffloadConnector P side supports memfabric pull only."
+        print(
+            f"[SFA-PD-LEARN][②注册-SFAPD] ProducerWorker.register_kv_caches: "
+            f"layers={len(kv_caches)} backend={self._backend} "
+            f"（注册 HBM 地址供 D pull；起 MembPullSendingThread）"
+        )
         layer2group_ids: dict[str, int] = {}
         for group_idx, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             for layer_name in kv_cache_group.layer_names:
@@ -598,6 +666,12 @@ class SFAPDCpuOffloadProducerWorker:
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)
+        print(
+            f"[SFA-PD-LEARN][②注册-SFAPD] memfabric.register_buffer: "
+            f"n_regions={len(register_regions.ptrs)} "
+            f"total_bytes={sum(register_regions.lengths)} "
+            f"total_layers={self.total_layers}"
+        )
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 
         ready_event = threading.Event()
@@ -613,6 +687,10 @@ class SFAPDCpuOffloadProducerWorker:
         # the user can compare against D's destination sums in the logs.
         self.kv_send_layer_thread._source_kv_caches = kv_caches
         self.layer_send_done_events = self.kv_send_layer_thread.layer_send_done_events
+        print(
+            f"[SFA-PD-LEARN][②注册-SFAPD] MembPullSendingThread ready: "
+            f"layers={len(kv_caches)} p_session={global_te._unique_id}"
+        )
         logger.info(
             "MembPull P registered kv caches: layers=%d, p_session=%s",
             len(kv_caches),
@@ -710,8 +788,19 @@ class SFAPDCpuOffloadProducerWorker:
                 continue
             layer_send_task.send_request[req_id] = self.update_decoder_info(req_id, req_meta)
         if layer_send_task.send_request:
+            print(
+                f"[SFA-PD-LEARN][③SFAPD-READY] ProducerWorker.save_kv_layer: "
+                f"layer={self.current_layer}({layer_name}) "
+                f"reqs={list(layer_send_task.send_request.keys())} "
+                f"→ send_queue.put(SendTask) （等 NPU event 后发 READ_READY_BATCH）"
+            )
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
         else:
+            print(
+                f"[SFA-PD-LEARN][③SFAPD-READY] ProducerWorker.save_kv_layer: "
+                f"layer={self.current_layer}({layer_name}) 无 pull 目标 "
+                f"→ _signal_layer_done（本层无 READ_READY）"
+            )
             self.kv_send_layer_thread._signal_layer_done(self.current_layer)
         self.current_layer += 1
 
@@ -726,8 +815,17 @@ class SFAPDCpuOffloadProducerWorker:
             return
         if 0 <= layer_idx < len(self.layer_send_done_events):
             event = self.layer_send_done_events[layer_idx]
+            already = event.is_set()
+            print(
+                f"[SFA-PD-LEARN][③SFAPD门控] ProducerWorker.wait_for_layer_send: "
+                f"mate_layer={layer_idx} already_done={already} → wait(timeout=10)"
+            )
             if not event.wait(timeout=10):
                 raise RuntimeError(f"Timed out waiting for D to read layer {layer_idx}'s KV before buffer reuse")
+            print(
+                f"[SFA-PD-LEARN][③SFAPD门控] ProducerWorker.wait_for_layer_send: "
+                f"mate_layer={layer_idx} DONE （可安全覆盖共享 HBM 槽）"
+            )
 
     def get_layer_send_event(self, layer_idx: int) -> threading.Event | None:
         if self.layer_send_done_events is None:
