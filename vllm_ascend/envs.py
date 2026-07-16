@@ -110,11 +110,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Opt-in KV *usage* debug (allocate/free/slot_mapping/kv_write/kv_read).
-    # Default 0. Set to 1 on debug/kv-cache-memory-inspect to trace runtime use
-    # of the tensors allocated during initialize_kv_cache.
-    # Valid: 0/1. Sensitive: no.
-    "VLLM_ASCEND_KV_USAGE_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_KV_USAGE_DEBUG", "0"))),
 }
 
 # end-env-vars-definition

@@ -228,8 +228,8 @@
 #       debug/kv-cache-memory-inspect: teach how Scheduler block pool
 #       allocate/free maps onto the tensors created by initialize_kv_cache.
 #    How：
-#       Wrap allocate_slots/free and emit [KV_DEBUG] usage.allocate /
-#       usage.free when VLLM_ASCEND_KV_USAGE_DEBUG=1.
+#       Wrap allocate_slots/free and always emit [KV_DEBUG] usage.allocate /
+#       usage.free on this debug branch (via vllm.logger).
 #    Related PR (if no, explain why):
 #       No. Debug-branch only instrumentation.
 #    Future Plan:

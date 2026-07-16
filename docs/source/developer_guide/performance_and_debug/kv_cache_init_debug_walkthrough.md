@@ -18,10 +18,14 @@
 | `vllm_ascend/worker/model_runner_v1.py` | `get_kv_cache_spec()`、`initialize_kv_cache()`、`initialize_kv_cache_tensors()` |
 | `vllm_ascend/worker/worker.py` | `determine_available_memory()` |
 
-### 使用阶段（需显式开启）
+### 使用阶段（本 debug 分支默认开启）
 
-```bash
-export VLLM_ASCEND_KV_USAGE_DEBUG=1
+无需再设 `VLLM_ASCEND_KV_USAGE_DEBUG`。usage 日志与 init 日志一样走 `vllm.logger`，启动后即可在 serve tee 日志里看到。
+
+启动时应先出现 patch 加载标记：
+
+```text
+[KV_DEBUG]: usage patch applied (KVCacheManager.allocate_slots/free)
 ```
 
 | 日志关键字 | 插入点 | 含义 |
@@ -41,7 +45,7 @@ grep '\[KV_DEBUG\]' /path/to/kv_debug_*.log
 grep 'usage\.' /path/to/kv_debug_*.log
 ```
 
-> **说明**：环境变量 `VLLM_KV_DEBUG=1` 控制的是 upstream vLLM 的 `kv_debug_log`，与本文 `[KV_DEBUG]` 打印无关。
+> **说明**：环境变量 `VLLM_KV_DEBUG=1` 控制的是 upstream vLLM 的 `kv_debug_log`，与本文 ascend `[KV_DEBUG]` 打印是两套机制。
 
 ## 总览：初始化调用链
 

@@ -18,9 +18,10 @@
 
 from __future__ import annotations
 
+from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 
-from vllm_ascend.kv_usage_debug import kv_block_ids_summary, log_alloc, log_free
+from vllm_ascend.kv_usage_debug import KV_DEBUG_TAG, kv_block_ids_summary, log_alloc, log_free
 
 _original_allocate_slots = KVCacheManager.allocate_slots
 _original_free = KVCacheManager.free
@@ -56,3 +57,7 @@ def _patched_free(self, request) -> None:
 
 KVCacheManager.allocate_slots = _patched_allocate_slots  # type: ignore[method-assign]
 KVCacheManager.free = _patched_free  # type: ignore[method-assign]
+
+# Boot marker: if this line is missing from serve logs, the platform patch
+# did not load in that process (usage.allocate/free will also be missing).
+logger.info("%s: usage patch applied (KVCacheManager.allocate_slots/free)", KV_DEBUG_TAG)

@@ -1,20 +1,19 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # Part of the debug/kv-cache-memory-inspect branch.
 #
-# Opt-in usage-phase KV debug helpers. Enable with:
-#   export VLLM_ASCEND_KV_USAGE_DEBUG=1
+# Usage-phase KV debug helpers. Always-on on this debug branch (no env gate).
+# Init-phase logs under [KV_DEBUG] are also always-on.
 #
-# Init-phase logs under [KV_DEBUG] remain always-on on this branch.
+# IMPORTANT: use vllm.logger (same as model_runner init [KV_DEBUG] lines).
+# A bare logging.getLogger("vllm_ascend.*") often does not show in EngineCore
+# tee'd serve logs even when VLLM_ASCEND_KV_USAGE_DEBUG=1 is set.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 from typing import Any
 
-from vllm_ascend import envs
-
-logger = logging.getLogger("vllm_ascend.kv_usage_debug")
+from vllm.logger import logger
 
 KV_DEBUG_TAG = "[KV_DEBUG]"
 
@@ -29,7 +28,8 @@ _MAX_ATTN_LOGS = 24
 
 
 def kv_usage_debug_enabled() -> bool:
-    return bool(envs.VLLM_ASCEND_KV_USAGE_DEBUG)
+    """Always enabled on debug/kv-cache-memory-inspect."""
+    return True
 
 
 def kv_block_ids_summary(blocks: Any, max_items: int = 16) -> Any:
@@ -64,8 +64,6 @@ def current_step() -> int:
 
 
 def should_log_detail() -> bool:
-    if not kv_usage_debug_enabled():
-        return False
     step = _step_count
     if step <= _DETAIL_FIRST_STEPS:
         return True
@@ -133,8 +131,6 @@ def log_alloc(
     new_block_ids: Any,
     ok: bool,
 ) -> None:
-    if not kv_usage_debug_enabled():
-        return
     logger.info(
         "%s: usage.allocate req_id=%s ok=%s num_new_tokens=%s "
         "num_new_computed=%s free_blocks %s->%s new_blocks=%s",
@@ -150,8 +146,6 @@ def log_alloc(
 
 
 def log_free(req_id: str, free_before: int, free_after: int) -> None:
-    if not kv_usage_debug_enabled():
-        return
     logger.info(
         "%s: usage.free req_id=%s free_blocks %s->%s",
         KV_DEBUG_TAG,
