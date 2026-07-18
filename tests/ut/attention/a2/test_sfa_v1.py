@@ -14,6 +14,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
+from vllm_ascend.attention.sfa.constants import NPU_QUANT_DST_TYPE_INT8
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFABackend,
     AscendSFAImpl,
@@ -94,12 +95,12 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
             torch.randn(2, 1, 1, 16),
             256,
             16,
-            dst_type=1,
+            dst_type=NPU_QUANT_DST_TYPE_INT8,
             tile_size=128,
         )
         packed_kv = torch.cat([actual_k_nope, actual_k_pe, actual_scales], dim=-1)
 
-        self.assertEqual(mock_block_quant.call_args.kwargs["dst_type"], 1)
+        self.assertEqual(mock_block_quant.call_args.kwargs["dst_type"], NPU_QUANT_DST_TYPE_INT8)
         self.assertEqual(mock_block_quant.call_args.kwargs["row_block_size"], 1)
         self.assertEqual(mock_block_quant.call_args.kwargs["col_block_size"], 128)
         self.assertEqual(packed_kv.shape, (2, 1, 1, 296))

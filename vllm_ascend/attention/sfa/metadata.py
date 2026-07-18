@@ -69,12 +69,13 @@ class AscendSFAMetadata:
     num_input_tokens: int = 0  # Number of tokens including padding.
     # The dimension of the attention heads
     head_dim: int | None = None
-    attn_mask: torch.Tensor = None
+    attn_mask: torch.Tensor | None = None
     # chunked prefill by default if no attn_states passed
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
+    # Populated only when DCP / DSA-CP / PCP feature paths are enabled.
     dcp_context: DCPContext | None = None
     dsa_cp_context: DSACPContext | None = None
-    reshape_cache_event: torch.npu.Event = None
+    reshape_cache_event: torch.npu.Event | None = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
     num_decodes: int = 0
     num_decode_tokens: int = 0

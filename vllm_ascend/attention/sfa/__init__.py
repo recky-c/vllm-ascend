@@ -5,7 +5,7 @@ from vllm_ascend.attention.sfa.constants import (
     O_PROJ_ACLNN_INPUT_PARAMS,
 )
 from vllm_ascend.attention.sfa.impl import AscendSFAImpl
-from vllm_ascend.attention.sfa.kv_quant import custom_kv_rmsnorm_rope
+from vllm_ascend.attention.sfa.kv_quant import KVRmsnormRopeResult, SFAKVCacheLayout, custom_kv_rmsnorm_rope
 from vllm_ascend.attention.sfa.metadata import (
     AscendSFAMetadata,
     DCPContext,
@@ -22,6 +22,8 @@ __all__ = [
     "DCPContext",
     "DCPQueryGatherContext",
     "DSACPContext",
+    "KVRmsnormRopeResult",
     "O_PROJ_ACLNN_INPUT_PARAMS",
+    "SFAKVCacheLayout",
     "custom_kv_rmsnorm_rope",
 ]

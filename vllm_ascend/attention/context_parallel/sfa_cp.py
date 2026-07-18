@@ -20,6 +20,7 @@ from vllm_ascend.attention.sfa import (
     DCPContext,
     DCPQueryGatherContext,
 )
+from vllm_ascend.attention.sfa.kv_quant import KVRmsnormRopeResult
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, enabling_mlapo, split_decodes_and_prefills
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import (
@@ -587,7 +588,7 @@ class AscendSFACPImpl(AscendSFAImpl):
             value_cache=kv_cache[1],
             slot_mapping=slot_mapping,
         )
-        return None, None
+        return KVRmsnormRopeResult(k_pe=None, k_nope=None, knope_scale=None)
 
     def _get_full_kv(self, k, attn_metadata: M):
         if self.pcp_size == 1 or self.enable_mlapo:

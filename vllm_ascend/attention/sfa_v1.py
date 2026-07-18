@@ -4,10 +4,13 @@ The implementation now lives in the ``vllm_ascend.attention.sfa`` package:
 
 - ``sfa.backend``: ``AscendSFABackend``
 - ``sfa.builder``: ``AscendSFAMetadataBuilder``
-- ``sfa.impl``: ``AscendSFAImpl``
+- ``sfa.impl``: ``AscendSFAImpl`` (mainline forward orchestration)
 - ``sfa.metadata``: ``AscendSFAMetadata`` and per-feature context dataclasses
-- ``sfa.kv_quant``: ``custom_kv_rmsnorm_rope``
+- ``sfa.kv_quant``: ``custom_kv_rmsnorm_rope`` / cache layout helpers
 - ``sfa.constants``: shared named constants
+- ``sfa.weight_prep``: MLAPO / prolog_v3 weight transforms and feature flags
+- ``sfa.dsa_cp``: DSA-CP metadata build and KV gather helpers
+- ``sfa.o_proj_tp``: DSA-CP mixed-mode o_proj TP gather
 
 This module only re-exports the public names so existing import sites
 (e.g. ``vllm_ascend.platform`` backend path strings) keep working.

@@ -1,9 +1,7 @@
 from typing import TYPE_CHECKING
 
 import torch
-from torch import nn
 from vllm.config import VllmConfig
-from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -13,13 +11,15 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.sfa.backend import AscendSFABackend
-from vllm_ascend.attention.sfa.metadata import AscendSFAMetadata, DSACPContext
+from vllm_ascend.attention.sfa.constants import TND_LAYOUT_MAX_DECODE_THRESHOLD
+from vllm_ascend.attention.sfa.dsa_cp import build_dsa_cp_context
+from vllm_ascend.attention.sfa.metadata import AscendSFAMetadata
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
 )
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
-from vllm_ascend.utils import _round_up, enable_dsa_cp
+from vllm_ascend.utils import enable_dsa_cp
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -65,9 +65,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
+            assert self.decode_threshold <= TND_LAYOUT_MAX_DECODE_THRESHOLD, (
                 f"decode_threshold exceeded \
-                npu_fused_infer_attention_score TND layout's limit of 16, \
+                npu_fused_infer_attention_score TND layout's limit of {TND_LAYOUT_MAX_DECODE_THRESHOLD}, \
                 got {self.decode_threshold}"
             )
             self.spec_actual_seq_lengths_query = [
@@ -151,90 +151,21 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         dsa_cp_context = None
         if self.enable_dsa_cp:
-            global_tp_size = get_tp_group().world_size
-            num_tokens = num_input_tokens
-            num_tokens_pad = _round_up(num_tokens, global_tp_size)
-            num_tokens_per_device = num_tokens_pad // global_tp_size
-            local_start = get_tp_group().rank_in_group * num_tokens_per_device
-            local_end_with_pad = local_start + num_tokens_per_device
-            local_end = min(local_end_with_pad, num_actual_tokens)
-
-            pad_size = num_tokens_pad - cos.shape[0]
-            assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
-
-            if pad_size > 0:
-                cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
-                sin = nn.functional.pad(sin, (0, 0, 0, 0, 0, 0, 0, pad_size))
-
-            pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
-            if pad_size_slot > 0:
-                slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
-            else:
-                slot_mapping = slot_mapping[:num_tokens_pad]
-            slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
-
-            cos = cos[local_start:local_end_with_pad]
-            sin = sin[local_start:local_end_with_pad]
-
-            assert cos.shape[0] == num_tokens_per_device, (
-                f"cos.shape[0] must be equal to num_tokens_per_device, \
-                    got {cos.shape[0]} and {num_tokens_per_device}"
-            )
-            assert slot_mapping_cp.shape[0] == num_tokens_per_device, (
-                f"slot_mapping_cp.shape[0] must be equal to num_tokens_per_device, \
-                    got {slot_mapping_cp.shape[0]} and {num_tokens_per_device}"
-            )
-            assert slot_mapping.shape[0] == num_tokens_pad, (
-                f"slot_mapping.shape[0] must be equal to num_tokens_pad, \
-                    got {slot_mapping.shape[0]} and {num_tokens_pad}"
-            )
-
-            if draft_index is not None:
-                assert self.spec_actual_seq_lengths_query is not None
-                assert self.spec_actual_seq_lengths_key is not None
-                # Per-draft-step buffers: independent, graph-stable storage so
-                # later draft steps don't clobber earlier ones' metadata.
-                actual_seq_lengths_query = self.spec_actual_seq_lengths_query[draft_index - 1]
-                actual_seq_lengths_key = self.spec_actual_seq_lengths_key[draft_index - 1]
-            else:
-                actual_seq_lengths_query = self.actual_seq_lengths_query
-                actual_seq_lengths_key = self.actual_seq_lengths_key
-
-            num_segs = cum_query_lens.shape[0]
-
-            # Vectorized per-request local query/key lengths for this rank's
-            # [local_start, local_end_with_pad) slice. Replaces a Python loop
-            # that did 2 .item() NPU->CPU syncs per request (2 * num_reqs
-            # syncs/step); now fully on-device with zero syncs.
-            # global_start[i] = 0 for i==0, else cum_query_lens[i-1]
-            global_start = common_attn_metadata.query_start_loc[:num_segs]
-            global_end = cum_query_lens
-
-            # Clip each request's [global_start, global_end) to the local range.
-            # num_local_tokens may be < 0 when the request falls entirely
-            # outside [local_start, local_end_with_pad); clamp before cumsum.
-            req_local_start = global_start.clamp(min=local_start)
-            req_local_end = global_end.clamp(max=local_end_with_pad)
-            num_local_tokens = req_local_end - req_local_start
-
-            local_query_lens = torch.cumsum(num_local_tokens.clamp(min=0), dim=0)
-            offset = global_end - req_local_end  # request tokens on later ranks
-            local_key_lens = torch.where(num_local_tokens > 0, seq_lens - offset, 0)
-
-            actual_seq_lengths_query[:num_segs] = local_query_lens
-            actual_seq_lengths_key[:num_segs] = local_key_lens
-            actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
-            actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
-
-            dsa_cp_context = DSACPContext(
-                num_tokens=num_tokens,
-                num_tokens_pad=num_tokens_pad,
-                local_start=local_start,
-                local_end=local_end,
-                local_end_with_pad=local_end_with_pad,
-                slot_mapping_cp=slot_mapping_cp,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
+            dsa_cp_context, cos, sin, slot_mapping = build_dsa_cp_context(
+                num_input_tokens=num_input_tokens,
+                num_actual_tokens=num_actual_tokens,
+                num_reqs=num_reqs,
+                cos=cos,
+                sin=sin,
+                slot_mapping=slot_mapping,
+                cum_query_lens=cum_query_lens,
+                seq_lens=seq_lens,
+                query_start_loc=common_attn_metadata.query_start_loc,
+                draft_index=draft_index,
+                actual_seq_lengths_query=self.actual_seq_lengths_query,
+                actual_seq_lengths_key=self.actual_seq_lengths_key,
+                spec_actual_seq_lengths_query=self.spec_actual_seq_lengths_query,
+                spec_actual_seq_lengths_key=self.spec_actual_seq_lengths_key,
             )
 
         if get_ascend_config().c8_enable_reshape_optim:

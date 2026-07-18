@@ -905,7 +905,7 @@ class TestAscendSFACPImpl(TestBase):
         attn_metadata.slot_mapping = slots
 
         result = self.impl.exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
         mock_reshape_and_cache.assert_called_once()
 
     @patch_distributed_groups(dcp_size=1, pcp_size=1, needs_mocks=False)

@@ -22,6 +22,7 @@ from tests.ut.base import TestBase
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
+from vllm_ascend.attention.sfa.o_proj_tp import OProjTPGather
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 
 
@@ -40,6 +41,7 @@ class TestAscendSFAOProjTPParams(TestBase):
             self.weight_scale = torch.nn.Parameter(torch.randn(4), requires_grad=False)
 
     def setUp(self):
+        OProjTPGather.pools.clear()
         AscendSFAImpl.o_proj_full_pools.clear()
 
     def _make_impl(self):

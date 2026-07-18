@@ -1,6 +1,7 @@
 import vllm.envs as envs_vllm
 from vllm.v1.attention.backend import AttentionBackend  # type: ignore
 
+from vllm_ascend.attention.sfa.constants import SFA_KERNEL_BLOCK_SIZE
 from vllm_ascend.attention.utils import enable_cp
 from vllm_ascend.utils import enable_sfa_dcp_replicated_indexer
 
@@ -55,4 +56,4 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
-        return [128]
+        return [SFA_KERNEL_BLOCK_SIZE]
