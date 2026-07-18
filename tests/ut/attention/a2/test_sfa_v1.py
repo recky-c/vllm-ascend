@@ -61,13 +61,13 @@ class TestAscendSFABackend(TestBase):
         result = AscendSFABackend.get_impl_cls()
         self.assertEqual(result, AscendSFAImpl)
 
-    @patch("vllm_ascend.attention.sfa_v1.enable_cp")
+    @patch("vllm_ascend.attention.sfa.backend.enable_cp")
     def test_get_builder_cls_with_cp(self, mock_enable_cp):
         mock_enable_cp.return_value = True
         builder_cls = AscendSFABackend.get_builder_cls()
         self.assertIsNotNone(builder_cls)
 
-    @patch("vllm_ascend.attention.sfa_v1.enable_cp")
+    @patch("vllm_ascend.attention.sfa.backend.enable_cp")
     def test_get_impl_cls_with_cp(self, mock_enable_cp):
         mock_enable_cp.return_value = True
         impl_cls = AscendSFABackend.get_impl_cls()
@@ -75,9 +75,9 @@ class TestAscendSFABackend(TestBase):
 
 
 class TestAscendSFAKVQuantSparseAttention(TestBase):
-    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_dynamic_block_quant")
-    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_interleave_rope")
-    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_rms_norm")
+    @patch("vllm_ascend.attention.sfa.kv_quant.torch_npu.npu_dynamic_block_quant")
+    @patch("vllm_ascend.attention.sfa.kv_quant.torch_npu.npu_interleave_rope")
+    @patch("vllm_ascend.attention.sfa.kv_quant.torch_npu.npu_rms_norm")
     def test_pack_prefill_kv_cache(self, mock_rms_norm, mock_rope, mock_block_quant):
         k_nope = torch.randn(2, 1, 1, 256, dtype=torch.bfloat16)
         k_pe = torch.randn(2, 1, 1, 16, dtype=torch.bfloat16)
@@ -271,7 +271,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         mock_ascend_config.enable_mlapo = True
         mock_ascend_config.enable_shared_expert_dp = False
         self.ascend_config_patcher = patch(
-            "vllm_ascend.attention.sfa_v1.get_ascend_config",
+            "vllm_ascend.attention.sfa.builder.get_ascend_config",
             return_value=mock_ascend_config,
         )
         self.ascend_config_patcher.start()
@@ -330,9 +330,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert builder.device == device
         assert builder.vllm_config == vllm_config
 
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
-    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
-    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp")
+    @patch("vllm_ascend.attention.sfa.impl.get_current_vllm_config")
+    @patch("vllm_ascend.attention.sfa.builder.get_cos_and_sin_mla")
+    @patch("vllm_ascend.attention.sfa.builder.enable_dsa_cp")
     @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
     def test_ascend_sfa_metadata_builder_build(
         self,
@@ -392,9 +392,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
         assert metadata.slot_mapping.shape == (100, 4, 1024)
 
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
-    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
-    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp", return_value=False)
+    @patch("vllm_ascend.attention.sfa.impl.get_current_vllm_config")
+    @patch("vllm_ascend.attention.sfa.builder.get_cos_and_sin_mla")
+    @patch("vllm_ascend.attention.sfa.builder.enable_dsa_cp", return_value=False)
     @patch("vllm.distributed.parallel_state.get_tp_group")
     @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
     def test_ascend_sfa_metadata_builder_build_for_graph_capture(
@@ -450,9 +450,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
 
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
-    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
-    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp", return_value=False)
+    @patch("vllm_ascend.attention.sfa.impl.get_current_vllm_config")
+    @patch("vllm_ascend.attention.sfa.builder.get_cos_and_sin_mla")
+    @patch("vllm_ascend.attention.sfa.builder.enable_dsa_cp", return_value=False)
     @patch("torch.ops._C_ascend.store_kv_block_metadata", create=True)
     def test_ascend_sfa_metadata_builder_build_with_c8_reshape_optim(
         self,
@@ -502,7 +502,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         mock_get_cos_and_sin_mla.return_value = (torch.randn(100), torch.randn(100))
 
-        with patch("vllm_ascend.attention.sfa_v1.get_ascend_config") as mock_get_ascend_config:
+        with patch("vllm_ascend.attention.sfa.builder.get_ascend_config") as mock_get_ascend_config:
             mock_ascend_config = MagicMock()
             mock_ascend_config.c8_enable_reshape_optim = True
             mock_get_ascend_config.return_value = mock_ascend_config

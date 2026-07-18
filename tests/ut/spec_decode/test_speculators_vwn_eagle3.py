@@ -162,7 +162,7 @@ def _mock_npu_env():
         # On MagicMock these fields yield TypeError on Python 3.12, so short-circuit
         # the check everywhere it's imported.
         patch("vllm_ascend.attention.attention_v1.enable_cp", return_value=False),
-        patch("vllm_ascend.attention.sfa_v1.enable_cp", return_value=False, create=True),
+        patch("vllm_ascend.attention.sfa.backend.enable_cp", return_value=False, create=True),
         patch("vllm_ascend.attention.mla_v1.enable_cp", return_value=False, create=True),
     ):
         yield

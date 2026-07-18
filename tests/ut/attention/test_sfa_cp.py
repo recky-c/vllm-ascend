@@ -535,9 +535,9 @@ class TestAscendSFACPImpl(TestBase):
 
     @patch("vllm_ascend.attention.context_parallel.sfa_cp.enabling_mlapo", return_value=False)
     @patch("vllm.distributed.parallel_state._TP", new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp_with_o_proj_tp", return_value=False)
-    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp", return_value=False)
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
+    @patch("vllm_ascend.attention.sfa.impl.enable_dsa_cp_with_o_proj_tp", return_value=False)
+    @patch("vllm_ascend.attention.sfa.impl.enable_dsa_cp", return_value=False)
+    @patch("vllm_ascend.attention.sfa.impl.get_current_vllm_config")
     @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
     def setUp(
         self,
@@ -598,9 +598,9 @@ class TestAscendSFACPImpl(TestBase):
 
     @patch("vllm_ascend.attention.context_parallel.sfa_cp.enabling_mlapo", return_value=False)
     @patch("vllm.distributed.parallel_state._TP", new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp_with_o_proj_tp", return_value=False)
-    @patch("vllm_ascend.attention.sfa_v1.enable_dsa_cp", return_value=False)
-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
+    @patch("vllm_ascend.attention.sfa.impl.enable_dsa_cp_with_o_proj_tp", return_value=False)
+    @patch("vllm_ascend.attention.sfa.impl.enable_dsa_cp", return_value=False)
+    @patch("vllm_ascend.attention.sfa.impl.get_current_vllm_config")
     @patch_distributed_groups(dcp_size=1, pcp_size=1, needs_mocks=False)
     def test_init_no_cp(
         self,
