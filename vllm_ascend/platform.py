@@ -957,12 +957,6 @@ class NPUPlatform(Platform):
         is_draft_model_prefill = False
         sinks = False
         in_profile_run = get_mrv2_in_profile_run()
-        moe_comm_type = select_moe_comm_method(
-            num_tokens,
-            vllm_config,
-            is_draft_model=is_draft_model,
-        )
-        moe_comm_method = get_moe_comm_method(moe_comm_type)
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
@@ -986,7 +980,7 @@ class NPUPlatform(Platform):
             flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
         pad_size = 0
         padded_length = None
-        if flash_comm_v1_enabled:
+        if flash_comm_v1_enabled and num_tokens is not None:
             pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
 
         if num_tokens is None and attn_metadata is not None:
@@ -999,6 +993,16 @@ class NPUPlatform(Platform):
                 pad_size = padded_length - num_tokens
         else:
             max_tokens_across_dp = num_tokens
+
+        # Must use max_tokens_across_dp (not local num_tokens) so every DP rank
+        # selects the same MoE/EP communication method before collective ops.
+        moe_comm_type = select_moe_comm_method(
+            max_tokens_across_dp if max_tokens_across_dp is not None else 0,
+            vllm_config,
+            is_draft_model=is_draft_model,
+        )
+        moe_comm_method = get_moe_comm_method(moe_comm_type)
+
         mc2_mask = None
         padded_num_tokens = None
         if num_tokens is not None:

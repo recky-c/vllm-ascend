@@ -298,6 +298,46 @@ class TestNPUPlatform(TestBase):
 
         self.assertTrue(kwargs["in_profile_run"])
 
+    def test_set_additional_forward_context_v2_selects_moe_comm_by_dp_max_tokens(self):
+        """DP ranks must pick MoE/EP method from max tokens across DP, not local size."""
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        dummy_comm_method = object()
+        dp_metadata = MagicMock()
+        # Local rank has 1 token; peer DP rank has 8. Method selection must use 8.
+        dp_metadata.num_tokens_across_dp_cpu = torch.tensor([1, 8], dtype=torch.int32)
+        select_calls: list[int] = []
+
+        def _capture_select(num_tokens, _vllm_config, is_draft_model=False):
+            select_calls.append(num_tokens)
+            return MoECommType.MC2
+
+        with (
+            patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", True, create=True),
+            patch("vllm_ascend.platform.is_moe_model", return_value=True),
+            patch("vllm_ascend.platform.enable_sp", return_value=False),
+            patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
+            patch("vllm.distributed.get_dp_group", return_value=MagicMock(world_size=2)),
+            patch(
+                "vllm_ascend.ascend_forward_context.select_moe_comm_method",
+                side_effect=_capture_select,
+            ),
+            patch("vllm_ascend.ascend_forward_context.get_mc2_mask", return_value=None),
+            patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_comm_method", return_value=dummy_comm_method),
+        ):
+            kwargs = self.platform.set_additional_forward_context(
+                attn_metadata=None,
+                vllm_config=vllm_config,
+                dp_metadata=dp_metadata,
+                num_tokens=1,
+            )
+
+        self.assertEqual(select_calls, [8])
+        self.assertEqual(kwargs["max_tokens_across_dp"], 8)
+        self.assertEqual(kwargs["padded_num_tokens"], 8)
+        self.assertEqual(kwargs["moe_comm_type"], MoECommType.MC2)
+        self.assertIs(kwargs["moe_comm_method"], dummy_comm_method)
+
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
