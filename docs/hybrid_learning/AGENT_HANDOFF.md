@@ -10,8 +10,8 @@
 
 | Repo | Branch to pull | Remote (author’s fork) | What it contains |
 |------|----------------|------------------------|------------------|
-| **vllm-ascend** | `feat/hybrid-learning-debug` (or `feat/model-runner-v2` if merged there) | `https://github.com/recky-c/vllm-ascend.git` (`origin` / `fork`) | Startup / worker / FA·GDN·MoE I/O / sample·accepted logs + **this doc** |
-| **vllm** | `feat/hybrid-learning-debug` | `https://github.com/recky-c/vllm.git` (`fork`) | Scheduler trunk logs `[HYBRID-SCHED]` |
+| **vllm-ascend** | `feat/hybrid-learning-debug` @ `77dbcb19b` | `https://github.com/recky-c/vllm-ascend.git` | Startup / worker / FA·GDN·MoE I/O / sample·accepted logs + **this doc** |
+| **vllm** | `feat/hybrid-learning-debug` @ `1f46aca55` | `https://github.com/recky-c/vllm.git` | Scheduler trunk logs `[HYBRID-SCHED]` |
 
 If only **vllm-ascend** is updated on the server, worker/forward logs still work; sched logs need the **vllm** branch (or equivalent commit) installed.
 
