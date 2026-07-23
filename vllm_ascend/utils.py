@@ -1257,6 +1257,12 @@ def refresh_block_size(vllm_config):
     if model_config.is_hybrid:
         # Hybrid attention+mamba models rely on the model-specific sizing
         # logic rather than the generic platform default.
+        logger.info(
+            "[HYBRID-STARTUP][config] skip generic block_size defaulting; "
+            "keep block_size=%s for hybrid page alignment "
+            "(see patch_mamba_config.verify_and_update_config)",
+            cache_config.block_size,
+        )
         return
 
     if cache_config.block_size != 128:

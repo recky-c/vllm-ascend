@@ -462,7 +462,17 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
 
-        return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
+        result_blocks = tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group)
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "[HYBRID-SCHED][prefix] Ascend per-group hit (skip Mamba in min): "
+            "hit_length=%d group_block_counts=%s max_cache_hit_length=%d",
+            hit_length,
+            [len(b) for b in result_blocks],
+            max_cache_hit_length,
+        )
+        return result_blocks, hit_length
 
 
 def get_kv_cache_coordinator(

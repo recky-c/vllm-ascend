@@ -42,6 +42,20 @@ def verify_and_update_config(cls, vllm_config) -> None:
     using_kv_store_with_hybrid = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and _using_kv_store(
         vllm_config
     )
+    logger.info(
+        "[HYBRID-STARTUP][config] enter verify_and_update_config: "
+        "arch=%s model_type=%s is_hybrid=%s using_kv_store=%s "
+        "disable_hybrid_kv_cache_manager=%s user_block_size=%s "
+        "mamba_cache_mode=%s prefix_caching=%s",
+        vllm_config.model_config.architecture,
+        getattr(getattr(vllm_config.model_config, "hf_config", None), "model_type", None),
+        getattr(vllm_config.model_config, "is_hybrid", None),
+        using_kv_store_with_hybrid,
+        vllm_config.scheduler_config.disable_hybrid_kv_cache_manager,
+        vllm_config.cache_config.block_size,
+        vllm_config.cache_config.mamba_cache_mode,
+        vllm_config.cache_config.enable_prefix_caching,
+    )
     logger.debug("Using kv store: %s", using_kv_store_with_hybrid)
     # Enable FULL_AND_PIECEWISE by default
     MambaModelConfig.verify_and_update_config(vllm_config)
@@ -75,6 +89,15 @@ def verify_and_update_config(cls, vllm_config) -> None:
     if len(mamba_shapes) == 1 and len(mamba_shapes[0]) == 3:
         conv_block_page_size = 0
 
+    logger.info(
+        "[HYBRID-STARTUP][config] mamba state: shapes=%s dtypes=%s "
+        "ssm_page=%dB conv_page=%dB (conv=0 means ssm-only)",
+        mamba_shapes,
+        mamba_dtypes,
+        ssm_block_page_size,
+        conv_block_page_size,
+    )
+
     # NOTE(zxr): because of the limit of Ascend Hardware, we need to keep
     # all cache tensors contiguous, so we align the page size of ssm_block
     # and single attn_block
@@ -96,13 +119,37 @@ def verify_and_update_config(cls, vllm_config) -> None:
         "Cannot align ssm_page_size and attn_page_size."
     )
 
+    logger.info(
+        "[HYBRID-STARTUP][config] attn page math: use_mla=%s kv_heads=%s "
+        "dtype=%s single_token_k_page=%dB attn_token_page=%dB "
+        "kernel_block=%d computed_attn_block_size=%d "
+        "(need single_token_k_page * block_size == ssm_page)",
+        model_config.use_mla,
+        attn_num_kv_heads,
+        kv_cache_dtype,
+        attn_single_token_k_page_size,
+        attn_token_page_size,
+        kernel_block_size,
+        attn_block_size,
+    )
+
     # override attention block size if either (a) the
     # user has not set it or (b) the user has set it
     # too small.
+    prev_block_size = cache_config.block_size
     if cache_config.block_size is None or cache_config.block_size < attn_block_size:
         cache_config.block_size = attn_block_size
         logger.info(
-            "Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.",
+            "[HYBRID-STARTUP][config] override block_size %s -> %d "
+            "(ensure attention page size >= mamba page size).",
+            prev_block_size,
+            attn_block_size,
+        )
+    else:
+        logger.info(
+            "[HYBRID-STARTUP][config] keep user block_size=%d "
+            "(>= computed attn_block_size=%d)",
+            cache_config.block_size,
             attn_block_size,
         )
 
@@ -117,9 +164,11 @@ def verify_and_update_config(cls, vllm_config) -> None:
         cache_config.mamba_page_size_padded = attn_page_size + conv_block_page_size
         mamba_padding_pct = 100 * conv_block_page_size / cache_config.mamba_page_size_padded
         logger.info(
-            "Padding mamba page size by %.2f%% to ensure "
-            "that mamba page size and attention page size are "
-            "exactly equal.",
+            "[HYBRID-STARTUP][config] pad mamba page: attn_page=%dB "
+            "conv_page=%dB mamba_page_padded=%dB (+%.2f%% for conv alignment)",
+            attn_page_size,
+            conv_block_page_size,
+            cache_config.mamba_page_size_padded,
             mamba_padding_pct,
         )
     # The extract_hidden_states connector (ExampleHiddenStatesConnector) only
@@ -133,6 +182,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     is_extract_hidden_states = (
         spec_config is not None and getattr(spec_config, "method", None) == "extract_hidden_states"
     )
+    prev_mamba_mode = cache_config.mamba_cache_mode
     if using_kv_store_with_hybrid and not is_extract_hidden_states:
         if cache_config.mamba_cache_mode == "none":
             cache_config.mamba_cache_mode = "align"
@@ -144,6 +194,18 @@ def verify_and_update_config(cls, vllm_config) -> None:
         cache_config.mamba_block_size = cache_config.block_size
     else:
         cache_config.mamba_block_size = model_config.max_model_len
+
+    logger.info(
+        "[HYBRID-STARTUP][config] final cache settings: block_size=%d "
+        "mamba_block_size=%d mamba_cache_mode=%s->%s "
+        "mamba_page_size_padded=%s is_extract_hidden_states=%s",
+        cache_config.block_size,
+        cache_config.mamba_block_size,
+        prev_mamba_mode,
+        cache_config.mamba_cache_mode,
+        cache_config.mamba_page_size_padded,
+        is_extract_hidden_states,
+    )
 
 
 vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = verify_and_update_config

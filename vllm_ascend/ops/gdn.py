@@ -15,6 +15,9 @@
 # limitations under the License.
 #
 
+import logging
+import os
+
 import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
@@ -34,6 +37,49 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+
+logger = logging.getLogger(__name__)
+
+# Per-step budget for [HYBRID-WORKER][forward] trunk logs (reset each model.forward).
+# Override count with VLLM_HYBRID_FWD_LOG_N (default 1). Set 0 to silence layer I/O logs.
+_HYBRID_FWD_LOG_BUDGET: dict[str, int] = {}
+
+
+def _hybrid_fwd_log_n() -> int:
+    raw = os.environ.get("VLLM_HYBRID_FWD_LOG_N", "1")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1
+
+
+def reset_hybrid_fwd_log() -> None:
+    """Call once before each model.forward; each kind logs up to N times per step."""
+    global _HYBRID_FWD_LOG_BUDGET
+    n = _hybrid_fwd_log_n()
+    _HYBRID_FWD_LOG_BUDGET = {
+        "full_attention": n,
+        "linear_attention": n,
+        "fa_io": n,
+        "gdn_io": n,
+        "gdn_core": n,
+        # FFN is per-attn-type so default N=1 shows MoE/MLP after first FA and first GDN.
+        "moe_after_full_attention": n,
+        "moe_after_linear_attention": n,
+        "mlp_after_full_attention": n,
+        "mlp_after_linear_attention": n,
+    }
+
+
+def take_hybrid_fwd_log(kind: str) -> bool:
+    """Consume one log slot for `kind`. Honors VLLM_HYBRID_WORKER_DEBUG (0=off)."""
+    if os.environ.get("VLLM_HYBRID_WORKER_DEBUG") == "0":
+        return False
+    left = _HYBRID_FWD_LOG_BUDGET.get(kind, 0)
+    if left <= 0:
+        return False
+    _HYBRID_FWD_LOG_BUDGET[kind] = left - 1
+    return True
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -75,6 +121,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         2. Core attention (custom op)
         3. Output projection
         """
+        log_io = take_hybrid_fwd_log("gdn_io")
+        in_shape = tuple(hidden_states.shape)
         num_tokens = hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
@@ -135,6 +183,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 3: Output Projection
         # ============================================================
         z_shape_og = z.shape
+        core_out_shape = tuple(core_attn_out.shape)
         # Reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
@@ -142,6 +191,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         out, _ = self.out_proj(core_attn_out)
+        if log_io:
+            logger.info(
+                "[HYBRID-WORKER][forward][io] kind=linear_attention.detail "
+                "prefix=%s in=%s mixed_qkv=%s b=%s a=%s core_out=%s out=%s "
+                "path=in_proj -> gdn_core(conv+ssm/state_indices) -> norm+out_proj",
+                self.prefix,
+                in_shape,
+                tuple(mixed_qkv.shape),
+                tuple(b.shape),
+                tuple(a.shape),
+                core_out_shape,
+                tuple(out.shape),
+            )
         if output is not None:
             output[:num_tokens] = out
         return out
@@ -174,6 +236,38 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        if take_hybrid_fwd_log("gdn_core"):
+            non_spec_shape = (
+                tuple(non_spec_state_indices_tensor.shape)
+                if non_spec_state_indices_tensor is not None
+                else None
+            )
+            spec_shape = (
+                tuple(spec_state_indices_tensor.shape)
+                if spec_state_indices_tensor is not None
+                else None
+            )
+            conv_shape = (
+                tuple(self_kv_cache[0].shape) if self_kv_cache is not None else None
+            )
+            ssm_shape = tuple(ssm_state.shape) if ssm_state is not None else None
+            logger.info(
+                "[HYBRID-WORKER][forward][gdn_core] layer=%s "
+                "num_actual_tokens=%d prefills=%d decodes=%d spec_decodes=%d "
+                "non_spec_state_indices.shape=%s spec_state_indices.shape=%s "
+                "kv_cache[conv].shape=%s kv_cache[ssm].shape=%s "
+                "(indexes mamba pages; not FA slot_mapping)",
+                self.prefix,
+                num_actual_tokens,
+                attn_metadata.num_prefills,
+                attn_metadata.num_decodes,
+                getattr(attn_metadata, "num_spec_decodes", 0),
+                non_spec_shape,
+                spec_shape,
+                conv_shape,
+                ssm_shape,
+            )
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]

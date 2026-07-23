@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -799,7 +800,524 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
-        return super()._update_states(scheduler_output)
+        self._log_worker_update_states_begin(scheduler_output)
+        result = super()._update_states(scheduler_output)
+        self._log_worker_update_states_end(scheduler_output)
+        return result
+
+    def _worker_debug_enabled(self) -> bool:
+        """Learning logs for worker trunk (_update_states / _prepare_inputs).
+
+        - VLLM_HYBRID_WORKER_DEBUG=1: always on
+        - VLLM_HYBRID_WORKER_DEBUG=0: always off
+        - unset: on when hybrid/mamba (is_hybrid / use_hybrid_blocks / _has_gdn)
+        """
+        env = os.environ.get("VLLM_HYBRID_WORKER_DEBUG")
+        if env is not None:
+            return env == "1"
+        return bool(
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or getattr(self, "need_accepted_tokens", False)
+        )
+
+    @staticmethod
+    def _format_block_ids_tuple(block_ids: tuple | list | None) -> str:
+        if block_ids is None:
+            return "None"
+        if not isinstance(block_ids, (tuple, list)):
+            return str(type(block_ids).__name__)
+        parts = []
+        for gid, ids in enumerate(block_ids):
+            if ids is None:
+                parts.append(f"g{gid}:None")
+                continue
+            n = len(ids)
+            sample = list(ids[:2])
+            if n > 2:
+                sample.append(ids[-1])
+            parts.append(f"g{gid}:n={n},sample={sample}")
+        return "{" + "; ".join(parts) + "}"
+
+    def _log_worker_update_states_begin(self, scheduler_output: "SchedulerOutput") -> None:
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        logger.info(
+            "%s[update_states][begin] total_tokens=%d finished=%d "
+            "new_reqs=%d cached_reqs=%d batch_reqs_before=%d "
+            "num_block_tables=%d use_hybrid_blocks=%s need_accepted_tokens=%s",
+            tag,
+            scheduler_output.total_num_scheduled_tokens,
+            len(scheduler_output.finished_req_ids),
+            len(scheduler_output.scheduled_new_reqs),
+            len(scheduler_output.scheduled_cached_reqs.req_ids),
+            self.input_batch.num_reqs,
+            len(getattr(self.input_batch.block_table, "block_tables", [self.input_batch.block_table])),
+            getattr(self, "use_hybrid_blocks", False),
+            getattr(self, "need_accepted_tokens", False),
+        )
+        # Trunk only: sample up to 2 new + 2 cached block_ids shapes (hybrid focus).
+        for nr in scheduler_output.scheduled_new_reqs[:2]:
+            logger.info(
+                "%s[update_states][begin] NEW req=%s computed=%d block_ids=%s "
+                "(hybrid: len(tuple)==num_kv_groups)",
+                tag,
+                nr.req_id,
+                nr.num_computed_tokens,
+                self._format_block_ids_tuple(nr.block_ids),
+            )
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(list(cached.req_ids)[:2]):
+            new_ids = cached.new_block_ids[i] if cached.new_block_ids else None
+            logger.info(
+                "%s[update_states][begin] CACHED req=%s computed=%d "
+                "new_block_ids=%s resumed=%s",
+                tag,
+                req_id,
+                cached.num_computed_tokens[i],
+                self._format_block_ids_tuple(new_ids),
+                req_id in cached.resumed_req_ids,
+            )
+
+    def _log_worker_update_states_end(self, scheduler_output: "SchedulerOutput") -> None:
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        # After update: show persistent batch + per-group row lengths for sample reqs.
+        num_reqs = self.input_batch.num_reqs
+        bt = self.input_batch.block_table
+        tables = getattr(bt, "block_tables", None)
+        if tables is None:
+            tables = [bt]
+        group_info = []
+        for gid, table in enumerate(tables):
+            is_mamba = getattr(table, "is_mamba_group", False)
+            # sample first req row length if any
+            row_n = int(table.num_blocks_per_row[0]) if num_reqs > 0 else 0
+            group_info.append(f"g{gid}:mamba={is_mamba},row0_blocks={row_n}")
+        logger.info(
+            "%s[update_states][end] batch_reqs_after=%d req_ids_sample=%s "
+            "block_tables=[%s]",
+            tag,
+            num_reqs,
+            list(self.input_batch.req_ids)[:3],
+            "; ".join(group_info),
+        )
+
+    def _log_worker_prepare_inputs_begin(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+    ) -> None:
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        num_reqs = self.input_batch.num_reqs
+        logger.info(
+            "%s[prepare_inputs][begin] num_reqs=%d total_tokens=%d "
+            "scheduled_tokens_sample=%s kernel_block_sizes=%s "
+            "(trunk steps: commit -> positions -> gdn_qsl? -> slot)",
+            tag,
+            num_reqs,
+            scheduler_output.total_num_scheduled_tokens,
+            num_scheduled_tokens[: min(num_reqs, 3)].tolist(),
+            getattr(self, "kernel_block_sizes", None),
+        )
+
+    def _log_prepare_step(self, step: str, msg: str, *args) -> None:
+        """Short trunk step log inside _prepare_inputs (no PCP/async detail)."""
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        logger.info("%s[prepare_inputs][%s] " + msg, tag, step, *args)
+
+    def _log_worker_prepare_inputs_after_slot_mapping(
+        self,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        bt = self.input_batch.block_table
+        tables = getattr(bt, "block_tables", None)
+        if tables is None:
+            tables = [bt]
+        parts = []
+        for gid, table in enumerate(tables):
+            is_mamba = getattr(table, "is_mamba_group", False)
+            if is_mamba:
+                parts.append(f"g{gid}:Mamba SKIP (no token slot; use state_indices later)")
+            else:
+                parts.append(
+                    f"g{gid}:FA COMPUTED slot_mapping for {total_num_scheduled_tokens} tokens"
+                )
+        logger.info(
+            "%s[prepare_inputs][slot_mapping] num_reqs=%d %s",
+            tag,
+            num_reqs,
+            " | ".join(parts),
+        )
+
+    def _log_worker_metadata_group(
+        self,
+        kv_cache_gid: int,
+        kv_cache_group,
+        cm,
+        attn_metadata_dict: dict,
+    ) -> None:
+        """Log one KV-cache-group's metadata build (FA vs GDN)."""
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or len(self.kv_cache_config.kv_cache_groups) > 1
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        spec = kv_cache_group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            sample_spec = next(iter(spec.kv_cache_specs.values()))
+            spec_name = f"UniformType({type(sample_spec).__name__})"
+        else:
+            spec_name = type(spec).__name__
+
+        builders = []
+        for attn_gid, attn_group in enumerate(self.attn_groups[kv_cache_gid]):
+            builder = attn_group.get_metadata_builder(0)
+            builders.append(
+                f"attn{attn_gid}:{type(builder).__name__}"
+                f"(layers={len(attn_group.layer_names)})"
+            )
+
+        # Sample one layer's metadata object from this group.
+        sample_layer = kv_cache_group.layer_names[0] if kv_cache_group.layer_names else None
+        meta = attn_metadata_dict.get(sample_layer) if sample_layer else None
+        meta_type = type(meta).__name__ if meta is not None else "None"
+
+        # Trunk hybrid fields only (no PCP/async dumps).
+        extra = []
+        if meta is not None:
+            if hasattr(meta, "slot_mapping"):
+                sm = getattr(meta, "slot_mapping", None)
+                extra.append(f"has_slot_mapping={sm is not None}")
+            # GDN / Mamba-style state indices
+            for attr in (
+                "non_spec_state_indices_tensor",
+                "spec_state_indices_tensor",
+                "num_prefills",
+                "num_decodes",
+                "num_spec_decodes",
+            ):
+                if hasattr(meta, attr):
+                    val = getattr(meta, attr)
+                    if isinstance(val, int):
+                        extra.append(f"{attr}={val}")
+                    elif val is None:
+                        extra.append(f"{attr}=None")
+                    else:
+                        # tensor / array: only shape
+                        shape = getattr(val, "shape", None)
+                        extra.append(f"{attr}.shape={tuple(shape) if shape is not None else type(val).__name__}")
+
+        bt_shape = tuple(cm.block_table_tensor.shape) if cm.block_table_tensor is not None else None
+        sm_shape = tuple(cm.slot_mapping.shape) if cm.slot_mapping is not None else None
+        logger.info(
+            "%s[metadata][group] kv_gid=%d spec=%s builders=[%s] "
+            "sample_layer=%s meta_type=%s "
+            "cm.block_table=%s cm.slot_mapping=%s %s",
+            tag,
+            kv_cache_gid,
+            spec_name,
+            ", ".join(builders),
+            sample_layer,
+            meta_type,
+            bt_shape,
+            sm_shape,
+            ("| " + " ".join(extra)) if extra else "",
+        )
+
+    def _log_worker_metadata_end(self, attn_metadata) -> None:
+        if isinstance(attn_metadata, list):
+            # ubatch: summarize first microbatch only
+            attn_metadata = attn_metadata[0] if attn_metadata else {}
+        if not isinstance(attn_metadata, dict):
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or len(self.kv_cache_config.kv_cache_groups) > 1
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        # Count layers per metadata type (same object shared within a group).
+        type_to_layers: dict[str, int] = defaultdict(int)
+        type_to_sample: dict[str, str] = {}
+        seen_ids: set[int] = set()
+        for layer_name, meta in attn_metadata.items():
+            mid = id(meta)
+            tname = type(meta).__name__
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                type_to_sample[tname] = layer_name
+            type_to_layers[tname] += 1
+        summary = [
+            f"{t}:layers={n},sample={type_to_sample.get(t)}"
+            for t, n in type_to_layers.items()
+        ]
+        logger.info(
+            "%s[metadata][end] distinct_meta_objects=%d by_type=[%s] "
+            "(hybrid expects >=2 types, e.g. FA + GDN)",
+            tag,
+            len(seen_ids),
+            "; ".join(summary),
+        )
+
+    def _log_worker_forward_begin(
+        self,
+        attn_metadata,
+        num_tokens_padded: int,
+        cudagraph_mode,
+    ) -> None:
+        """Trunk log right before model.forward (FA/GDN metadata already built)."""
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or len(self.kv_cache_config.kv_cache_groups) > 1
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        meta = attn_metadata
+        if isinstance(meta, list):
+            meta = meta[0] if meta else {}
+        type_counts: dict[str, int] = defaultdict(int)
+        sample_by_type: dict[str, str] = {}
+        if isinstance(meta, dict):
+            seen: set[int] = set()
+            for layer_name, m in meta.items():
+                mid = id(m)
+                tname = type(m).__name__
+                if mid not in seen:
+                    seen.add(mid)
+                    sample_by_type[tname] = layer_name
+                type_counts[tname] += 1
+        summary = [
+            f"{t}:layers={n},sample={sample_by_type.get(t)}"
+            for t, n in type_counts.items()
+        ]
+        logger.info(
+            "%s[forward][begin] num_tokens_padded=%d cudagraph=%s "
+            "attn_meta_by_type=[%s] "
+            "(set_ascend_forward_context -> model; layers pick FA vs GDN)",
+            tag,
+            num_tokens_padded,
+            cudagraph_mode,
+            "; ".join(summary) if summary else "empty",
+        )
+
+    def _log_worker_forward_end(self, hidden_states) -> None:
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        if isinstance(hidden_states, IntermediateTensors):
+            hs = hidden_states.tensors.get("hidden_states")
+            shape = tuple(hs.shape) if hs is not None else "IntermediateTensors"
+        else:
+            shape = (
+                tuple(hidden_states.shape)
+                if hasattr(hidden_states, "shape")
+                else type(hidden_states).__name__
+            )
+        logger.info(
+            "%s[forward][end] hidden_states.shape=%s",
+            tag,
+            shape,
+        )
+
+    def _log_worker_logits(
+        self,
+        logits: torch.Tensor | None,
+        logits_indices: torch.Tensor | None,
+        sample_hidden_states: torch.Tensor | None,
+    ) -> None:
+        """Trunk log after forward, before sample (logits path)."""
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or getattr(self, "need_accepted_tokens", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        li_shape = tuple(logits_indices.shape) if logits_indices is not None else None
+        sh_shape = (
+            tuple(sample_hidden_states.shape) if sample_hidden_states is not None else None
+        )
+        lo_shape = tuple(logits.shape) if logits is not None else None
+        logger.info(
+            "%s[logits] sample_hidden=%s logits_indices=%s logits=%s "
+            "need_accepted_tokens=%s "
+            "(hidden[logits_indices] -> compute_logits -> sample_tokens)",
+            tag,
+            sh_shape,
+            li_shape,
+            lo_shape,
+            getattr(self, "need_accepted_tokens", False),
+        )
+
+    def _log_worker_sample_begin(
+        self,
+        scheduler_output: "SchedulerOutput",
+        logits: torch.Tensor | None,
+        spec_decode_metadata,
+    ) -> None:
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or getattr(self, "need_accepted_tokens", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        logger.info(
+            "%s[sample][begin] num_reqs=%d total_tokens=%d logits=%s "
+            "use_spec=%s need_accepted_tokens=%s "
+            "(sampler -> optional _update_states_after_model_execute)",
+            tag,
+            self.input_batch.num_reqs,
+            scheduler_output.total_num_scheduled_tokens,
+            tuple(logits.shape) if logits is not None else None,
+            spec_decode_metadata is not None,
+            getattr(self, "need_accepted_tokens", False),
+        )
+
+    def _log_worker_sample_end(
+        self,
+        valid_sampled_token_ids,
+        sampler_output,
+    ) -> None:
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or getattr(self, "need_accepted_tokens", False)
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        # Sample up to 3 reqs: lengths of accepted/sampled ids (CPU lists or tensor).
+        samples = []
+        if valid_sampled_token_ids is not None:
+            for i, ids in enumerate(list(valid_sampled_token_ids)[:3]):
+                if ids is None:
+                    samples.append(f"r{i}:None")
+                elif hasattr(ids, "shape"):
+                    samples.append(f"r{i}:tensor{tuple(ids.shape)}")
+                else:
+                    samples.append(f"r{i}:n={len(ids)},ids={list(ids)[:4]}")
+        raw = getattr(sampler_output, "sampled_token_ids", None)
+        raw_shape = tuple(raw.shape) if raw is not None and hasattr(raw, "shape") else None
+        logger.info(
+            "%s[sample][end] sampled_token_ids.shape=%s valid_sample=%s "
+            "req_ids_sample=%s",
+            tag,
+            raw_shape,
+            samples,
+            list(self.input_batch.req_ids)[:3],
+        )
+
+    def _log_worker_accepted_tokens(
+        self,
+        phase: str,
+        *,
+        num_reqs: int | None = None,
+        sampled_token_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Log accepted-token sync used by GDN/spec on the next step."""
+        if not self._worker_debug_enabled():
+            return
+        if not getattr(self, "need_accepted_tokens", False):
+            return
+        tag = "[HYBRID-WORKER]"
+        n = num_reqs if num_reqs is not None else self.input_batch.num_reqs
+        cpu = getattr(self.input_batch, "num_accepted_tokens_cpu", None)
+        cpu_sample = None
+        if cpu is not None and n > 0:
+            try:
+                cpu_sample = cpu[: min(n, 4)].tolist()
+            except Exception:
+                cpu_sample = str(type(cpu))
+        gpu_np = getattr(getattr(self, "num_accepted_tokens", None), "np", None)
+        gpu_sample = None
+        if gpu_np is not None and n > 0:
+            try:
+                gpu_sample = gpu_np[: min(n, 4)].tolist()
+            except Exception:
+                gpu_sample = str(type(gpu_np))
+        raw_shape = (
+            tuple(sampled_token_ids.shape)
+            if sampled_token_ids is not None and hasattr(sampled_token_ids, "shape")
+            else None
+        )
+        logger.info(
+            "%s[accepted][%s] num_reqs=%d sampled_token_ids.shape=%s "
+            "num_accepted_tokens_cpu_sample=%s num_accepted_tokens_np_sample=%s "
+            "(next GDN step reads these for state slot / init)",
+            tag,
+            phase,
+            n,
+            raw_shape,
+            cpu_sample,
+            gpu_sample,
+        )
+
+    def _log_metadata_step(self, step: str, msg: str, *args) -> None:
+        """Short trunk step log inside _build_attention_metadata."""
+        if not self._worker_debug_enabled():
+            return
+        hybrid = (
+            getattr(self.model_config, "is_hybrid", False)
+            or getattr(self, "use_hybrid_blocks", False)
+            or getattr(self, "_has_gdn", False)
+            or len(getattr(self, "kv_cache_config").kv_cache_groups) > 1
+        )
+        tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+        logger.info("%s[metadata][%s] " + msg, tag, step, *args)
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -871,9 +1389,24 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        self._log_worker_prepare_inputs_begin(scheduler_output, num_scheduled_tokens)
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
+        if self._worker_debug_enabled():
+            bt = self.input_batch.block_table
+            tables = getattr(bt, "block_tables", None) or [bt]
+            self._log_prepare_step(
+                "commit",
+                "committed %d block_table(s) for num_reqs=%d [%s]",
+                len(tables),
+                num_reqs,
+                "; ".join(
+                    f"g{i}:mamba={getattr(t, 'is_mamba_group', False)}"
+                    for i, t in enumerate(tables)
+                ),
+            )
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -904,6 +1437,16 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.num_computed_tokens_cpu[req_indices],
             self.query_pos.np[: cu_num_tokens[-1]],
             out=positions_np,
+        )
+        self._log_prepare_step(
+            "positions",
+            "attn_state=%s with_prefill=%s tokens=%d "
+            "pos_sample=%s cu_num_tokens_tail=%s",
+            getattr(attn_state, "name", str(attn_state)),
+            with_prefill,
+            total_num_scheduled_tokens,
+            positions_np[: min(4, total_num_scheduled_tokens)].tolist(),
+            cu_num_tokens[-1] if len(cu_num_tokens) else None,
         )
 
         # For PCP, compute slot_mapping on GPU using pre-PCP-split positions.
@@ -999,6 +1542,12 @@ class NPUModelRunner(GPUModelRunner):
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
+        self._log_prepare_step(
+            "input_ids",
+            "gathered %d token ids; sample=%s",
+            total_num_scheduled_tokens,
+            self.input_ids.cpu[: min(4, total_num_scheduled_tokens)].tolist(),
+        )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
@@ -1057,6 +1606,11 @@ class NPUModelRunner(GPUModelRunner):
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
         copy_snapshot_to_gpu(self.query_start_loc)
+        self._log_prepare_step(
+            "query_start_loc",
+            "FA query_start_loc filled; sample=%s (GDN may use separate unpadded qsl next)",
+            self.query_start_loc.np[: min(num_reqs + 1, 4)].tolist(),
+        )
 
         # Now, query_start_loc is padded.
         # But gdn needs an unpadded one.
@@ -1067,7 +1621,17 @@ class NPUModelRunner(GPUModelRunner):
             self.gdn_query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
             self.gdn_query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
             copy_snapshot_to_gpu(self.gdn_query_start_loc)
-
+            self._log_prepare_step(
+                "gdn_qsl",
+                "filled gdn_query_start_loc (unpadded) for GDN metadata; "
+                "qsl_sample=%s (hybrid-only)",
+                self.gdn_query_start_loc.np[: min(num_reqs + 1, 4)].tolist(),
+            )
+        else:
+            self._log_prepare_step(
+                "gdn_qsl",
+                "skipped (_has_gdn=False); FA uses query_start_loc only",
+            )
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
@@ -1085,6 +1649,13 @@ class NPUModelRunner(GPUModelRunner):
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        self._log_prepare_step(
+            "seq_lens_input_ids",
+            "optimistic_seq_lens_sample=%s; _prepare_input_ids copied "
+            "%d tokens to NPU",
+            self.optimistic_seq_lens_cpu[: min(num_reqs, 3)].tolist(),
+            total_num_scheduled_tokens,
+        )
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1161,6 +1732,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
+            self._log_worker_accepted_tokens("prepare_inputs_sync", num_reqs=num_reqs)
         else:
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
@@ -1291,6 +1863,9 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
+            self._log_worker_prepare_inputs_after_slot_mapping(
+                num_reqs, total_num_scheduled_tokens
+            )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -1351,6 +1926,22 @@ class NPUModelRunner(GPUModelRunner):
             self.num_decode_draft_tokens.copy_to_gpu()
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices
+        if use_spec_decode:
+            self._log_prepare_step(
+                "logits_spec",
+                "use_spec_decode=True num_draft_tokens_sample=%s "
+                "logits_indices_len=%d num_sampled_tokens_sample=%s",
+                num_draft_tokens[: min(num_reqs, 3)].tolist() if num_draft_tokens is not None else None,
+                int(logits_indices.shape[0]),
+                num_sampled_tokens[: min(num_reqs, 3)].tolist(),
+            )
+        else:
+            self._log_prepare_step(
+                "logits_spec",
+                "use_spec_decode=False logits_indices_len=%d "
+                "(last-token per req); no SpecDecodeMetadata",
+                int(logits_indices.shape[0]),
+            )
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -2325,6 +2916,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        self._log_worker_forward_begin(attn_metadata, num_tokens_padded, cudagraph_mode)
+        # Reset per-step FA/GDN layer log budget (see ops/gdn.py).
+        from vllm_ascend.ops.gdn import reset_hybrid_fwd_log
+
+        reset_hybrid_fwd_log()
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2354,6 +2950,7 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        self._log_worker_forward_end(hidden_states)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2410,6 +3007,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+            self._log_worker_logits(logits, logits_indices, sample_hidden_states)
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
@@ -2473,6 +3072,8 @@ class NPUModelRunner(GPUModelRunner):
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        self._log_worker_sample_begin(scheduler_output, logits, spec_decode_metadata)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2548,6 +3149,7 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        self._log_worker_sample_end(valid_sampled_token_ids, sampler_output)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -2617,6 +3219,11 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+            self._log_worker_accepted_tokens(
+                "after_update",
+                num_reqs=self.input_batch.num_reqs,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+            )
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
@@ -3246,6 +3853,18 @@ class NPUModelRunner(GPUModelRunner):
             group_key_idx = self.group_key_idx.gpu[:num_reqs_padded],
             group_key_cache_idx = self.group_key_cache_idx.gpu[:num_reqs_padded],
         )
+        self._log_metadata_step(
+            "cm_base",
+            "common metadata ready (defaults to group0 FA tables): "
+            "num_reqs_padded=%d num_tokens=%d max_query_len=%d "
+            "block_table=%s slot_mapping=%s attn_state=%s",
+            num_reqs_padded,
+            num_tokens,
+            max_query_len,
+            tuple(block_table_gid_0.shape) if block_table_gid_0 is not None else None,
+            tuple(slot_mapping_gid_0.shape) if slot_mapping_gid_0 is not None else None,
+            getattr(self.attn_state, "name", str(self.attn_state)),
+        )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -3273,6 +3892,12 @@ class NPUModelRunner(GPUModelRunner):
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
+                self._log_metadata_step(
+                    "build_extra",
+                    "kv_gid=%d GDN+spec: pass num_accepted_tokens and "
+                    "num_decode_draft_tokens into builder",
+                    kv_cache_gid,
+                )
 
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
                 if for_cudagraph_capture:
@@ -3287,6 +3912,15 @@ class NPUModelRunner(GPUModelRunner):
                     block_size=attn_group.kv_cache_spec.block_size,
                 )
 
+            self._log_metadata_step(
+                "build",
+                "kv_gid=%d attn_gid=%d builder=%s layers=%d "
+                "calling builder.build()...",
+                kv_cache_gid,
+                attn_gid,
+                type(builder).__name__,
+                len(attn_group.layer_names),
+            )
             if (for_cudagraph_capture
                     and not isinstance(builder, (
                         AscendDSAMetadataBuilder,
@@ -3306,6 +3940,16 @@ class NPUModelRunner(GPUModelRunner):
                     and isinstance(builder, GDNAttentionMetadataBuilder) and attn_metadata_i.num_prefills == 0:
                     if attn_metadata_i.num_decodes == 0 and attn_metadata_i.num_spec_decodes > 0:
                         attn_metadata_i.spec_state_indices_tensor[attn_metadata_i.num_spec_decodes:].fill_(0)
+            self._log_metadata_step(
+                "build_done",
+                "kv_gid=%d attn_gid=%d meta_type=%s "
+                "attach to %d layers (sample=%s)",
+                kv_cache_gid,
+                attn_gid,
+                type(attn_metadata_i).__name__,
+                len(attn_group.layer_names),
+                attn_group.layer_names[0] if attn_group.layer_names else None,
+            )
             if isinstance(builder, AscendDSAMetadataBuilder):
                 prefill_ratio_to_sas_metadata = builder.prefill_ratio_to_sas_metadata  # type: ignore[assignment]
                 decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata  # type: ignore[assignment]
@@ -3327,6 +3971,25 @@ class NPUModelRunner(GPUModelRunner):
         decode_ratio_to_sas_metadata: dict[Any, Any] = {}
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
+        if self._worker_debug_enabled():
+            hybrid = (
+                getattr(self.model_config, "is_hybrid", False)
+                or getattr(self, "use_hybrid_blocks", False)
+                or getattr(self, "_has_gdn", False)
+                or len(self.kv_cache_config.kv_cache_groups) > 1
+            )
+            tag = "[HYBRID-WORKER]" if hybrid else "[WORKER]"
+            logger.info(
+                "%s[metadata][begin] num_kv_groups=%d num_tokens=%d "
+                "num_reqs=%d use_spec_decode=%s _has_gdn=%s "
+                "(each group builds its own metadata; FA vs GDN differ)",
+                tag,
+                len(self.kv_cache_config.kv_cache_groups),
+                num_tokens,
+                num_reqs,
+                use_spec_decode,
+                getattr(self, "_has_gdn", False),
+            )
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
@@ -3347,10 +4010,30 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(builder, GDNAttentionMetadataBuilder):
                     cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
                     cm.query_start_loc = self.gdn_query_start_loc.gpu[: num_reqs_padded + 1]
+                    self._log_metadata_step(
+                        "gdn_qsl_swap",
+                        "kv_gid=%d switch cm.query_start_loc -> "
+                        "gdn_query_start_loc (unpadded) for GDN builder",
+                        kv_cache_gid,
+                    )
 
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
+                )
+                self._log_metadata_step(
+                    "swap_tables",
+                    "kv_gid=%d replace cm block_table/slot_mapping "
+                    "with this group's tables: block_table=%s slot_mapping=%s "
+                    "(group0 kept FA tables from cm_base)",
+                    kv_cache_gid,
+                    tuple(cm.block_table_tensor.shape) if cm.block_table_tensor is not None else None,
+                    tuple(cm.slot_mapping.shape) if cm.slot_mapping is not None else None,
+                )
+            elif self._worker_debug_enabled():
+                self._log_metadata_step(
+                    "swap_tables",
+                    "kv_gid=0 keep cm_base FA block_table/slot_mapping",
                 )
             if self.speculative_config and isinstance(self.drafter, (AscendStep3p5MTPProposer, AscendDSparkProposer)):
                 # step3p5 MTP draft layers span multiple KV cache groups; capture
@@ -3374,6 +4057,15 @@ class NPUModelRunner(GPUModelRunner):
                     decode_ratio_to_sas_metadata,
                     common_ratio_to_sas_metadata,
                 )
+            if self._worker_debug_enabled():
+                self._log_worker_metadata_group(
+                    kv_cache_gid,
+                    kv_cache_group,
+                    cm,
+                    attn_metadata if not isinstance(attn_metadata, list) else attn_metadata[0],
+                )
+        if self._worker_debug_enabled():
+            self._log_worker_metadata_end(attn_metadata)
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
             for req_id in self.input_batch.req_ids:
@@ -3912,8 +4604,57 @@ class NPUModelRunner(GPUModelRunner):
             [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
         )
 
+        if self.use_hybrid_blocks or self.need_accepted_tokens or getattr(self.model_config, "is_hybrid", False):
+            for gid, groups in enumerate(self.attn_groups):
+                for agid, attn_group in enumerate(groups):
+                    logger.info(
+                        "[HYBRID-STARTUP][runner] attn_group[kv=%d][attn=%d]: "
+                        "backend=%s spec=%s layers=%d need_accepted_tokens=%s "
+                        "use_hybrid_blocks=%s",
+                        gid,
+                        agid,
+                        getattr(attn_group.backend, "__name__", str(attn_group.backend)),
+                        type(attn_group.kv_cache_spec).__name__,
+                        len(attn_group.layer_names),
+                        self.need_accepted_tokens,
+                        self.use_hybrid_blocks,
+                    )
+
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if self.hybrid_with_attn_and_mamba or self.use_hybrid_blocks or getattr(self.model_config, "is_hybrid", False):
+            logger.info(
+                "[HYBRID-STARTUP][runner] after initialize_kv_cache_tensors: "
+                "hybrid_with_attn_and_mamba=%s num_kv_cache_layers=%d "
+                "kernel_block_sizes=%s",
+                self.hybrid_with_attn_and_mamba,
+                len(kv_caches),
+                getattr(self, "kernel_block_sizes", None),
+            )
+            # Log one sample FA and one sample Mamba cache tensor shape if present.
+            logged_attn = False
+            logged_mamba = False
+            for layer_name, cache in kv_caches.items():
+                if logged_attn and logged_mamba:
+                    break
+                if isinstance(cache, tuple) and len(cache) >= 2 and not logged_attn and "attn" in layer_name:
+                    shapes = [tuple(t.shape) if torch.is_tensor(t) else type(t).__name__ for t in cache]
+                    logger.info(
+                        "[HYBRID-STARTUP][runner] sample FA cache %s shapes=%s",
+                        layer_name,
+                        shapes,
+                    )
+                    logged_attn = True
+                elif isinstance(cache, (list, tuple)) and not logged_mamba and "linear_attn" in layer_name:
+                    shapes = [tuple(t.shape) if torch.is_tensor(t) else type(t).__name__ for t in cache]
+                    logger.info(
+                        "[HYBRID-STARTUP][runner] sample Mamba/GDN cache %s "
+                        "num_states=%d shapes=%s (typically conv then ssm)",
+                        layer_name,
+                        len(cache),
+                        shapes,
+                    )
+                    logged_mamba = True
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4137,6 +4878,7 @@ class NPUModelRunner(GPUModelRunner):
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
         self.hybrid_with_attn_and_mamba = False
+        self._logged_hybrid_raw_alloc = False
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             use_mamba, use_attn = False, False
             for layer_name in kv_cache_tensor.shared_by:
@@ -4161,6 +4903,17 @@ class NPUModelRunner(GPUModelRunner):
                         cache_size_aligned = kv_cache_tensor.size + alignment
                         tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
                         tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+
+                    if use_mamba and use_attn and not getattr(self, "_logged_hybrid_raw_alloc", False):
+                        logger.info(
+                            "[HYBRID-STARTUP][memory] allocate shared raw tensor(s): "
+                            "first_size=%.2fMiB shared_by=%d sample=%s "
+                            "(FA+Mamba share int8 buffer; further tensors omitted)",
+                            kv_cache_tensor.size / (1024 * 1024),
+                            len(kv_cache_tensor.shared_by),
+                            kv_cache_tensor.shared_by[:4],
+                        )
+                        self._logged_hybrid_raw_alloc = True
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache for all shared layers
@@ -4716,6 +5469,15 @@ class NPUModelRunner(GPUModelRunner):
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details."
+            )
+            logger.info(
+                "[HYBRID-STARTUP][runner] reinit InputBatch for multi-group: "
+                "block_sizes=%s kernel_block_sizes=%s "
+                "max_num_blocks_per_req=%s "
+                "(kernel_block_sizes=[0] means Mamba group skips slot_mapping)",
+                block_sizes,
+                self.kernel_block_sizes,
+                max_num_blocks,
             )
             self.input_batch = NPUInputBatch(
                 max_num_reqs=self.max_num_reqs,

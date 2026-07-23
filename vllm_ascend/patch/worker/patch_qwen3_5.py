@@ -17,6 +17,8 @@
 # mypy: ignore-errors
 
 
+import logging
+
 import torch
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention as _GDNBaseCls
@@ -30,14 +32,18 @@ except ImportError:
     IntermediateTensors = None
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
-from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, take_hybrid_fwd_log
 from vllm_ascend.utils import is_310p
+
+logger = logging.getLogger(__name__)
 
 _GDN_PATCH_TARGET = _GDNBaseCls
 
 
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, output: torch.Tensor = None):
+        log_io = take_hybrid_fwd_log("fa_io")
+        in_shape = tuple(hidden_states.shape)
         qkv, _ = self.qkv_proj(hidden_states)
         if "qwen3_5" in self.config.model_type:
             cos_sin = self.rotary_emb.cos_sin_cache[positions]
@@ -83,6 +89,22 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
             attn_output = attn_output * gate
 
         out, _ = self.o_proj(attn_output)
+        if log_io:
+            attn_prefix = getattr(getattr(self, "attn", None), "prefix", None)
+            logger.info(
+                "[HYBRID-WORKER][forward][io] kind=full_attention.detail "
+                "prefix=%s in=%s q=%s k=%s v=%s attn_out=%s out=%s "
+                "path=qkv_proj(+rmsnorm/rope) -> Attention.backend(slot_mapping K/V) "
+                "-> o_proj%s",
+                attn_prefix or getattr(self, "prefix", None),
+                in_shape,
+                tuple(q.shape),
+                tuple(k.shape),
+                tuple(v.shape),
+                tuple(attn_output.shape),
+                tuple(out.shape),
+                " (+attn_output_gate)" if self.attn_output_gate else "",
+            )
         if output is not None:
             output[:] = out
         return out
@@ -103,12 +125,37 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.layer_type == "linear_attention":
+            log_attn = take_hybrid_fwd_log("linear_attention")
+            attn_in = tuple(hidden_states.shape)
             hidden_states = self.linear_attn(hidden_states=hidden_states)
+            if log_attn:
+                logger.info(
+                    "[HYBRID-WORKER][forward][io] kind=linear_attention "
+                    "prefix=%s in=%s out=%s "
+                    "path=input_layernorm -> GDN(linear_attn) -> "
+                    "(optional layer_scale) -> post_attn_layernorm -> mlp",
+                    getattr(self.linear_attn, "prefix", None),
+                    attn_in,
+                    tuple(hidden_states.shape),
+                )
         elif self.layer_type == "full_attention":
+            log_attn = take_hybrid_fwd_log("full_attention")
+            attn_in = tuple(hidden_states.shape)
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
                 positions=positions,
             )
+            if log_attn:
+                attn_prefix = getattr(getattr(self.self_attn, "attn", None), "prefix", None)
+                logger.info(
+                    "[HYBRID-WORKER][forward][io] kind=full_attention "
+                    "prefix=%s in=%s out=%s "
+                    "path=input_layernorm -> FA(self_attn) -> "
+                    "(optional layer_scale) -> post_attn_layernorm -> mlp",
+                    attn_prefix or getattr(self.self_attn, "prefix", None),
+                    attn_in,
+                    tuple(hidden_states.shape),
+                )
         else:
             raise ValueError("Invalid layer_type")
 
@@ -118,9 +165,41 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
             else:
                 hidden_states = hidden_states * (self.attn_layer_scale.to(hidden_states.dtype) + 1)
 
-        # Fully Connected
+        # Fully Connected (dense MLP or Sparse MoE — orthogonal to FA/GDN)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        mlp_name = type(self.mlp).__name__
+        is_moe = mlp_name == "Qwen3NextSparseMoeBlock"
+        ffn_kind = ("moe" if is_moe else "mlp") + f"_after_{self.layer_type}"
+        log_ffn = take_hybrid_fwd_log(ffn_kind)
+        ffn_in = tuple(hidden_states.shape)
         hidden_states = self.mlp(hidden_states)
+        if log_ffn:
+            if is_moe:
+                experts = getattr(self.mlp, "experts", None)
+                logger.info(
+                    "[HYBRID-WORKER][forward][io] kind=moe "
+                    "mlp=%s after_attn_type=%s in=%s out=%s "
+                    "n_routed_experts=%s top_k=%s has_shared_expert=%s "
+                    "path=post_attn_layernorm -> gate/router -> FusedMoE "
+                    "(+optional shared_expert) -> hidden",
+                    getattr(self.mlp, "prefix", mlp_name),
+                    self.layer_type,
+                    ffn_in,
+                    tuple(hidden_states.shape),
+                    getattr(self.mlp, "n_routed_experts", None),
+                    getattr(experts, "top_k", None),
+                    getattr(self.mlp, "shared_expert", None) is not None,
+                )
+            else:
+                logger.info(
+                    "[HYBRID-WORKER][forward][io] kind=mlp "
+                    "mlp=%s after_attn_type=%s in=%s out=%s "
+                    "path=post_attn_layernorm -> dense MLP(gate_up/down) -> hidden",
+                    getattr(self.mlp, "prefix", mlp_name),
+                    self.layer_type,
+                    ffn_in,
+                    tuple(hidden_states.shape),
+                )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

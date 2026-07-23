@@ -48,7 +48,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, UniformTypeKVCacheSpecs
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -584,6 +584,26 @@ class NPUWorker(WorkerBase):
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
+        if getattr(self.model_config, "is_hybrid", False):
+            logger.info(
+                "[HYBRID-STARTUP][memory] profile done: is_hybrid=True "
+                "init_free=%.2fGiB after_free=%.2fGiB "
+                "weights=%.2fGiB peak_activation=%.2fGiB non_torch=%.2fGiB "
+                "available_kv_cache=%.2fGiB requested=%.2fGiB "
+                "block_size=%s mamba_block_size=%s mamba_cache_mode=%s "
+                "mamba_page_size_padded=%s",
+                GiB(self.init_snapshot.free_memory),
+                GiB(free_gpu_memory),
+                GiB(profile_result.weights_memory),
+                GiB(profile_result.torch_peak_increase),
+                GiB(profile_result.non_torch_increase),
+                GiB(self.available_kv_cache_memory_bytes),
+                GiB(self.requested_memory),
+                self.cache_config.block_size,
+                self.cache_config.mamba_block_size,
+                self.cache_config.mamba_cache_mode,
+                self.cache_config.mamba_page_size_padded,
+            )
 
         return int(self.available_kv_cache_memory_bytes)
 
@@ -895,6 +915,50 @@ class NPUWorker(WorkerBase):
 
             context = nullcontext()  # type: ignore
         with context:
+            if getattr(self.model_config, "is_hybrid", False) or len(kv_cache_config.kv_cache_groups) > 1:
+                GiB = lambda b: b / GiB_bytes
+                logger.info(
+                    "[HYBRID-STARTUP][groups] before initialize_kv_cache: "
+                    "num_blocks=%d num_groups=%d num_tensors=%d "
+                    "total_tensor_bytes=%.2fGiB runner=%s",
+                    kv_cache_config.num_blocks,
+                    len(kv_cache_config.kv_cache_groups),
+                    len(kv_cache_config.kv_cache_tensors),
+                    GiB(sum(t.size for t in kv_cache_config.kv_cache_tensors)),
+                    type(self.model_runner).__name__,
+                )
+                for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+                    spec = group.kv_cache_spec
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        sample = next(iter(spec.kv_cache_specs.values()))
+                        spec_desc = f"UniformType({type(sample).__name__})"
+                        page = sample.page_size_bytes
+                        block = sample.block_size
+                    else:
+                        spec_desc = type(spec).__name__
+                        page = getattr(spec, "page_size_bytes", None)
+                        block = getattr(spec, "block_size", None)
+                    logger.info(
+                        "[HYBRID-STARTUP][groups] group[%d]: spec=%s "
+                        "block_size=%s page_size_bytes=%s layers=%d "
+                        "layer_names_sample=%s is_eagle=%s",
+                        gid,
+                        spec_desc,
+                        block,
+                        page,
+                        len(group.layer_names),
+                        group.layer_names[:3],
+                        getattr(group, "is_eagle_group", False),
+                    )
+                for tid, tensor in enumerate(kv_cache_config.kv_cache_tensors):
+                    logger.info(
+                        "[HYBRID-STARTUP][groups] tensor[%d]: size=%.2fMiB "
+                        "shared_by_count=%d shared_by_sample=%s",
+                        tid,
+                        tensor.size / (1024 * 1024),
+                        len(tensor.shared_by),
+                        tensor.shared_by[:4],
+                    )
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
             # Restrict to mamba and full attn hybrid models (e.g. Qwen3.x).

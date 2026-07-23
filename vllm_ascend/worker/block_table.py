@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
@@ -431,6 +432,28 @@ class MultiGroupBlockTable:
         positions_compressed_list: list[np.ndarray] | None = None,
         req_indices_compressed_list: list[np.ndarray] | None = None,
     ) -> None:
+        # Learning log (trunk): which groups compute vs skip slot_mapping.
+        # Controlled by VLLM_HYBRID_WORKER_DEBUG (same semantics as model_runner).
+        import os
+
+        env = os.environ.get("VLLM_HYBRID_WORKER_DEBUG")
+        log_on = env == "1" or (
+            env is None and any(bt.is_mamba_group for bt in self.block_tables)
+        )
+        if log_on and env != "0":
+            decisions = []
+            for i, block_table in enumerate(self.block_tables):
+                if block_table.is_mamba_group:
+                    decisions.append(f"g{i}:SKIP(mamba)")
+                else:
+                    decisions.append(f"g{i}:COMPUTE(fa)")
+            logger.info(
+                "[HYBRID-WORKER][slot_mapping] MultiGroupBlockTable: %s "
+                "num_reqs=%d num_tokens=%d",
+                " | ".join(decisions),
+                num_reqs,
+                positions.shape[0],
+            )
         for i, block_table in enumerate(self.block_tables):
             if block_table.is_mamba_group:
                 continue
