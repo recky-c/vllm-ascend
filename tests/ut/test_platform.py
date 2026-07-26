@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -298,6 +299,61 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertTrue(kwargs["in_profile_run"])
+
+    def test_hybrid_pcp_forces_allgather_moe_adapter(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        hybrid_attn_metadata = SimpleNamespace(
+            hybrid_pcp_bridge_view=object(),
+            hybrid_pcp_forward_view=SimpleNamespace(
+                linear_num_tokens_padded=7,
+            ),
+        )
+        allgather_method = object()
+
+        def get_comm_method(comm_type):
+            if comm_type == MoECommType.ALLGATHER:
+                return allgather_method
+            return object()
+
+        with (
+            patch(
+                "vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER",
+                True,
+                create=True,
+            ),
+            patch("vllm_ascend.platform.is_moe_model", return_value=True),
+            patch("vllm_ascend.platform.enable_sp", return_value=False),
+            patch(
+                "vllm.distributed.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm.distributed.get_dp_group",
+                return_value=MagicMock(world_size=1),
+            ),
+            patch(
+                "vllm_ascend.ascend_forward_context.select_moe_comm_method",
+                return_value=MoECommType.MC2,
+            ),
+            patch(
+                "vllm_ascend.ascend_forward_context.get_mc2_mask",
+                return_value=None,
+            ),
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_comm_method",
+                side_effect=get_comm_method,
+            ),
+        ):
+            kwargs = self.platform.set_additional_forward_context(
+                attn_metadata=hybrid_attn_metadata,
+                vllm_config=vllm_config,
+                dp_metadata=None,
+                num_tokens=7,
+            )
+
+        self.assertEqual(kwargs["moe_comm_type"], MoECommType.ALLGATHER)
+        self.assertIs(kwargs["moe_comm_method"], allgather_method)
+        self.assertEqual(kwargs["max_tokens_across_pcp"], 7)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.ascend_config.init_ascend_config")

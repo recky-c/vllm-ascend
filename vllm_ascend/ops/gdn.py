@@ -27,13 +27,18 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.attention.context_parallel.hybrid_pcp.gdn_adapter import (
+    extract_local_conv_history,
+    select_pcp_conv_histories,
+    validate_gdn_linear_inputs,
+)
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
-from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -174,6 +179,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        hybrid_forward_view = _EXTRA_CTX.hybrid_pcp_forward_view
+        if hybrid_forward_view is not None:
+            validate_gdn_linear_inputs(
+                mixed_qkv,
+                num_actual_tokens,
+                hybrid_forward_view,
+            )
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -234,17 +246,38 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     prefill_seq_offset = max(0, num_seqs - attn_metadata.num_prefills)
                     prefill_cache_indices = non_spec_state_indices_tensor[prefill_seq_offset:]
                     mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
-                    last_width_prefill_x = extract_last_width(
-                        mixed_qkv_non_spec_T, non_spec_query_start_loc[prefill_seq_offset:], state_len
+                    pcp_group = get_pcp_group()
+                    local_prefill_query_start_loc = non_spec_query_start_loc[prefill_seq_offset:]
+                    (
+                        last_width_prefill_x,
+                        local_prefill_seq_lens,
+                    ) = extract_local_conv_history(
+                        mixed_qkv_non_spec_T,
+                        local_prefill_query_start_loc,
+                        state_len,
                     )
-                    pcp_rank = get_pcp_group().rank_in_group
-                    all_last_width_prefill_x = get_pcp_group().all_gather(
-                        last_width_prefill_x.unsqueeze(0).contiguous(), 0
+                    initial_history = self_kv_cache[0][
+                        prefill_cache_indices,
+                        :state_len,
+                        :,
+                    ].transpose(-1, -2)
+                    (
+                        previous_history,
+                        final_history,
+                    ) = select_pcp_conv_histories(
+                        last_width_prefill_x,
+                        local_prefill_seq_lens,
+                        initial_history,
+                        pcp_group,
                     )
-                    if pcp_rank > 0 and prefill_cache_indices.shape[0] > 0:
-                        self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
-                            pcp_rank - 1, ...
-                        ].transpose(-1, -2)
+                    if pcp_group.rank_in_group > 0 and prefill_cache_indices.shape[0] > 0:
+                        current_history = self_kv_cache[0][
+                            prefill_cache_indices,
+                            :state_len,
+                            :,
+                        ]
+                        selected_history = previous_history.transpose(-1, -2)
+                        current_history.copy_(selected_history)
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         mixed_qkv_non_spec_output,
@@ -262,9 +295,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
                     if prefill_cache_indices.shape[0] > 0:
-                        self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
-                            -1, ...
-                        ].transpose(-1, -2)
+                        self_kv_cache[0][
+                            prefill_cache_indices,
+                            :state_len,
+                            :,
+                        ] = final_history.transpose(-1, -2)
                 else:
                     conv_weights_T = conv_weights.transpose(0, 1)
                     activation_num = 1 if self.activation else 0

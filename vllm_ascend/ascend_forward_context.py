@@ -362,6 +362,8 @@ class _ExtraForwardContextProxy:
         "layer_idx",
         "max_tokens_across_dp",
         "max_tokens_across_pcp",
+        "hybrid_pcp_bridge_view",
+        "hybrid_pcp_forward_view",
         "num_accept_tokens",
         "in_profile_run",
         "padded_num_tokens",

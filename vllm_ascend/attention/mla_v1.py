@@ -226,6 +226,14 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
     decode_metadata_cls: type[AscendMLADecodeMetadata] = AscendMLADecodeMetadata
 
+    @staticmethod
+    def get_pcp_group_capability():
+        from vllm_ascend.attention.context_parallel.hybrid_pcp import (
+            dual_chunk_pcp_capability,
+        )
+
+        return dual_chunk_pcp_capability()
+
     def __init__(
         self,
         kv_cache_spec: AscendMLAAttentionSpec,
@@ -1707,6 +1715,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: M,
         need_gather_q_kv: bool = False,
         output: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
@@ -1721,13 +1730,41 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
         num_decode_tokens = attn_metadata.num_decode_tokens
+        bridge_view = _EXTRA_CTX.hybrid_pcp_bridge_view
+        linear_output = output
+        if bridge_view is not None:
+            from vllm_ascend.attention.context_parallel.hybrid_pcp.mla_adapter import (
+                preprocess_hybrid_pcp_mla,
+            )
+
+            if positions is None:
+                raise RuntimeError("Hybrid MLA attention requires linear positions.")
+            output = output.new_empty(
+                (
+                    bridge_view.layout.fa_num_tokens_padded,
+                    output.shape[-1],
+                )
+            )
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
-        o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
+        o_proj_input_shape = (
+            output.shape[0],
+            self.num_heads * self.v_head_dim,
+        )
         o_proj_input = torch.zeros(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
         # MLA Preprocess
-        if (self.fa_quant_layer or self.enable_mlapo) and (
+        if bridge_view is not None:
+            decode_preprocess_res, prefill_preprocess_res = preprocess_hybrid_pcp_mla(
+                self,
+                layer_name,
+                hidden_states,
+                positions,
+                kv_cache,
+                attn_metadata,
+                bridge_view,
+            )
+        elif (self.fa_quant_layer or self.enable_mlapo) and (
             attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS and attn_metadata.num_prefills == 0
         ):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
@@ -1774,4 +1811,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        if bridge_view is not None:
+            from vllm_ascend.attention.context_parallel.hybrid_pcp.mla_adapter import (
+                restore_hybrid_pcp_mla_output,
+            )
+
+            return restore_hybrid_pcp_mla_output(
+                output,
+                linear_output,
+                bridge_view,
+            )
         return output_padded

@@ -49,7 +49,13 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
+from vllm_ascend.worker.v2.pcp.contracts import (
+    HybridPCPManagerProtocol,
+    HybridPCPModelStateProtocol,
+)
+from vllm_ascend.worker.v2.pcp.pcp_manager import (
+    maybe_build_ascend_pcp_manager,
+)
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
@@ -147,7 +153,37 @@ class NPUModelRunner(GPUModelRunner):
                 self.supports_mm_inputs,
                 self.req_states,
                 self.block_tables,
+                self.attn_groups,
             )
+
+    def _get_hybrid_pcp_manager(
+        self,
+    ) -> HybridPCPManagerProtocol | None:
+        manager = self.pcp_manager
+        if isinstance(manager, HybridPCPManagerProtocol):
+            return manager
+        return None
+
+    @torch.inference_mode()
+    def _dummy_run(
+        self,
+        num_tokens: int,
+        *args,
+        skip_attn: bool = False,
+        **kwargs,
+    ):
+        # Hybrid PCP dummy/profile runs must build the same immutable step
+        # contract as a real forward. The parent profile path normally skips
+        # attention metadata to reduce peak memory, which would leave the
+        # attention backends without a bridge/cache-write plan.
+        if self._get_hybrid_pcp_manager() is not None:
+            skip_attn = False
+        return super()._dummy_run(
+            num_tokens,
+            *args,
+            skip_attn=skip_attn,
+            **kwargs,
+        )
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -161,6 +197,7 @@ class NPUModelRunner(GPUModelRunner):
             if (
                 mc2_tokens_capacity is not None
                 and self.max_num_tokens > mc2_tokens_capacity
+                and self._get_hybrid_pcp_manager() is None
                 and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
                 in {MoECommType.MC2, MoECommType.FUSED_MC2}
             ):
@@ -372,6 +409,42 @@ class NPUModelRunner(GPUModelRunner):
         update_cos_sin(self.input_batch.positions)
 
         return self.input_batch
+
+    def prepare_attn(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_attn(input_batch)
+        self._bind_hybrid_prepared_step()
+        return block_tables, slot_mappings
+
+    def prepare_dummy_attn(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_dummy_attn(input_batch)
+        manager = self._get_hybrid_pcp_manager()
+        if manager is not None:
+            manager.prepare_dummy_step(
+                input_batch,
+                block_tables,
+                slot_mappings,
+            )
+            self._bind_hybrid_prepared_step()
+        return block_tables, slot_mappings
+
+    def _bind_hybrid_prepared_step(self) -> None:
+        manager = self._get_hybrid_pcp_manager()
+        if manager is None:
+            return
+        if not isinstance(
+            self.model_state,
+            HybridPCPModelStateProtocol,
+        ):
+            raise RuntimeError("Hybrid PCP requires a hybrid-aware ModelState.")
+        self.model_state.bind_hybrid_prepared_step(
+            manager.consume_prepared_step()
+        )
 
     def postprocess(
         self,

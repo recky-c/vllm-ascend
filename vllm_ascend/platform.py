@@ -925,6 +925,7 @@ class NPUPlatform(Platform):
         """
         # NOTE(Ronald1995): avoid circular import.
         from vllm_ascend.ascend_forward_context import (
+            MoECommType,
             get_mc2_mask,
             get_mrv2_in_profile_run,
             select_moe_comm_method,
@@ -1008,6 +1009,24 @@ class NPUPlatform(Platform):
                 mc2_mask = reserved_mc2_mask[:padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
+        hybrid_bridge_view = getattr(
+            attn_metadata,
+            "hybrid_pcp_bridge_view",
+            None,
+        )
+        hybrid_forward_view = getattr(
+            attn_metadata,
+            "hybrid_pcp_forward_view",
+            None,
+        )
+        max_tokens_across_pcp = hybrid_forward_view.linear_num_tokens_padded if hybrid_forward_view is not None else 0
+        if hybrid_forward_view is not None:
+            # Hybrid PCP's first-stage MoE contract is implemented by the
+            # AllGather/ReduceScatter adapter, which owns valid-token
+            # compaction and restoration. Threshold-based MC2 selection would
+            # bypass that contract and route linear-layout padding.
+            moe_comm_type = MoECommType.ALLGATHER
+            moe_comm_method = get_moe_comm_method(moe_comm_type)
         return {
             "moe_comm_type": moe_comm_type,
             "moe_comm_method": moe_comm_method,
@@ -1024,6 +1043,9 @@ class NPUPlatform(Platform):
             "in_profile_run": in_profile_run,
             "padded_num_tokens": padded_num_tokens,
             "sinks": sinks,
+            "hybrid_pcp_bridge_view": hybrid_bridge_view,
+            "hybrid_pcp_forward_view": hybrid_forward_view,
+            "max_tokens_across_pcp": max_tokens_across_pcp,
         }
 
     @staticmethod

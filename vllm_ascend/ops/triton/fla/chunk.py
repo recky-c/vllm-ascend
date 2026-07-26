@@ -152,12 +152,48 @@ def chunk_gated_delta_rule_fwd(
             update_chunk_offsets=update_chunk_offsets_chunk64,
             num_decodes=actual_num_decodes,
         )
-        all_final_state = get_pcp_group().all_gather(final_state.unsqueeze(0), 0)
+        local_valid = (cu_seqlens[1:] - cu_seqlens[:-1]) > 0
+        valid_marker = local_valid[:, None, None, None].expand(
+            -1,
+            final_state.shape[1],
+            final_state.shape[2],
+            1,
+        )
+        final_state_payload = torch.cat(
+            (final_state, valid_marker.to(final_state.dtype)),
+            dim=-1,
+        )
+        all_final_state_payload = get_pcp_group().all_gather(
+            final_state_payload.unsqueeze(0),
+            0,
+        )
+        all_final_state = all_final_state_payload[..., :-1]
+        valid_by_rank = all_final_state_payload[:, :, 0, 0, -1] > 0
         final_chunk_indices = final_chunk_indices_chunk64
         if final_chunk_indices is None:
             final_chunk_indices = prepare_final_chunk_indices(cu_seqlens, chunk_size)
         final_h_update = h_update[:, final_chunk_indices, :, :, :]
         all_final_h_update = get_pcp_group().all_gather(final_h_update, 0)
+
+        # Empty linear segments are state identities. Explicitly impose that
+        # contract so the physical last rank is equivalent to the last rank
+        # that owns tokens for each request.
+        valid_expanded = valid_by_rank[:, :, None, None, None]
+        all_final_state = torch.where(
+            valid_expanded,
+            all_final_state,
+            initial_state.unsqueeze(0),
+        )
+        identity = torch.eye(
+            all_final_h_update.shape[-1],
+            dtype=all_final_h_update.dtype,
+            device=all_final_h_update.device,
+        ).view(1, 1, 1, *all_final_h_update.shape[-2:])
+        all_final_h_update = torch.where(
+            valid_expanded,
+            all_final_h_update,
+            identity,
+        )
 
         updated_state = final_state.new_empty(get_pcp_group().world_size, *final_state.shape)
         updated_state[0, ...] = all_final_state[0]

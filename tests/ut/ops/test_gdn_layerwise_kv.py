@@ -23,6 +23,10 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+from vllm_ascend.attention.context_parallel.hybrid_pcp.gdn_adapter import (
+    extract_local_conv_history,
+    select_pcp_conv_histories,
+)
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
@@ -37,6 +41,66 @@ class _Linear(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor):
         return hidden_states[:, : self.output_size], None
+
+
+def test_select_pcp_conv_histories_skips_empty_ranks():
+    histories = torch.tensor(
+        [
+            [[[10.0, 11.0]], [[20.0, 21.0]]],
+            [[[30.0, 31.0]], [[40.0, 41.0]]],
+            [[[50.0, 51.0]], [[60.0, 61.0]]],
+        ]
+    )
+    counts_by_rank = torch.tensor(
+        [
+            [2, 2],
+            [0, 2],
+            [2, 0],
+        ]
+    )
+    marker = counts_by_rank[:, :, None, None].to(histories.dtype)
+    gathered_payload = torch.cat((histories, marker), dim=-1)
+
+    class FakePCPGroup:
+        rank_in_group = 2
+
+        def all_gather(self, payload, dim):
+            assert payload.shape == (1, 2, 1, 3)
+            assert dim == 0
+            return gathered_payload
+
+    previous, final = select_pcp_conv_histories(
+        histories[2],
+        torch.tensor([2, 0]),
+        torch.zeros_like(histories[2]),
+        FakePCPGroup(),
+    )
+
+    assert torch.equal(previous[0], histories[0, 0])
+    assert torch.equal(previous[1], histories[1, 1])
+    assert torch.equal(final[0], histories[2, 0])
+    assert torch.equal(final[1], histories[1, 1])
+
+
+def test_extract_local_conv_history_handles_short_and_empty_segments():
+    history, seq_lens = extract_local_conv_history(
+        torch.tensor([[10.0, 20.0, 21.0]]),
+        torch.tensor([0, 1, 3]),
+        width=3,
+    )
+    assert seq_lens.tolist() == [1, 2]
+    assert history[:, 0].tolist() == [
+        [0.0, 0.0, 10.0],
+        [0.0, 20.0, 21.0],
+    ]
+
+    empty, empty_lens = extract_local_conv_history(
+        torch.empty((1, 0)),
+        torch.tensor([0, 0]),
+        width=3,
+    )
+    assert empty_lens.tolist() == [0]
+    assert empty.tolist() == [[[0.0, 0.0, 0.0]]]
 
 
 class _Norm(nn.Module):

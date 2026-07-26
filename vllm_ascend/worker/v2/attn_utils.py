@@ -17,7 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import vllm
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -48,6 +49,10 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor
+from vllm_ascend.worker.v2.pcp.contracts import (
+    HybridAttentionMetadataMap,
+    HybridPreparedStep,
+)
 
 _ATTENTION_MASK_BUILDER = None
 
@@ -207,6 +212,102 @@ def build_attn_metadata(
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
+
+
+def build_hybrid_attn_metadata(
+    *,
+    prepared_step: HybridPreparedStep,
+    cudagraph_mode: CUDAGraphMode,
+    attn_groups: list[list[AttentionGroup]],
+    max_model_len: int,
+    model_specific_metadata_factory: Callable[[Any, int, bool], ModelSpecificAttnMetadata | None],
+    for_cudagraph_capture: bool = False,
+) -> HybridAttentionMetadataMap:
+    """Build each Hybrid PCP group from its declared input view."""
+
+    output: dict[str, Any] = {}
+    for group_inputs in prepared_step.group_inputs:
+        group_id = group_inputs.group_id
+        input_batch = group_inputs.input_batch
+        if cudagraph_mode == CUDAGraphMode.FULL:
+            num_reqs = input_batch.num_reqs_after_padding
+            num_tokens = input_batch.num_tokens_after_padding
+        else:
+            num_reqs = input_batch.num_reqs
+            num_tokens = input_batch.num_tokens
+
+        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np[: num_reqs + 1])
+        query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
+        seq_lens_cpu = torch.from_numpy(input_batch.seq_lens_np)[:num_reqs]
+        max_seq_len = (
+            max_model_len if for_cudagraph_capture else input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        )
+        model_specific_metadata = model_specific_metadata_factory(
+            input_batch,
+            num_reqs,
+            for_cudagraph_capture,
+        )
+        common_extra_kwargs = (
+            model_specific_metadata.get_extra_common_attn_kwargs(
+                group_id,
+                num_reqs,
+            )
+            if model_specific_metadata is not None
+            else {}
+        )
+        attn_state = input_batch.attn_state
+        if group_inputs.cache_write_plan is not None and prepared_step.layout.has_prefill:
+            # Hybrid FA backends are cache-first: every rank has just written
+            # the complete prefill KV replica described by the plan, and the
+            # virtual query rows must read it through their block tables.
+            attn_state = AscendAttentionState.PrefillCacheHit
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=query_start_loc_gpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_upper_bound=seq_lens_cpu,
+            seq_lens=input_batch.seq_lens[:num_reqs],
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=input_batch.num_scheduled_tokens.max().item(),
+            block_table_tensor=group_inputs.block_table,
+            slot_mapping=group_inputs.slot_mapping,
+            positions=input_batch.positions,
+            attn_state=attn_state,
+            graph_pad_size=-1,
+            num_input_tokens=0,
+            max_seq_len=max_seq_len,
+            causal=True,
+            **common_extra_kwargs,
+        )
+
+        for attn_group in attn_groups[group_id]:
+            builder = attn_group.get_metadata_builder(0)
+            if for_cudagraph_capture:
+                metadata = builder.build_for_cudagraph_capture(common_attn_metadata)
+            else:
+                extra_kwargs = (
+                    model_specific_metadata.get_extra_attn_kwargs(
+                        builder,
+                        num_reqs,
+                    )
+                    if model_specific_metadata is not None
+                    else {}
+                )
+                metadata = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                    **extra_kwargs,
+                )
+            for layer_name in attn_group.layer_names:
+                metadata.hybrid_cache_write_plan = group_inputs.cache_write_plan
+                output[layer_name] = metadata
+
+    return HybridAttentionMetadataMap(
+        output,
+        bridge_view=prepared_step.bridge_view,
+        forward_view=prepared_step.forward_view,
+    )
 
 
 def build_attn_state(

@@ -30,6 +30,9 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ops.fused_moe.hybrid_pcp import (
+    HybridPCPTokenCompactor,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass
@@ -49,6 +52,7 @@ class PrepareAndFinalize(ABC):
 
     def __init__(self, moe_config: FusedMoEConfig):
         self.moe_config = moe_config
+        self._hybrid_pcp_compactor = HybridPCPTokenCompactor()
 
     @abstractmethod
     def prepare(
@@ -332,6 +336,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
     TP AG → Attn → TP RS → EP AG → MoE → EP RS
     """
 
+    @torch.compiler.disable
     def prepare(
         self,
         hidden_states: torch.Tensor,
@@ -355,6 +360,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
     def _prepare_with_ep_group(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, quant_type=QuantType.NONE
     ) -> MoEPrepareOutput:
+        hidden_states, router_logits = self._hybrid_pcp_compactor.compact_inputs(
+            hidden_states,
+            router_logits,
+            _EXTRA_CTX.hybrid_pcp_forward_view,
+        )
         pertoken_scale = None
         if quant_type == QuantType.W8A8:
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
@@ -425,6 +435,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             MoEPrepareOutput with global tensors.
         """
+        hidden_states, router_logits = self._hybrid_pcp_compactor.compact_inputs(
+            hidden_states,
+            router_logits,
+            _EXTRA_CTX.hybrid_pcp_forward_view,
+        )
         self.enable_shared_expert_dp = enable_shared_expert_dp
         if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
@@ -466,6 +481,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         )
 
     def all_gather_input_id_with_dp_group(self, input_ids: torch.Tensor) -> torch.Tensor:
+        input_ids = self._hybrid_pcp_compactor.compact_tensor(input_ids)
         if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
             pad_size = max_tokens_across_dp - self.num_tokens
@@ -475,6 +491,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             input_ids = self.moe_config.dp_group.all_gather(input_ids, 0)
         return input_ids
 
+    @torch.compiler.disable
     def finalize(
         self,
         hidden_states: torch.Tensor,
@@ -509,7 +526,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
         hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
 
-        return hidden_states
+        return self._hybrid_pcp_compactor.restore_output(hidden_states)
 
     def _finalize_with_dp_group(self, hidden_states: torch.Tensor, reduce_results: bool) -> torch.Tensor:
         """
@@ -528,4 +545,4 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
-        return hidden_states
+        return self._hybrid_pcp_compactor.restore_output(hidden_states)

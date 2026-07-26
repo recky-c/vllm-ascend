@@ -215,6 +215,14 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     reorder_batch_threshold: int = 1
     metadata_cls: type[AscendMetadata] = AscendMetadata
 
+    @staticmethod
+    def get_pcp_group_capability():
+        from vllm_ascend.attention.context_parallel.hybrid_pcp import (
+            dual_chunk_pcp_capability,
+        )
+
+        return dual_chunk_pcp_capability()
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -418,6 +426,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
 
 class AscendAttentionBackendImpl(AttentionImpl):
+    supports_pcp: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -1567,6 +1577,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
+
+        if _EXTRA_CTX.hybrid_pcp_bridge_view is not None:
+            from vllm_ascend.attention.context_parallel.hybrid_pcp.gqa_adapter import (
+                forward_hybrid_pcp_gqa,
+            )
+
+            if key is None or value is None:
+                raise RuntimeError("Hybrid PCP GQA requires explicit key/value operands.")
+            return forward_hybrid_pcp_gqa(
+                self,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                _EXTRA_CTX.hybrid_pcp_bridge_view,
+            )
 
         # Initialize key_cache and value_cache from kv_cache if not already set.
         # This is needed for DecodeOnly mode where key/value are None but we still

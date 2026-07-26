@@ -193,6 +193,14 @@ def _build_non_spec_chunked_prefill_metadata(
 class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
+    @staticmethod
+    def get_pcp_group_capability():
+        from vllm_ascend.attention.context_parallel.hybrid_pcp import (
+            contiguous_state_pcp_capability,
+        )
+
+        return contiguous_state_pcp_capability()
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,

@@ -21,16 +21,25 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
-import vllm_ascend.worker.v2.pcp_manager as pcp_manager_module
+import vllm_ascend.worker.v2.pcp.pcp_manager as pcp_manager_module
+from vllm_ascend.attention.context_parallel.hybrid_pcp import (
+    contiguous_state_pcp_capability,
+    dual_chunk_pcp_capability,
+)
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import (
+from vllm_ascend.worker.v2.pcp.capability import (
+    resolve_group_capabilities,
+)
+from vllm_ascend.worker.v2.pcp.pcp_manager import (
     AscendPCPManager,
     maybe_build_ascend_pcp_manager,
 )
+from vllm_ascend.worker.v2.pcp.validation import validate_hybrid_batch
 
 
 def _make_local_pcp_batch() -> AscendInputBatch:
@@ -225,3 +234,67 @@ def test_maybe_build_ascend_pcp_manager_uses_ascend_subclass():
     assert manager.dcp_rank == 0
     assert manager.cp_interleave == 4
     validate_config.assert_called_once_with(vllm_config, False)
+
+
+def test_resolve_group_capabilities_checks_every_builder():
+    fa_capability = dual_chunk_pcp_capability()
+
+    class FABuilder:
+        @staticmethod
+        def get_pcp_group_capability():
+            return fa_capability
+
+    groups = [
+        [
+            SimpleNamespace(
+                metadata_builders=[FABuilder(), FABuilder()],
+            )
+        ]
+    ]
+
+    assert resolve_group_capabilities(groups) == (fa_capability,)
+
+
+def test_resolve_group_capabilities_rejects_heterogeneous_group():
+    class FABuilder:
+        @staticmethod
+        def get_pcp_group_capability():
+            return dual_chunk_pcp_capability()
+
+    class StateBuilder:
+        @staticmethod
+        def get_pcp_group_capability():
+            return contiguous_state_pcp_capability()
+
+    groups = [
+        [
+            SimpleNamespace(
+                metadata_builders=[FABuilder(), StateBuilder()],
+            )
+        ]
+    ]
+
+    with pytest.raises(NotImplementedError, match="heterogeneous"):
+        resolve_group_capabilities(groups)
+
+
+def test_validate_hybrid_batch_rejects_continued_prefill():
+    batch = SimpleNamespace(
+        is_prefilling_np=np.array([False, True, True]),
+        num_computed_tokens_np=np.array([8, 0, 3]),
+        num_scheduled_tokens=np.array([1, 4, 2]),
+    )
+
+    with pytest.raises(NotImplementedError, match="continued prefill"):
+        validate_hybrid_batch(batch)
+
+
+def test_validate_hybrid_batch_rejects_empty_prefill():
+    batch = SimpleNamespace(
+        is_prefilling_np=np.array([False, True]),
+        num_computed_tokens_np=np.array([8, 0]),
+        num_scheduled_tokens=np.array([1, 0]),
+    )
+
+    with pytest.raises(RuntimeError, match="at least one token"):
+        validate_hybrid_batch(batch)

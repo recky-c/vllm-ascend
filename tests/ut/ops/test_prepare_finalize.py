@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -203,3 +204,53 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         result_with_tp = layer.finalize(h_out, reduce_results=True)
         self.assertEqual(result_with_tp.shape[0], 3)
+
+    @patch(
+        "vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp_by_pass",
+        return_value=False,
+    )
+    @patch(
+        "vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp",
+        return_value=False,
+    )
+    def test_allgather_hybrid_pcp_excludes_linear_padding(
+        self,
+        mock_enable_sp,
+        mock_enable_sp_by_pass,
+    ):
+        self.moe_config.dp_size = 1
+        self.moe_config.pcp_size = 1
+        layer = PrepareAndFinalizeWithAllGather(self.moe_config)
+        valid_mask = torch.tensor([True, True, False, True, False])
+        forward_view = SimpleNamespace(
+            linear_valid_mask=valid_mask,
+            linear_num_tokens=3,
+        )
+        hidden_states = torch.arange(20, dtype=torch.float32).view(5, 4)
+        router_logits = torch.arange(10, dtype=torch.float32).view(5, 2)
+
+        with patch(
+            "vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX",
+            SimpleNamespace(hybrid_pcp_forward_view=forward_view),
+        ):
+            prepared = layer.prepare(hidden_states, router_logits)
+            self.assertTrue(
+                torch.equal(
+                    prepared.hidden_states,
+                    hidden_states[valid_mask],
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    prepared.router_logits,
+                    router_logits[valid_mask],
+                )
+            )
+            restored = layer.finalize(
+                prepared.hidden_states + 1,
+                reduce_results=False,
+            )
+
+        expected = torch.zeros_like(hidden_states)
+        expected[valid_mask] = hidden_states[valid_mask] + 1
+        self.assertTrue(torch.equal(restored, expected))

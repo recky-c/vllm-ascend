@@ -171,7 +171,25 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 (hidden_states.shape[0], hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
             )
 
-        torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
+        if _EXTRA_CTX.hybrid_pcp_bridge_view is not None:
+            forward_context: ForwardContext = get_forward_context()
+            attn_metadata = forward_context.attn_metadata[self.mla_attn.layer_name]
+            self.mla_attn.impl.forward(
+                self.mla_attn.layer_name,
+                hidden_states,
+                self.mla_attn.kv_cache,
+                attn_metadata,
+                need_gather_q_kv,
+                output,
+                positions=positions,
+            )
+        else:
+            torch.ops.vllm.mla_forward(
+                hidden_states,
+                need_gather_q_kv,
+                output,
+                self.prefix,
+            )
         output = output.view(-1, hidden_dim)
         return output
 

@@ -28,10 +28,12 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.worker.v2.attn_utils import build_hybrid_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import (
     AscendAttentionMetadataMixin,
 )
+from vllm_ascend.worker.v2.pcp.contracts import HybridPreparedStep
 
 
 class AscendMambaHybridModelState(
@@ -39,6 +41,40 @@ class AscendMambaHybridModelState(
     MambaHybridModelState,
 ):
     """Ascend adapter for the upstream hybrid model-state lifecycle."""
+
+    def bind_hybrid_prepared_step(
+        self,
+        prepared_step: HybridPreparedStep,
+    ) -> None:
+        if getattr(self, "_hybrid_prepared_step", None) is not None:
+            raise RuntimeError("A HybridPreparedStep is already bound to the model state.")
+        last_step_id = getattr(self, "_last_hybrid_step_id", 0)
+        if prepared_step.step_id <= last_step_id:
+            raise RuntimeError(
+                f"HybridPreparedStep must be newer than the last bound step: {prepared_step.step_id} <= {last_step_id}."
+            )
+        self._last_hybrid_step_id = prepared_step.step_id
+        self._hybrid_prepared_step = prepared_step
+
+    def preprocess_state(
+        self,
+        input_batch: AscendInputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        kv_cache_config: KVCacheConfig,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        try:
+            super().preprocess_state(
+                input_batch,
+                block_tables,
+                kv_cache_config,
+                num_computed_tokens,
+            )
+        except Exception:
+            # execute_model invokes preprocess_state after the Runner has bound
+            # the step but before prepare_attn can consume it.
+            self._hybrid_prepared_step = None
+            raise
 
     def _build_model_specific_metadata(
         self,
@@ -83,6 +119,24 @@ class AscendMambaHybridModelState(
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
     ) -> dict[str, Any]:
+        prepared_step = getattr(self, "_hybrid_prepared_step", None)
+        if prepared_step is not None:
+            if prepared_step.linear_batch is not input_batch:
+                self._hybrid_prepared_step = None
+                raise RuntimeError("HybridPreparedStep is bound to a different input batch.")
+            try:
+                self.attn_metadata = build_hybrid_attn_metadata(
+                    prepared_step=prepared_step,
+                    cudagraph_mode=cudagraph_mode,
+                    attn_groups=attn_groups,
+                    max_model_len=self.max_model_len,
+                    model_specific_metadata_factory=(self._build_model_specific_metadata),
+                    for_cudagraph_capture=for_capture,
+                )
+                return self.attn_metadata
+            finally:
+                self._hybrid_prepared_step = None
+
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
         else:
