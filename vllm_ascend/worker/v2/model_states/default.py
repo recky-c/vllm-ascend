@@ -23,16 +23,21 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import (
+    ModelSpecificAttnMetadata,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 
-class AscendModelState(DefaultModelState):
-    """Model state for Ascend NPUs."""
+class AscendAttentionMetadataMixin:
+    """Build Ascend attention metadata for a model-state implementation."""
 
-    def prepare_attn(
+    max_model_len: int
+
+    def _prepare_ascend_attn(
         self,
         input_batch: AscendInputBatch,
         cudagraph_mode: CUDAGraphMode,
@@ -41,8 +46,8 @@ class AscendModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
-        """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
             num_reqs = input_batch.num_reqs_after_padding
@@ -53,6 +58,7 @@ class AscendModelState(DefaultModelState):
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
+
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
         self.attn_metadata = build_attn_metadata(
@@ -72,6 +78,32 @@ class AscendModelState(DefaultModelState):
             seq_lens_np=input_batch.seq_lens_np,
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
+            model_specific_attn_metadata=model_specific_attn_metadata,
             for_cudagraph_capture=for_capture,
         )
         return self.attn_metadata
+
+
+class AscendModelState(AscendAttentionMetadataMixin, DefaultModelState):
+    """Model state for Ascend NPUs."""
+
+    def prepare_attn(
+        self,
+        input_batch: AscendInputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        """Build attention metadata with Ascend-specific fields."""
+        return self._prepare_ascend_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture,
+        )
