@@ -12,7 +12,10 @@ import warnings
 
 import torch
 from einops import rearrange
+from vllm.distributed import get_pcp_group
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
+
+from vllm_ascend.ops.gdn_pcp_ssm import correct_pcp_prefill_ssm_state
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_o import chunk_fwd_o  # noqa: F401
@@ -41,6 +44,9 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
     chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
     chunk_indices_chunk64_host = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64_host
+    chunk_offsets_chunk64 = None if prebuilt_meta is None else getattr(
+        prebuilt_meta, "chunk_offsets_chunk64", None
+    )
     chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
     g = chunk_local_cumsum(
         g,
@@ -120,6 +126,22 @@ def chunk_gated_delta_rule_fwd(
         _fs_full = initial_state.clone()
         _fs_full[keep_meta] = final_state
         final_state = _fs_full
+
+    if get_pcp_group().world_size > 1:
+        assert cu_seqlens is not None
+        h, v_new, final_state = correct_pcp_prefill_ssm_state(
+            initial_state=initial_state,
+            local_final_state=final_state,
+            local_h=h,
+            local_v_new=v_new,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+            chunk_offsets=chunk_offsets_chunk64,
+        )
 
     o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
         q_ascendc,
