@@ -49,7 +49,10 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
+from vllm_ascend.worker.v2.pcp_manager import (
+    maybe_build_ascend_pcp_manager,
+    maybe_partition_ascend_pcp_batch,
+)
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
@@ -366,7 +369,9 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=attn_state,
         )
 
-        self.input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(self.pcp_manager, self.input_batch)
+        self.input_batch = maybe_partition_ascend_pcp_batch(
+            self.pcp_manager, self.input_batch
+        )
 
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(self.input_batch.positions)

@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -26,6 +27,12 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.hybrid_pcp import (
+    HybridPreparedStep,
+    build_fa_prefill_global_maps,
+    init_hybrid_pcp,
+    partition_hybrid_batch,
+)
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 
@@ -33,8 +40,25 @@ class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
 
     def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
+        max_num_reqs = kwargs.get("max_num_reqs")
+        max_num_tokens = kwargs.get("max_num_tokens")
         super().__init__(*args, **kwargs)
         self.vllm_config = vllm_config
+        model_config = getattr(vllm_config, "model_config", None)
+        self._is_hybrid = bool(getattr(model_config, "is_hybrid", False))
+        # Nested hybrid bag (None when this step is non-hybrid / cleared).
+        self.hybrid: HybridPreparedStep | None = None
+        self._hybrid_step_id = 0
+        self._linear_batch_partitioner = init_hybrid_pcp(
+            is_hybrid=self._is_hybrid,
+            vllm_config=vllm_config,
+            pcp_world_size=self.pcp_world_size,
+            pcp_rank=self.pcp_rank,
+            device=self.device,
+            req_states=self._req_states,
+            max_num_reqs=max_num_reqs,
+            max_num_tokens=max_num_tokens,
+        )
 
     @staticmethod
     def validate_config(
@@ -89,6 +113,61 @@ class AscendPCPManager(PCPManager):
             local_batch.num_scheduled_tokens,
         )
         return local_batch
+
+    def partition_linear_batch(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[AscendInputBatch, int]:
+        """Delegate linear-batch materialization to the hybrid helper."""
+        if self._linear_batch_partitioner is None:
+            raise RuntimeError(
+                "partition_linear_batch requires a hybrid PCP manager."
+            )
+        return self._linear_batch_partitioner.partition(input_batch)
+
+    def _get_fa_prefill_global_maps(
+        self,
+        *,
+        num_decode_tokens: int,
+        fa_tokens_padded: int,
+    ) -> tuple[np.ndarray, ...]:
+        """Read upstream DualChunk private state and delegate map construction."""
+        if self._padded_gather_idx is None:
+            raise RuntimeError(
+                "FA prefill maps require partition_batch() to run first."
+            )
+        if self._global_batch is None:
+            raise RuntimeError("FA prefill maps require a partitioned global batch.")
+
+        global_batch = self._global_batch
+        fa_segments_by_rank = [
+            self._get_rank_segments(
+                rank,
+                global_batch.num_scheduled_tokens,
+                global_batch.num_computed_tokens_np,
+                global_batch.is_prefilling_np,
+                global_batch.query_start_loc_np,
+            )
+            for rank in range(self.pcp_world_size)
+        ]
+        return build_fa_prefill_global_maps(
+            padded_gather_idx=self._padded_gather_idx.detach().cpu().numpy(),
+            pcp_world_size=self.pcp_world_size,
+            num_decode_tokens=num_decode_tokens,
+            fa_tokens_padded=fa_tokens_padded,
+            fa_segments_by_rank=fa_segments_by_rank,
+        )
+
+
+def maybe_partition_ascend_pcp_batch(
+    manager: AscendPCPManager | None,
+    input_batch: AscendInputBatch,
+) -> AscendInputBatch:
+    """Partition for Ascend PCP; hybrid uses the outer dual-view wrapper."""
+    if manager is None:
+        return input_batch
+    if manager._is_hybrid:
+        return partition_hybrid_batch(manager, input_batch)
+    return manager.partition_batch(input_batch)
 
 
 def maybe_build_ascend_pcp_manager(
