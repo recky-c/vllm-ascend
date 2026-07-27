@@ -22,10 +22,14 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.hybrid_pcp import (
+    init_linear_pcp,
+    partition_sequential_batch,
+)
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
 
@@ -72,8 +76,22 @@ class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
 
     def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
+        max_num_reqs = kwargs.get("max_num_reqs")
+        max_num_tokens = kwargs.get("max_num_tokens")
         super().__init__(*args, **kwargs)
         self.vllm_config = vllm_config
+        model_config = getattr(vllm_config, "model_config", None)
+        self._is_hybrid = bool(getattr(model_config, "is_hybrid", False))
+        self._linear_batch_partitioner = init_linear_pcp(
+            is_hybrid=self._is_hybrid,
+            vllm_config=vllm_config,
+            pcp_world_size=self.pcp_world_size,
+            pcp_rank=self.pcp_rank,
+            device=self.device,
+            req_states=self._req_states,
+            max_num_reqs=max_num_reqs,
+            max_num_tokens=max_num_tokens,
+        )
 
     @staticmethod
     def validate_config(
@@ -114,7 +132,7 @@ class AscendPCPManager(PCPManager):
             raise NotImplementedError("MRV2 PCP supports PIECEWISE CUDA graphs only.")
 
     def partition_batch(self, input_batch: AscendInputBatch) -> AscendInputBatch:
-        """Partition the batch and update Ascend-specific local metadata."""
+        """DualChunk partition + Ascend metadata (non-hybrid / FA-only path)."""
         local_batch = super().partition_batch(input_batch)
         assert isinstance(local_batch, AscendInputBatch)
 
@@ -128,6 +146,28 @@ class AscendPCPManager(PCPManager):
             local_batch.num_scheduled_tokens,
         )
         return local_batch
+
+    def partition_linear_batch(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[AscendInputBatch, int, list[list[RankSegment]]]:
+        """Delegate sequential local-batch materialization."""
+        if self._linear_batch_partitioner is None:
+            raise RuntimeError(
+                "partition_linear_batch requires a hybrid PCP manager."
+            )
+        return self._linear_batch_partitioner.partition(input_batch)
+
+
+def maybe_partition_ascend_pcp_batch(
+    manager: AscendPCPManager | None,
+    input_batch: AscendInputBatch,
+) -> AscendInputBatch:
+    """Partition for Ascend PCP; hybrid uses single-view sequential split."""
+    if manager is None:
+        return input_batch
+    if manager._is_hybrid:
+        return partition_sequential_batch(manager, input_batch)
+    return manager.partition_batch(input_batch)
 
 
 def maybe_build_ascend_pcp_manager(

@@ -1,330 +1,251 @@
-# Ascend MRv2 Hybrid PCP — 单视图线性切分方案（简化版）
+# Ascend MRv2 Hybrid PCP — 单视图顺序切分方案（简化版）
 
-> 状态：草案，供评审对齐；与双视图方案并行探索，互不替代。  
+> 状态：草案（已按「一套切分走到底 + 层后同步」修订）。  
 > 工作分支：`feat/mrv2-hybrid-pcp-linear-only`  
 > 代码基线：`c8b480b7f`（Hybrid MRv2 主干 + PCP `validate_config` 放宽 MLA-only；**尚未**接入双视图 PCP 生产端）  
 > 对照文档：同目录 `mrv2_hybrid_pcp_design.md`（双视图 / DualChunk FA 旁路方案）  
-> 一句话：**全网只保留一套线性局部视图；不做 DualChunk、不做双视图桥接、不考虑 FA 负载均衡。**
+> 一句话：**FA 与 GDN 共用同一套顺序（因果连续）切分；层间/层后同步 KV 或 SSM；不做双视图、不做布局桥、不做 FA 负载均衡，也不再单独搞一套 V1「接缝」体系。**
 
 ---
 
-## 0. 为什么再开一套简化方案
+## 0. 方案定位
 
-双视图方案（`mrv2_hybrid_pcp_design.md`）的核心是：
+双视图方案要同时伺候两套布局（线性给 GDN、DualChunk 给 FA），再用 bridge 来回变。  
+本方案更简单：
 
-- GDN 友好 → **线性主路径**
-- FA 跟上游 → **DualChunk 旁路**
-- 进/出 FA → **三套 bridge idx + 单次 AG**
-
-这套完整，但也重：生产端、消费端、backend adapter、idx 正确性都耦合在「两套布局」上。
-
-本方案刻意收窄目标：
+```text
+一套顺序切分 ──► 所有层（FA / GDN / MLP / MoE）同一 local_batch
+        │
+        ▼
+每层算完本卡局部结果后，按层类型同步必要状态：
+  · FA 层 → 同步 KV（或 latent KV）
+  · GDN 层 → 同步 SSM / conv 等递推状态
+        │
+        ▼
+下一层继续用同一套 token 布局往下算
+```
 
 | 目标 | 本方案 | 双视图方案 |
 |------|--------|------------|
-| 视图数量 | **1（仅线性）** | 2（linear + FA DualChunk） |
-| FA 布局 | 与 GDN/MLP **同一套** L1 连续段 | 上游 DualChunk / virtual-batch |
-| 负载均衡 | **不做**（接受 prefill 段长度按名次不均） | DualChunk 改善 FA 负载 |
-| 布局转换 | **无** bridge idx | 三个 hybrid bridge idx |
-| 复杂度 | 低，优先跑通正确性 | 高，优先 FA 性能与上游对齐 |
-
-适用场景：先验证「Hybrid + PCP 在线性因果切分下能否端到端正确」，再决定是否回到双视图做 FA 性能优化。
+| 切分 | **一套顺序切分走到底** | 线性 + DualChunk 两套 |
+| FA / GDN | **同一布局** | 布局不同，靠 bridge |
+| 跨卡依赖 | **  KV / SSM** | FA 靠 bridge+AG；GDN 靠 V1 接缝套件 |
+| 负载均衡 | **不做** | DualChunk 改善 FA 负载 |
+| V1 GDN「接缝」专项 | **不单独引入** | 明确复用 V1 接缝 |
 
 ---
 
-## 1. 从双视图方案继承什么 / 明确丢掉什么
+## 1. 继承与丢掉
 
-### 1.1 继承（可取部分）
+### 1.1 仍可借用
 
-1. **宿主仍是上游 MRv2 框架**：不重写 `execute_model()`；Runner 路径保持 `prepare_inputs → prepare_attn → forward → restore`。  
-2. **线性切分语义（V1 L1）**：prefill 按请求做**因果连续**分段；decode **各卡复制**。  
-3. **GDN 接缝留在 ops**：`conv last_width AG`、`initial_state_mode`、SSM `final_state` AG 修正；Manager 只保证「本卡 token 是因果连续段」。  
-4. **Mamba/GDN state 不分片**：请求级 state 可复制；接缝靠通信，不靠按 token 切 state。  
-5. **FA KV 本阶段不分片**（与上游 PCP 精神一致；不做 DCP）。  
-6. **配置边界**：不做 chunked prefill / spec / PD / MM / PP / LoRA / DCP；第一阶段 EP 关闭；`mamba_cache_mode=none`、`enable_prefix_caching=False`。  
-7. **capability fail-fast**：不用 `model_type` 白名单卡死；未支持组合直接报错。  
-8. **MoE 走 linear pad + `linear_valid_mask`**：与「主路径即线性」天然一致（双视图里 MoE 也走这条）。  
-9. **嵌套 step bag**：用一个只读 step 对象挂在 Manager 上，避免字段散落（可比照 `HybridPreparedStep`，但字段更少）。
+1. 不重写 `execute_model()`；Runner 仍是 `prepare_inputs → prepare_attn → forward → restore`。  
+2. **顺序切分语义**：prefill 按请求做因果连续分段；decode 各卡复制。  
+3. FA KV / GDN state **都不按 PCP 做存储分片**（同步后各卡持有算下一步所需的副本或前缀）。  
+4. 配置边界：不做 chunked / spec / PD / MM / PP / LoRA / DCP；第一阶段关 EP；`mamba_cache_mode=none`、`enable_prefix_caching=False`。  
+5. capability fail-fast；MoE 用 local batch 的 pad / `is_padding`。  
+6. 精简 step bag，避免字段散落。
 
-### 1.2 丢掉（相对双视图）
+### 1.2 明确丢掉
 
-1. **不上游 `partition_batch()` 作为主路径**（那是 DualChunk）。  
-2. **无 `fa_batch` / virtual-batch**。  
-3. **无** `hybrid_linear_ag_restore_idx` / `hybrid_global_to_fa_idx` / `hybrid_fa_to_linear_idx` 三桥。  
-4. **无** FA enter/exit 布局变换；无「AG → 原序 → 再取 DualChunk」链路。  
-5. **不考虑** DualChunk 式 FA 负载均衡。  
-6. **不引入** 为双视图服务的 `CacheWritePlan(PREFILL/ALREADY_GLOBAL)` 复杂分支（若 FA 需要 AG KV，用更直接的「本卡 Q + 已聚集/本地 KV」契约即可，见 §4.3）。
+1. DualChunk / `fa_batch` / virtual-batch。  
+2. 三套 bridge idx 与 FA enter/exit 换布局。  
+3. FA 负载均衡。  
+4. **不再把 V1「接缝」（last_width AG + SSM 重跑修正等）当作本方案必选子系统**——跨卡因果依赖统一收成「同步 SSM / 同步 KV」。  
+5. 主路径不调用上游 `partition_batch()`（DualChunk）。
 
 ---
 
-## 2. 问题定义与范围
+## 2. 范围与成功标准
 
-### 2.1 要解决什么
+| 类别 | 第一版 |
+|------|--------|
+| PCP + TP；MLA/GQA + GDN 同布局 | ✅ |
+| dense / MoE Hybrid | ✅ |
+| 双视图 / bridge / FA 均衡 / V1 接缝专项 | ❌ |
+| eager 正确性 | ✅ 必达 |
+| piecewise | 后置 |
 
-在 MRv2 上，让 **Hybrid（KV-attention + GDN）** 在 `pcp_size > 1` 下，用**单一线性切分**完成 prefill/decode 正确性闭环。
-
-### 2.2 第一版范围
-
-| 类别 | 第一版 | 说明 |
-|------|--------|------|
-| PCP + TP | ✅ | 主叠加 |
-| MLA/GQA + GDN | ✅ | FA 与 GDN **共用线性 batch** |
-| dense / MoE Hybrid | ✅ | MoE 认 linear pad + valid mask |
-| FA 负载均衡 | ❌ | 明确不做 |
-| 双视图 / bridge | ❌ | 明确不做 |
-| EP / DCP / chunked / spec / PD / MM / PP / LoRA | ❌ | 同双视图第一阶段 |
-| eager | ✅ 必达 | 本方案主验收 |
-| piecewise | 后置 | 先正确性，后图模式 |
-
-### 2.3 成功标准（本方案）
-
-1. `pcp_size=1`：与现有 Hybrid 主干行为一致（无 PCP 税）。  
-2. `pcp_size>1`：prefill/decode 数值正确；GDN 接缝正确；FA 在线性局部 Q 上可算。  
-3. 不支持组合 fail-fast。  
-4. 真机验收由负责人自行安排；本文不绑定矩阵门禁。
+成功标准：`pcp=1` 行为不回归；`pcp>1` 下 FA/GDN 在同一顺序切分上正确；不支持组合 fail-fast。
 
 ---
 
 ## 3. 核心决策
 
-### C1. 唯一视图 = 线性局部 batch
-
-```text
-global InputBatch（真实 req，建议 decode-first）
-        │
-        ▼
-AscendPCPManager.partition_linear()   # 唯一 partition
-        │
-        ▼
-local_batch = 线性局部 InputBatch
-  - 保持原 num_reqs（不 virtualize）
-  - prefill：每卡一段因果连续 token
-  - decode：每卡复制完整 decode tokens
-  - 层间 hidden 始终在此布局
-```
-
-- **GDN / MLP / MoE / 默认算子**：直接吃 `local_batch`。  
-- **FA（MLA/GQA）**：也吃同一 `local_batch` 的 Q 侧 token；**不再**换成 DualChunk rows。
-
-### C2. 切分算法（L1，不考虑均衡）
-
-对每个 prefill 请求长度为 `N`、`pcp_world_size = W`、本卡 rank `r`：
-
-```text
-base, rem = divmod(N, W)
-len_r = base + (1 if r < rem else 0)
-off_r = base * r + min(r, rem)
-本卡拿走 global[off_r : off_r + len_r]
-```
-
-- decode：`len_r = N`，`off_r = 0`（复制）。  
-- 不等长时对 AG 做 **linear pad** 到 `max(各卡 local_num_tokens)`；`linear_valid_mask = arange(L) < local_num_tokens`。  
-- **不做** DualChunk、**不做** `cp_interleave` 交错（第一版）；若后续要与某条 V1 路径对齐再单开决策。
-
-### C3. FA 在单视图下如何正确（必须说清）
-
-线性切分后，rank `r` 只有序列的一段。因果 FA 需要看到**更前缀**的 K/V，因此 FA **仍需要通信**，只是通信对象不再是「换布局」，而是「补全上下文」：
-
-```text
-本卡 linear Q（及本卡产出的 K/V 或 MLA latent）
-        │
-        ├─ pure decode：各卡 token 相同，旁路集体通信（与双视图一致精神）
-        └─ 含 prefill：
-              对 prefill 段 pad → PCP all_gather（QKV 或 KV/latent，后端定）
-              → 得到全局（或前缀所需）K/V
-              → 本卡只算自己的 Q rows
-              → 写本地 KV cache（FA KV 不分片：写全量或按既有 cache 契约）
-              → 输出仍留在本卡 linear 布局（无需 scatter 回另一套视图）
-```
-
-要点：
-
-- **没有**「linear ↔ DualChunk」变换，故**没有**三 bridge idx。  
-- 若 AG 后需要还原「按 rank 拼接 → 全局原序」，只保留**一个**与 sample/FA 共用的  
-  `linear_ag_restore_idx`（语义 ≈ 双视图里的 ①，但不再接 ②③）。  
-- FA 各卡算力随分段长度变化 → **接受不均衡**；这是本方案相对 DualChunk 的明确代价。
-
-> 实施时 FA backend 以「input_layout = CONTIGUOUS_CAUSAL」消费 linear batch；  
-> 禁止再假设 virtual-row / DualChunk metadata。
-
-### C4. Sample restore
-
-- pure decode：各卡 hidden 已是完整 decode 前缀，本地即可。  
-- 含 prefill：对 prefill 段 AG → `linear_ag_restore_idx` 还原全局原序 → 与 decode 前缀拼回 `global_batch` 再 sample。  
-- **禁止**依赖上游 DualChunk 的 `_hidden_restore_idx` 作为 hybrid 主路径（那条对应 DualChunk gather）。
-
-### C5. 与上游 `PCPManager` 的关系
-
-| 能力 | 本方案 |
-|------|--------|
-| `super().partition_batch()` | **主路径不调用**（避免 DualChunk 污染） |
-| 线性 partition | Ascend 自研 / 复用 V1 L1 算法，落在 `hybrid_pcp` 或 Manager 私有方法 |
-| `prepare_attn` / slot / block table | 全部按 **linear local_batch** 的原 `num_reqs` 行准备 |
-| 上游 restore_for_sampling | Hybrid 路径覆盖为线性 AG restore |
-
-非 hybrid 模型：仍可走现有 Ascend/上游 DualChunk PCP（若已接通），与本方案互不强制合流。
-
----
-
-## 4. 架构与数据流
-
-### 4.1 一 step 时序
+### C1. 一套切分，全层共用
 
 ```text
 global InputBatch
         │
         ▼
-partition_linear_only()
-  ├─ L1 segments（各 rank）
-  ├─ materialize linear local_batch
-  ├─ linear_num_tokens / padded / valid_mask
-  └─ linear_ag_restore_idx（仅 AG 还原原序；无 FA 桥）
+partition_sequential()     # 唯一 partition
         │
         ▼
-prepare_attn(local_batch)
-  ├─ 所有 attn group（FA + GDN）共用 linear batch + 对应 block/slot
-  └─ 发布 LinearPCPStep（只读）并 bind → ModelState
-        │
-        ▼
-forward（hidden 始终线性）
-  ├─ GDN：本地算 + V1 接缝
-  ├─ FA：§3 C3 的 AG-KV（或等价）+ 本地 Q；输出不换布局
-  └─ MoE：pad / valid_mask
-        │
-        ▼
-restore_for_sampling：§3 C4
+local_batch（顺序切分后的局部 token）
+  · 保持原 num_reqs
+  · prefill：每卡一段因果连续区间
+  · decode：每卡复制
+  · FA、GDN、MLP、MoE 全部只认这一份
 ```
 
-### 4.2 建议结构体（精简）
+### C2. 切分公式（顺序 / 不考虑均衡）
+
+对 prefill 长度 `N`、world `W`、rank `r`：
 
 ```text
-AscendPCPManager
-  └── linear_step: LinearPCPStep | None
-
-LinearPCPStep
-  ├── step_id
-  ├── global_batch
-  ├── local_batch          # 唯一视图
-  └── layout: LinearPCPLayout
-
-LinearPCPLayout
-  ├── num_decode_tokens
-  ├── linear_num_tokens
-  ├── linear_num_tokens_padded
-  ├── linear_ag_restore_idx   # AG(linear pad by rank) → global real tokens（或仅 prefill）
-  └── linear_valid_mask
+base, rem = divmod(N, W)
+len_r = base + (1 if r < rem else 0)
+off_r = base * r + min(r, rem)
+本卡：global[off_r : off_r + len_r]
 ```
 
-相对双视图 `HybridPreparedStep`：
+decode：整段复制。同步前若长度不齐则 pad；有效位用 `InputBatch.is_padding` / `num_tokens`。
 
-- 删除 `fa_batch`  
-- 删除 `hybrid_global_to_fa_idx` / `hybrid_fa_to_linear_idx`  
-- 保留（并改名）单一 AG restore + valid mask  
+### C3. 跨卡怎么对齐：层后同步，而不是「接缝体系」
 
-### 4.3 职责划分
+顺序切分后，本卡只有一段序列。下一层或本层收尾时，需要把**别的卡算出来的状态**对齐过来。统一模型：
+
+```text
+本卡用 local_batch 做完当前层局部计算
+        │
+        ├─ FA 层：同步 KV（或 MLA latent KV）
+        │         → 各卡具备后续注意力所需的前缀/全量 KV 视图
+        │
+        └─ GDN 层：同步 SSM / conv 等递推状态
+                  → 后段 rank 拿到前段 rank 递推到的状态，或各卡对齐末状态供 decode
+        │
+        ▼
+hidden 仍留在同一套 local 布局，进入下一层（无需换视图）
+```
+
+说明：
+
+- **FA**：同步的是 **KV**；本卡 Q 仍是本卡那段 token，不算 DualChunk row。  
+- **GDN**：同步的是 **SSM（及必要的 conv 状态）**；不另立「接缝」模块名，实现上可以是一次 AG/P2P 状态，而不是 V1 那套 extract → AG → 注入 → 重跑 h 的完整剧本（第一版以正确、简单为准）。  
+- **pure decode**：token 各卡已复制，可按层类型决定是否旁路同步。  
+- 层间 **hidden 不要求整网 AG**；只同步该层类型需要的 KV 或 SSM。
+
+> 因果事实仍然在：后段 rank 的 GDN 依赖前段状态。  
+> 本方案把它看成 **「同步 SSM」**，而不是单独产品化的「接缝子系统」。
+
+### C4. Sample restore
+
+- decode：本地即可。  
+- 含 prefill：对 local hidden 的 prefill 段 AG → `_hidden_restore_idx`（线性语义）还原全局序 → sample。  
+- 不使用上游 DualChunk `_hidden_restore_idx`。
+
+### C5. 与上游 PCPManager
+
+| 项 | 本方案 |
+|----|--------|
+| `super().partition_batch()` | 主路径不用 |
+| partition | 自研顺序切分 |
+| prepare_attn / block / slot | 全按 `local_batch` |
+| restore | 线性 AG restore |
+
+非 hybrid：可继续 DualChunk；与本方案分流。
+
+---
+
+## 4. 数据流与结构
+
+### 4.1 一 step
+
+```text
+global InputBatch
+        │
+        ▼
+partition_sequential()
+  → local_batch；写入 `_global_batch` / `_hidden_restore_idx`
+        │
+        ▼
+prepare_attn(local_batch)   # FA 与 GDN 同一 batch
+        │
+        ▼
+forward
+  · 每层：本地算 →（FA 同步 KV / GDN 同步 SSM）→ 同布局进入下层
+  · MoE：pad + is_padding / num_tokens
+        │
+        ▼
+restore_for_sampling
+```
+
+### 4.2 状态存放（复用上游字段，不新增 step bag）
+
+```text
+Runner.input_batch              ← partition 返回的 local_batch（唯一视图）
+AscendPCPManager._global_batch  ← 本 step 的 global InputBatch
+AscendPCPManager._hidden_restore_idx
+        ← 顺序切分语义：AG(linear_prefill pad) → global_prefill（shape T-D）
+          （与 DualChunk 写入同一字段名，hybrid 路径语义不同；restore 时走 hybrid 分支）
+
+pad / 有效 token：
+  local_batch.num_tokens / num_tokens_after_padding / is_padding
+  （不再另存 linear_valid_mask）
+```
+
+不引入 `LinearPCPStep` / `LinearPCPLayout`。
+
+### 4.3 职责
 
 | 组件 | 职责 |
 |------|------|
-| `AscendPCPManager` | 线性 partition、layout、sample restore；**不**维护 FA 第二视图 |
-| Runner | `maybe_partition` 在 hybrid 时走线性入口；`prepare_attn` bind step |
-| GDN | 只认线性 + 现有接缝 |
-| FA backend | 认线性 batch；自行（或经薄包装）做跨 rank KV/latent 集合；**不做布局桥** |
-| MoE | linear pad + valid mask |
-| ModelState | 一次性消费 `LinearPCPStep`；FA/GDN 都从 `local_batch` 取视图 |
-
-### 4.4 文件落点（建议）
-
-```text
-vllm_ascend/worker/v2/
-  pcp_manager.py          # AscendPCPManager：接线、读上游私有态（若需要）、restore
-  hybrid_pcp.py           # L1 segments、linear materialize、LinearPCPLayout/Step、AG restore
-  model_runner.py         # hybrid 时调用线性 partition 入口
-```
-
-- 算法进 `hybrid_pcp.py`；Manager 只做编排与（必要时）上游私有字段外递。  
-- **不要**为了「跟上游长得像」去调用 DualChunk `partition_batch` 再丢掉结果。
+| Manager | 顺序 partition、layout、sample restore |
+| Runner | hybrid 走顺序切分入口 |
+| FA | 同布局局部算 + **同步 KV** |
+| GDN | 同布局局部算 + **同步 SSM**（不引入独立接缝产品层） |
+| MoE | `is_padding` / `num_tokens` |
+| ModelState | 读 Runner `input_batch`（即 local）+ Manager 上复用字段 |
 
 ---
 
-## 5. 关键风险与明确接受的代价
+## 5. 代价与风险
 
-| 风险 / 代价 | 说明 | 态度 |
-|-------------|------|------|
-| FA 负载不均 | 前段 rank 与后段 rank token 数可差 1，长尾请求更明显 | **接受**（本方案前提） |
-| FA 集体通信量 | 每层 FA 仍可能 AG KV/QKV；无 DualChunk 时难以复用上游 MLA PCP 捷径 | 用最简正确实现；性能不是本方案第一目标 |
-| 与上游 PCP 元数据不兼容 | 上游大量假设 DualChunk virtual rows | Hybrid 路径独立，不强行复用 |
-| 与双视图代码分叉 | 两套方案并存一段时间 | 分支隔离；公共能力（L1、GDN 接缝、valid mask）可后续抽取 |
-
----
-
-## 6. 实施拆分（建议）
-
-### L0：基线确认
-
-- 分支基于 `c8b480b7f`；`pcp=1` Hybrid 可跑（已有 M0）。  
-- 本文评审通过后再写代码。
-
-### L1：线性 partition 生产端
-
-- `get_linear_rank_segments` + materialize `local_batch`  
-- `LinearPCPLayout`（restore idx + valid mask）  
-- Runner 入口切换；**不**调用 DualChunk partition  
-- UT：切分、pad、decode-first、pure decode、restore 排列
-
-### L2：prepare_attn + GDN
-
-- 全 group 走 linear block/slot  
-- 接上现有 GDN 接缝（`pcp_size>1`）  
-- UT / 小规模真机：纯 GDN 敏感路径（若有）或 hybrid 中 GDN 层
-
-### L3：FA on linear
-
-- MLA 或 GQA 之一先打通「本地 Q + AG KV/latent」  
-- decode 旁路  
-- 正确性优先，不做均衡
-
-### L4：MoE valid-token + sample restore 收口
-
-- pad/unpad 与 `linear_valid_mask`  
-- sample 与 L1 restore 共用 idx
-
-### L5（可选）：piecewise
-
-- 通信保持 graph break；与双视图 M6 同类，本方案不阻塞 L1–L4。
+| 项 | 态度 |
+|----|------|
+| FA / GDN 段长度不均 | 接受 |
+| 每层同步 KV 或 SSM 的通信量 | 接受；正确性优先 |
+| 不复用上游 DualChunk / V1 接缝实现 | 故意简化；可后补优化 |
+| 与双视图分叉 | 分支隔离 |
 
 ---
 
-## 7. 与双视图方案的关系（决策备忘）
+## 6. 实施拆分
 
-| 问题 | 建议 |
-|------|------|
-| 哪条是主线？ | **未定**；本分支用于快速验证单视图可行性 |
-| 能否合并？ | 生产端（L1 partition、GDN 接缝、MoE mask）可共用；FA 路径与 step bag **不要**过早揉成一套抽象 |
-| 若单视图正确但 FA 慢？ | 再评估是否切回双视图做 FA 旁路 |
-| 若单视图连正确性都难（FA 集合契约）？ | 记录阻塞点，优先回到双视图或收窄只验 GDN+假 FA |
-
----
-
-## 8. 待评审确认项
-
-请在开工前确认：
-
-1. **FA 集合策略**：prefill 默认「AG KV/latent + 本地 Q」是否可接受（相对整段 AG QKV）？  
-2. **`linear_ag_restore_idx` 域**：整段 token 还原，还是 decode-first 下仅 prefill 段（与双视图 ① 对齐）？建议：**仅 prefill，decode 旁路**。  
-3. **非 hybrid PCP**：是否完全不动，继续 DualChunk？建议：**不动**。  
-4. **命名**：`LinearPCPStep` / `LinearPCPLayout` 是否可采用（避免再叫 Hybrid 造成与双视图混淆）？  
-5. **第一刀代码**：是否按 §6 只做 L1 生产端 + UT，暂不接 FA backend？
+1. **L1** 顺序 partition + layout + Runner 入口 + UT  
+2. **L2** prepare_attn 全走 local_batch；GDN：**同步 SSM** 的最小正确实现  
+3. **L3** FA：**同步 KV** + 本地 Q  
+4. **L4** MoE valid-mask + sample restore  
+5. **L5**（可选）piecewise  
 
 ---
 
-## 9. 附录：和双视图字段对照
+## 7. 与双视图的关系
+
+- 本分支验证「一套切分 + 层后同步」能否端到端正确。  
+- 公共可抽：顺序 partition、valid_mask、restore idx。  
+- FA 慢或同步过重时，再评估是否回到双视图。  
+- **不要**把 V1 接缝与双视图 bridge 偷运回本方案「为了好像更完整」。
+
+---
+
+## 8. 待确认
+
+1. GDN 同步粒度：段边界 P2P（前卡 → 后卡）还是全 rank AG 状态？第一版建议 **能正确即可，优先简单 AG**。  
+2. FA 同步：AG 全量 KV，还是只收集前缀？第一版建议 **AG 全量 KV/latent（实现简单）**。  
+3. `_hidden_restore_idx` 仅覆盖 prefill 段？（建议是）  
+4. 非 hybrid 是否不动 DualChunk？（建议不动）  
+5. 是否先只做 L1 生产端再接同步逻辑？
+
+---
+
+## 9. 与双视图字段对照
 
 | 双视图 | 本方案 |
 |--------|--------|
-| `linear_batch` + `fa_batch` | 仅 `local_batch`（线性） |
-| `hybrid_linear_ag_restore_idx` | `linear_ag_restore_idx`（保留语义） |
-| `hybrid_global_to_fa_idx` | **删除** |
-| `hybrid_fa_to_linear_idx` | **删除** |
-| `linear_valid_mask` | 保留 |
-| `CacheWritePlan` 双视图分支 | 不做；FA 用更直接的 linear 契约 |
-| 主路径返回值 | 仍是线性 `local_batch` |
+| linear + fa 双 batch | 仅 Runner `input_batch`（local） |
+| `HybridPreparedStep` / layout | **不建**；复用 `_global_batch` + `_hidden_restore_idx` |
+| 三 bridge idx | 无 |
+| V1 GDN 接缝专项 | 改为层后/边界同步 SSM |
+| FA enter/exit 换布局 | 改为层后同步 KV |
+| DualChunk 均衡 | 不做 |
