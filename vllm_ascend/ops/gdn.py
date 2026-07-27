@@ -26,9 +26,12 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm.distributed import get_pcp_group
+
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
+from vllm_ascend.ops.gdn_pcp_conv import transfer_pcp_prefill_conv_state
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -222,6 +225,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 initial_state_mode_opt = non_spec_causal_conv1d_meta.initial_state_mode
                 conv_weights_T = conv_weights.transpose(0, 1)
                 activation_num = 1 if self.activation else 0
+                state_len = conv_weights.shape[1] - 1
+
+                # Sequential PCP: transfer previous-rank conv before local conv.
+                pcp_prefill_conv_transfer = None
+                if get_pcp_group().world_size > 1:
+                    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+                    assert non_spec_query_start_loc is not None
+                    assert non_spec_state_indices_tensor is not None
+                    pcp_prefill_conv_transfer = transfer_pcp_prefill_conv_state(
+                        conv_state=self_kv_cache[0],
+                        mixed_qkv=mixed_qkv_non_spec,
+                        query_start_loc=non_spec_query_start_loc,
+                        state_indices=non_spec_state_indices_tensor,
+                        num_prefills=attn_metadata.num_prefills,
+                        state_len=state_len,
+                    )
+
                 mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
                 torch.ops._C_ascend.npu_causal_conv1d_custom(
                     mixed_qkv_non_spec_output,
@@ -238,6 +258,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     run_mode=0,
                 )
                 mixed_qkv_non_spec = mixed_qkv_non_spec_output
+                if pcp_prefill_conv_transfer is not None:
+                    pcp_prefill_conv_transfer.write_back_final_conv_state()
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0

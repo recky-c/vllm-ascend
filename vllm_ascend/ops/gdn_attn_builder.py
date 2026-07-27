@@ -31,6 +31,9 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm.distributed import get_pcp_group
+
+from vllm_ascend.ops.gdn_pcp_conv import force_prefill_initial_state_mode
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -306,6 +309,18 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if non_spec_cache_indices is None:
             raise RuntimeError("Expected non_spec_cache_indices for Ascend GDN prefill conv1d path.")
         prefill_num_rows = attn_metadata.non_spec_query_start_loc.size(0) - 1
+        pcp_group = get_pcp_group()
+        if (
+            pcp_group.world_size > 1
+            and pcp_group.rank_in_group > 0
+            and attn_metadata.num_prefills > 0
+            and initial_state_mode is not None
+        ):
+            initial_state_mode = force_prefill_initial_state_mode(
+                initial_state_mode,
+                num_prefills=attn_metadata.num_prefills,
+                prefill_num_rows=prefill_num_rows,
+            )
         attn_metadata.non_spec_prefill_metadata = GDNPrefillMetadata(
             causal_conv1d=GDNCausalConv1dMetadata(
                 query_start_loc=attn_metadata.non_spec_query_start_loc,
