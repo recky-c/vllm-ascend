@@ -22,13 +22,16 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.hybrid_pcp import (
+    get_dummy_slot_mappings_sequential,
     init_linear_pcp,
     partition_sequential_batch,
+    prepare_attn_sequential,
 )
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
@@ -156,6 +159,20 @@ class AscendPCPManager(PCPManager):
                 "partition_linear_batch requires a hybrid PCP manager."
             )
         return self._linear_batch_partitioner.partition(input_batch)
+
+    def prepare_attn(
+        self, input_batch: InputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Prepare block tables / slots for the active PCP view."""
+        if not self._is_hybrid:
+            return super().prepare_attn(input_batch)
+        return prepare_attn_sequential(self, input_batch)
+
+    def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
+        """Dummy slots for profile/capture; hybrid uses local token width."""
+        if not self._is_hybrid:
+            return super().get_dummy_slot_mappings(num_tokens)
+        return get_dummy_slot_mappings_sequential(self, num_tokens)
 
 
 def maybe_partition_ascend_pcp_batch(

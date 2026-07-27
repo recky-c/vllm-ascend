@@ -25,8 +25,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
     combine_sampled_and_draft_tokens,
     prepare_pos_seq_lens,
 )
@@ -506,3 +508,44 @@ def partition_sequential_batch(
         is_prefilling=global_batch.is_prefilling_np,
     )
     return local_batch
+
+
+def prepare_attn_sequential(
+    manager: AscendPCPManager,
+    input_batch: InputBatch,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Build block tables / slots from the sequential local batch.
+
+    FA and GDN share this view. Reads Manager-owned buffers
+    (``_block_tables``, ``_local_block_tables``, ``_global_batch_slot_mappings``)
+    but does not use DualChunk ``padded_gather_idx`` expansion.
+    """
+    assert manager._block_tables is not None
+    assert manager._local_block_tables is not None
+    assert manager._local_block_table_ptrs is not None
+    assert manager._global_batch_slot_mappings is not None
+
+    block_tables = manager._block_tables.gather_block_tables(
+        input_batch.idx_mapping,
+        input_batch.num_reqs_after_padding,
+        out=manager._local_block_tables,
+        out_ptrs=manager._local_block_table_ptrs,
+    )
+    slot_mappings = manager._block_tables.compute_slot_mappings(
+        input_batch.idx_mapping,
+        input_batch.query_start_loc,
+        input_batch.positions,
+        input_batch.num_tokens_after_padding,
+        out=manager._global_batch_slot_mappings,
+    )
+    return block_tables, slot_mappings
+
+
+def get_dummy_slot_mappings_sequential(
+    manager: AscendPCPManager,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Dummy local-width slots for hybrid profile/capture."""
+    assert manager._global_batch_slot_mappings is not None
+    manager._global_batch_slot_mappings.fill_(PAD_SLOT_ID)
+    return manager._global_batch_slot_mappings[:, :num_tokens]
