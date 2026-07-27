@@ -19,6 +19,7 @@
 
 import torch
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -34,6 +35,44 @@ class AscendPCPManager(PCPManager):
     def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.vllm_config = vllm_config
+
+    @staticmethod
+    def validate_config(
+        vllm_config: VllmConfig,
+        supports_mm_inputs: bool,
+    ) -> None:
+        """Override upstream validate_config: drop the MLA-only restriction."""
+        parallel_config = vllm_config.parallel_config
+        model_config = vllm_config.model_config
+        pcp_size = parallel_config.prefill_context_parallel_size
+        if pcp_size <= 1:
+            return
+
+        if parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError("MRV2 PCP does not support PP yet.")
+        if model_config.is_encoder_decoder:
+            raise NotImplementedError(
+                "MRV2 PCP does not support encoder-decoder models yet."
+            )
+        if supports_mm_inputs:
+            raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
+        if vllm_config.lora_config is not None:
+            raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "MRV2 PCP does not support speculative decoding yet."
+            )
+        is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
+        if (
+            is_sparse_mla
+            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            raise NotImplementedError(
+                "MRV2 sparse MLA PCP does not support CUDA graphs yet. "
+                "Set -cc.cudagraph_mode=NONE."
+            )
+        if vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            raise NotImplementedError("MRV2 PCP supports PIECEWISE CUDA graphs only.")
 
     def partition_batch(self, input_batch: AscendInputBatch) -> AscendInputBatch:
         """Partition the batch and update Ascend-specific local metadata."""
@@ -65,7 +104,7 @@ def maybe_build_ascend_pcp_manager(
     if pcp_size <= 1:
         return None
 
-    PCPManager.validate_config(vllm_config, supports_mm_inputs)
+    AscendPCPManager.validate_config(vllm_config, supports_mm_inputs)
     dcp_size = parallel_config.decode_context_parallel_size
     return AscendPCPManager(
         pcp_world_size=pcp_size,

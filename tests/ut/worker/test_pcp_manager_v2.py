@@ -23,7 +23,6 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 import vllm_ascend.worker.v2.pcp_manager as pcp_manager_module
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
@@ -205,7 +204,7 @@ def test_maybe_build_ascend_pcp_manager_uses_ascend_subclass():
     req_states = MagicMock()
 
     with (
-        patch.object(PCPManager, "validate_config") as validate_config,
+        patch.object(AscendPCPManager, "validate_config") as validate_config,
         patch.object(pcp_manager_module, "get_pcp_group", return_value=pcp_group),
         patch.object(pcp_manager_module, "get_dcp_group", return_value=dcp_group),
     ):
