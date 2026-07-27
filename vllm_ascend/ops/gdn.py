@@ -17,7 +17,6 @@
 
 import torch
 from einops import rearrange
-from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
@@ -33,7 +32,6 @@ from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
-from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -222,68 +220,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 query_start_loc_opt = non_spec_causal_conv1d_meta.query_start_loc
                 cache_indices_opt = non_spec_causal_conv1d_meta.cache_indices
                 initial_state_mode_opt = non_spec_causal_conv1d_meta.initial_state_mode
-                if get_pcp_group().world_size > 1:
-                    conv_weights_T = conv_weights.transpose(0, 1)
-                    activation_num = 1 if self.activation else 0
-                    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-                    assert non_spec_query_start_loc is not None
-                    non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
-                    width = conv_weights.shape[1]
-                    state_len = width - 1
-                    num_seqs = non_spec_query_start_loc.shape[0] - 1
-                    prefill_seq_offset = max(0, num_seqs - attn_metadata.num_prefills)
-                    prefill_cache_indices = non_spec_state_indices_tensor[prefill_seq_offset:]
-                    mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
-                    last_width_prefill_x = extract_last_width(
-                        mixed_qkv_non_spec_T, non_spec_query_start_loc[prefill_seq_offset:], state_len
-                    )
-                    pcp_rank = get_pcp_group().rank_in_group
-                    all_last_width_prefill_x = get_pcp_group().all_gather(
-                        last_width_prefill_x.unsqueeze(0).contiguous(), 0
-                    )
-                    if pcp_rank > 0 and prefill_cache_indices.shape[0] > 0:
-                        self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
-                            pcp_rank - 1, ...
-                        ].transpose(-1, -2)
-                    mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
-                        mixed_qkv_non_spec_output,
-                        mixed_qkv_non_spec,
-                        conv_weights_T,
-                        conv_state=self_kv_cache[0],
-                        bias_opt=self.conv1d.bias,
-                        query_start_loc_opt=query_start_loc_opt,
-                        cache_indices_opt=cache_indices_opt,
-                        initial_state_mode_opt=initial_state_mode_opt,
-                        num_accepted_tokens_opt=None,
-                        activation_mode=activation_num,
-                        pad_slot_id=PAD_SLOT_ID,
-                        run_mode=0,
-                    )
-                    mixed_qkv_non_spec = mixed_qkv_non_spec_output
-                    if prefill_cache_indices.shape[0] > 0:
-                        self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
-                            -1, ...
-                        ].transpose(-1, -2)
-                else:
-                    conv_weights_T = conv_weights.transpose(0, 1)
-                    activation_num = 1 if self.activation else 0
-                    mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
-                        mixed_qkv_non_spec_output,
-                        mixed_qkv_non_spec,
-                        conv_weights_T,
-                        conv_state=self_kv_cache[0],
-                        bias_opt=self.conv1d.bias,
-                        query_start_loc_opt=query_start_loc_opt,
-                        cache_indices_opt=cache_indices_opt,
-                        initial_state_mode_opt=initial_state_mode_opt,
-                        num_accepted_tokens_opt=None,
-                        activation_mode=activation_num,
-                        pad_slot_id=PAD_SLOT_ID,
-                        run_mode=0,
-                    )
-                    mixed_qkv_non_spec = mixed_qkv_non_spec_output
+                conv_weights_T = conv_weights.transpose(0, 1)
+                activation_num = 1 if self.activation else 0
+                mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
+                torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    mixed_qkv_non_spec_output,
+                    mixed_qkv_non_spec,
+                    conv_weights_T,
+                    conv_state=self_kv_cache[0],
+                    bias_opt=self.conv1d.bias,
+                    query_start_loc_opt=query_start_loc_opt,
+                    cache_indices_opt=cache_indices_opt,
+                    initial_state_mode_opt=initial_state_mode_opt,
+                    num_accepted_tokens_opt=None,
+                    activation_mode=activation_num,
+                    pad_slot_id=PAD_SLOT_ID,
+                    run_mode=0,
+                )
+                mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0

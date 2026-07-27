@@ -17,7 +17,6 @@ from dataclasses import dataclass
 
 import torch
 from vllm.config import VllmConfig
-from vllm.distributed import get_pcp_group
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -35,8 +34,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
-    prepare_final_chunk_indices,
-    prepare_update_chunk_offsets,
 )
 
 _GDN_CHUNK_SIZE = 64
@@ -57,11 +54,8 @@ class GDNChunkedPrefillMetadata:
     chunk_indices_chunk64_host: tuple[int, ...]
     chunk_indices_chunk64: torch.Tensor
     chunk_offsets_chunk64: torch.Tensor
-    update_chunk_offsets_chunk64: torch.Tensor
-    final_chunk_indices_chunk64: torch.Tensor
     chunk_indices_large_block: torch.Tensor
     block_indices_cumsum: torch.Tensor
-    num_decodes: int = 0
     cu_seqlens_kern: tuple[int, ...] | None = None
     keep_meta: torch.Tensor | None = None
 
@@ -159,8 +153,6 @@ def _build_non_spec_chunked_prefill_metadata(
 
     chunk_indices_chunk64 = prepare_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
     chunk_offsets_chunk64 = prepare_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    update_chunk_offsets_chunk64 = prepare_update_chunk_offsets(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
-    final_chunk_indices_chunk64 = prepare_final_chunk_indices(cu_seqlens_cpu, _GDN_CHUNK_SIZE)
     chunk_indices_large_block = prepare_chunk_indices(
         cu_seqlens_cpu,
         _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
@@ -181,8 +173,6 @@ def _build_non_spec_chunked_prefill_metadata(
         chunk_indices_chunk64_host=tuple(chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist()),
         chunk_indices_chunk64=chunk_indices_chunk64.to(device=device, non_blocking=True),
         chunk_offsets_chunk64=chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        update_chunk_offsets_chunk64=update_chunk_offsets_chunk64.to(device=device, non_blocking=True),
-        final_chunk_indices_chunk64=final_chunk_indices_chunk64.to(device=device, non_blocking=True),
         chunk_indices_large_block=chunk_indices_large_block.to(device=device, non_blocking=True),
         block_indices_cumsum=block_indices_cumsum.to(device=device, non_blocking=True),
         cu_seqlens_kern=cu_seqlens_kern,
@@ -316,12 +306,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if non_spec_cache_indices is None:
             raise RuntimeError("Expected non_spec_cache_indices for Ascend GDN prefill conv1d path.")
         prefill_num_rows = attn_metadata.non_spec_query_start_loc.size(0) - 1
-        pcp_size = getattr(self.vllm_config.parallel_config, "prefill_context_parallel_size", 1)
-        pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
-        if pcp_rank > 0 and attn_metadata.num_prefills > 0:
-            prefill_seq_offset = max(0, prefill_num_rows - attn_metadata.num_prefills)
-            initial_state_mode = initial_state_mode.clone()
-            initial_state_mode[prefill_seq_offset:] = True
         attn_metadata.non_spec_prefill_metadata = GDNPrefillMetadata(
             causal_conv1d=GDNCausalConv1dMetadata(
                 query_start_loc=attn_metadata.non_spec_query_start_loc,
