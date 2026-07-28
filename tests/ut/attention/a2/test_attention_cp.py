@@ -47,15 +47,12 @@ def test_gqa_pcp_extends_v1_backend_without_polluting_base_metadata() -> None:
     assert not hasattr(AscendMetadata(), "pcp_slot_mapping")
 
 
-def test_pcp_builder_selects_rank_slots_and_uses_cached_prefill() -> None:
+def test_pcp_builder_keeps_local_slots_for_cache_and_attn() -> None:
     builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
     builder.pcp_size = 2
     builder.pcp_rank = 1
     common_metadata = SimpleNamespace(
-        slot_mapping=torch.tensor(
-            [100, 101, 102, 103, -1, -1, 201, 202, 203, -1],
-            dtype=torch.int64,
-        )
+        slot_mapping=torch.tensor([100, 201, 202, 203, -1], dtype=torch.int64),
     )
     base_metadata = AscendAttentionPCPMetadata(
         num_actual_tokens=4,
@@ -84,7 +81,7 @@ def test_pcp_builder_preserves_chunked_prefill_state() -> None:
     builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
     builder.pcp_size = 2
     builder.pcp_rank = 0
-    common_metadata = SimpleNamespace(slot_mapping=torch.tensor([10, 11, -1, 20, 21, 22], dtype=torch.int64))
+    common_metadata = SimpleNamespace(slot_mapping=torch.tensor([10, 11, -1], dtype=torch.int64))
     base_metadata = AscendAttentionPCPMetadata(
         num_actual_tokens=2,
         num_decode_tokens=0,
@@ -104,11 +101,11 @@ def test_pcp_builder_preserves_chunked_prefill_state() -> None:
     assert metadata.attn_state == AscendAttentionState.ChunkedPrefill
 
 
-def test_pcp_builder_rejects_nondivisible_expanded_slots() -> None:
+def test_pcp_builder_rejects_actual_tokens_past_local_width() -> None:
     builder = AscendAttentionPCPMetadataBuilder.__new__(AscendAttentionPCPMetadataBuilder)
     builder.pcp_size = 2
     builder.pcp_rank = 0
-    common_metadata = SimpleNamespace(slot_mapping=torch.arange(9))
+    common_metadata = SimpleNamespace(slot_mapping=torch.arange(3))
     base_metadata = AscendAttentionPCPMetadata(num_actual_tokens=4)
 
     with (
@@ -117,7 +114,7 @@ def test_pcp_builder_rejects_nondivisible_expanded_slots() -> None:
             "build",
             return_value=base_metadata,
         ),
-        np.testing.assert_raises_regex(RuntimeError, "must be divisible"),
+        np.testing.assert_raises_regex(RuntimeError, "exceeds the rank-local"),
     ):
         builder.build(0, common_metadata)
 
@@ -139,13 +136,11 @@ def test_pcp_cache_gather_keeps_one_decode_and_all_padded_prefills() -> None:
     key_cache = torch.empty((8, 1, 1))
     value_cache = torch.empty((8, 1, 1))
     output = torch.empty((4, 2, 1))
+    # Local absolute slots aligned with local K/V rows (not DualChunk expanded).
     metadata = AscendAttentionPCPMetadata(
         num_decode_tokens=1,
         pcp_local_num_input_tokens=4,
-        pcp_slot_mapping=torch.tensor(
-            [10, 11, 12, -1, -1, 21, 22, -1],
-            dtype=torch.int64,
-        ),
+        pcp_slot_mapping=torch.tensor([10, 11, 12, -1], dtype=torch.int64),
     )
 
     def all_gather(tensor, dim):
@@ -154,7 +149,7 @@ def test_pcp_cache_gather_keeps_one_decode_and_all_padded_prefills() -> None:
     pcp_group = SimpleNamespace(world_size=2, all_gather=all_gather)
     with (
         patch(
-            "vllm.model_executor.layers.attention.pcp.get_pcp_group",
+            "vllm_ascend.attention.context_parallel.attention_cp.get_pcp_group",
             return_value=pcp_group,
         ),
         patch(
@@ -183,7 +178,7 @@ def test_pcp_cache_gather_keeps_one_decode_and_all_padded_prefills() -> None:
     )
     assert torch.equal(
         kwargs["slot_mapping"],
-        torch.tensor([10, 11, 12, -1, 21, 22, -1]),
+        torch.tensor([10, 11, 12, -1, 21, 22, 9]),
     )
     assert kwargs["key_cache"] is key_cache
     assert kwargs["value_cache"] is value_cache
@@ -211,7 +206,7 @@ def test_pcp_cache_gather_pure_prefill_odd_length_with_padding() -> None:
     metadata = AscendAttentionPCPMetadata(
         num_decode_tokens=0,
         pcp_local_num_input_tokens=3,
-        pcp_slot_mapping=torch.tensor([10, 11, -1, 12, 13, 14]),
+        pcp_slot_mapping=torch.tensor([10, 11, -1], dtype=torch.int64),
     )
 
     def all_gather(tensor, dim):
@@ -221,7 +216,7 @@ def test_pcp_cache_gather_pure_prefill_odd_length_with_padding() -> None:
     pcp_group = SimpleNamespace(world_size=2, all_gather=all_gather)
     with (
         patch(
-            "vllm.model_executor.layers.attention.pcp.get_pcp_group",
+            "vllm_ascend.attention.context_parallel.attention_cp.get_pcp_group",
             return_value=pcp_group,
         ),
         patch(
@@ -252,7 +247,7 @@ def test_pcp_cache_gather_pure_prefill_odd_length_with_padding() -> None:
     )
     assert torch.equal(
         kwargs["slot_mapping"],
-        torch.tensor([10, 11, -1, 12, 13, 14]),
+        torch.tensor([10, 11, -1, 12, 13, 3]),
     )
     notify_cache_written.assert_called_once_with()
 
@@ -266,11 +261,11 @@ def test_pcp_decode_only_does_not_all_gather_kv() -> None:
     metadata = AscendAttentionPCPMetadata(
         num_decode_tokens=2,
         pcp_local_num_input_tokens=2,
-        pcp_slot_mapping=torch.tensor([10, 11, -1, -1]),
+        pcp_slot_mapping=torch.tensor([10, 11], dtype=torch.int64),
     )
 
     with (
-        patch("vllm.model_executor.layers.attention.pcp.get_pcp_group") as get_pcp_group,
+        patch("vllm_ascend.attention.context_parallel.attention_cp.get_pcp_group") as get_pcp_group,
         patch(
             "vllm_ascend.attention.context_parallel.attention_cp.DeviceOperator.reshape_and_cache"
         ) as reshape_and_cache,

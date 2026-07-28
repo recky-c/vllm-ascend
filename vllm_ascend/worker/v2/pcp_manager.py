@@ -21,6 +21,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
@@ -28,10 +29,8 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.hybrid_pcp import (
-    get_dummy_slot_mappings_sequential,
     init_linear_pcp,
     partition_sequential_batch,
-    prepare_attn_sequential,
 )
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
@@ -163,16 +162,36 @@ class AscendPCPManager(PCPManager):
     def prepare_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        """Prepare block tables / slots for the active PCP view."""
-        if not self._is_hybrid:
-            return super().prepare_attn(input_batch)
-        return prepare_attn_sequential(self, input_batch)
+        """Local block tables / slots for any PCP partition (DualChunk or sequential).
+
+        Slot = f(req, position) on the local batch only. Does not DualChunk-expand
+        slots; KV gather all-gathers local K/V/slots with the same row layout.
+        """
+        assert self._block_tables is not None
+        assert self._local_block_tables is not None
+        assert self._local_block_table_ptrs is not None
+        assert self._global_batch_slot_mappings is not None
+
+        block_tables = self._block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            input_batch.num_reqs_after_padding,
+            out=self._local_block_tables,
+            out_ptrs=self._local_block_table_ptrs,
+        )
+        slot_mappings = self._block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            input_batch.positions,
+            input_batch.num_tokens_after_padding,
+            out=self._global_batch_slot_mappings,
+        )
+        return block_tables, slot_mappings
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
-        """Dummy slots for profile/capture; hybrid uses local token width."""
-        if not self._is_hybrid:
-            return super().get_dummy_slot_mappings(num_tokens)
-        return get_dummy_slot_mappings_sequential(self, num_tokens)
+        """Dummy local-width slots for profile/capture (matches prepare_attn)."""
+        assert self._global_batch_slot_mappings is not None
+        self._global_batch_slot_mappings.fill_(PAD_SLOT_ID)
+        return self._global_batch_slot_mappings[:, :num_tokens]
 
 
 def maybe_partition_ascend_pcp_batch(

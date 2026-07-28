@@ -23,7 +23,6 @@ import torch.distributed as dist
 import torch_npu
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import logger
-from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
@@ -55,23 +54,76 @@ from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.utils import cp_chunkedprefill_comm_stream, weak_ref_tensors
 
 
+def gather_prefill_kv_cache_inputs(
+    tensors: tuple[torch.Tensor, ...],
+    slot_mapping: torch.Tensor,
+    num_decode_tokens: int,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Keep replicated decode writes local; AG local prefill K/V/slots together.
+
+    Layout-agnostic over DualChunk or sequential local batches: local K/V rows
+    must align with ``slot_mapping`` of length ``local_num_tokens`` (no DualChunk
+    ``pcp * local`` expand).
+    """
+    local_num_tokens = tensors[0].shape[0]
+    if any(tensor.shape[0] != local_num_tokens for tensor in tensors):
+        raise RuntimeError("PCP cache tensors must share token length.")
+    if slot_mapping.shape[0] < local_num_tokens:
+        raise RuntimeError(
+            "PCP slot_mapping is shorter than local tokens: "
+            f"{slot_mapping.shape[0]} < {local_num_tokens}."
+        )
+    if not 0 <= num_decode_tokens <= local_num_tokens:
+        raise RuntimeError(
+            f"Invalid num_decode_tokens={num_decode_tokens} for local_num_tokens={local_num_tokens}."
+        )
+
+    if num_decode_tokens == local_num_tokens:
+        return tensors, slot_mapping[:num_decode_tokens]
+
+    pcp_group = get_pcp_group()
+    gathered_prefills = tuple(
+        pcp_group.all_gather(tensor[num_decode_tokens:local_num_tokens].contiguous(), dim=0)
+        for tensor in tensors
+    )
+    gathered_slots = pcp_group.all_gather(
+        slot_mapping[num_decode_tokens:local_num_tokens].contiguous(),
+        dim=0,
+    )
+    if num_decode_tokens == 0:
+        return gathered_prefills, gathered_slots
+
+    cache_inputs = tuple(
+        torch.cat((tensor[:num_decode_tokens], gathered_prefill), dim=0)
+        for tensor, gathered_prefill in zip(tensors, gathered_prefills)
+    )
+    cache_slots = torch.cat(
+        (slot_mapping[:num_decode_tokens], gathered_slots),
+        dim=0,
+    )
+    return cache_inputs, cache_slots
+
+
 @dataclass
 class AscendAttentionPCPMetadata(AscendMetadata):
-    """GQA metadata needed to write the complete PCP KV cache."""
+    """GQA metadata needed to write the complete PCP KV cache.
+
+    ``pcp_slot_mapping`` is the rank-local absolute slot vector aligned with
+    local K/V rows (from ``compute_slot_mappings`` on the local batch). Prefill
+    gather all-gathers K/V/slots together; DualChunk expand is not used.
+    """
 
     pcp_slot_mapping: torch.Tensor | None = None
     pcp_local_num_input_tokens: int = 0
 
 
 class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
-    """Build rank-local GQA metadata while retaining expanded cache slots."""
+    """Build GQA PCP metadata from local-batch slots (any PCP partition)."""
 
     metadata_cls = AscendAttentionPCPMetadata
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
-        self.pcp_rank = get_pcp_group().rank_in_group
 
     def build(
         self,
@@ -79,41 +131,23 @@ class AscendAttentionPCPMetadataBuilder(AscendAttentionMetadataBuilder):
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
     ) -> AscendAttentionPCPMetadata:
-        expanded_slot_mapping = common_attn_metadata.slot_mapping
+        local_slot_mapping = common_attn_metadata.slot_mapping
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
             fast_build,
         )
         assert isinstance(metadata, AscendAttentionPCPMetadata)
-        if expanded_slot_mapping.numel() % self.pcp_size != 0:
-            raise RuntimeError(
-                "PCP slot mapping size must be divisible by the PCP world size: "
-                f"{expanded_slot_mapping.numel()} % {self.pcp_size} != 0."
-            )
 
-        local_num_input_tokens = expanded_slot_mapping.numel() // self.pcp_size
+        local_num_input_tokens = local_slot_mapping.numel()
         if metadata.num_actual_tokens > local_num_input_tokens:
             raise RuntimeError(
                 "PCP actual token count exceeds the rank-local padded token count: "
                 f"{metadata.num_actual_tokens} > {local_num_input_tokens}."
             )
 
-        rank_slot_mappings = expanded_slot_mapping.view(
-            self.pcp_size,
-            local_num_input_tokens,
-        )
-        num_decode_tokens = metadata.num_decode_tokens
-        metadata.slot_mapping = torch.cat(
-            (
-                rank_slot_mappings[0, :num_decode_tokens],
-                rank_slot_mappings[
-                    self.pcp_rank,
-                    num_decode_tokens : metadata.num_actual_tokens,
-                ],
-            )
-        )
-        metadata.pcp_slot_mapping = expanded_slot_mapping
+        metadata.slot_mapping = local_slot_mapping[: metadata.num_actual_tokens]
+        metadata.pcp_slot_mapping = local_slot_mapping
         metadata.pcp_local_num_input_tokens = local_num_input_tokens
         if metadata.num_prefills > 0 and metadata.attn_state == AscendAttentionState.PrefillNoCache:
             metadata.attn_state = AscendAttentionState.ChunkedPrefill
@@ -144,26 +178,26 @@ class AscendAttentionPCPImpl(AscendAttentionBackendImpl):
                 attn_metadata.reshape_cache_event.record()
             return query, key, value, output
 
-        expanded_slot_mapping = attn_metadata.pcp_slot_mapping
-        if expanded_slot_mapping is None:
-            raise RuntimeError("GQA PCP metadata is missing the expanded slot mapping.")
+        local_slot_mapping = attn_metadata.pcp_slot_mapping
+        if local_slot_mapping is None:
+            raise RuntimeError("GQA PCP metadata is missing the local cache slot mapping.")
         local_num_input_tokens = attn_metadata.pcp_local_num_input_tokens
         if key.shape[0] < local_num_input_tokens:
             raise RuntimeError(
-                f"PCP GQA input is shorter than the rank-local padded batch: {key.shape[0]} < {local_num_input_tokens}."
+                f"PCP GQA input is shorter than the rank-local padded batch: "
+                f"{key.shape[0]} < {local_num_input_tokens}."
             )
 
-        (cache_key, cache_value), cache_slot_mapping = _gather_prefill_cache_inputs(
-            (
-                key[:local_num_input_tokens],
-                value[:local_num_input_tokens],
-            ),
-            expanded_slot_mapping,
+        local_key = key[:local_num_input_tokens]
+        local_value = value[:local_num_input_tokens]
+        (cache_key, cache_value), cache_slot_mapping = gather_prefill_kv_cache_inputs(
+            (local_key, local_value),
+            local_slot_mapping[:local_num_input_tokens],
             attn_metadata.num_decode_tokens,
         )
         logger.info_once(
             "[GQA-PCP] Entered KV gather path: local_kv=%s, gathered_kv=%s, slots=%s",
-            tuple(key[:local_num_input_tokens].shape),
+            tuple(local_key.shape),
             tuple(cache_key.shape),
             tuple(cache_slot_mapping.shape),
         )
