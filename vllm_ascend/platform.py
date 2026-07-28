@@ -1008,6 +1008,15 @@ class NPUPlatform(Platform):
                 mc2_mask = reserved_mc2_mask[:padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
+
+        # MoE AllGather pads local batches to this width before PCP AG.
+        # Runner passes num_tokens_after_padding (already equal across PCP ranks
+        # after partition). Missing this field makes _EXTRA_CTX return None.
+        pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        max_tokens_across_pcp = 0
+        if pcp_size > 1 and num_tokens is not None:
+            max_tokens_across_pcp = int(num_tokens)
+
         return {
             "moe_comm_type": moe_comm_type,
             "moe_comm_method": moe_comm_method,
@@ -1018,6 +1027,7 @@ class NPUPlatform(Platform):
             "pad_size": pad_size,
             "padded_length": padded_length,
             "max_tokens_across_dp": max_tokens_across_dp,
+            "max_tokens_across_pcp": max_tokens_across_pcp,
             "mc2_mask": mc2_mask,
             "is_draft_model": is_draft_model,
             "is_draft_model_prefill": is_draft_model_prefill,
