@@ -98,7 +98,6 @@ def validate_ascend_pcp_config(
         )
 
 
-
 class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
 
