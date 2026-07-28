@@ -292,8 +292,8 @@ def test_validate_ascend_gqa_pcp_rejects_unsupported_modes(case, match):
         validate_ascend_pcp_config(vllm_config, supports_mm_inputs=supports_mm_inputs)
 
 
-@pytest.mark.parametrize("case", ["dtype", "quantization", "piecewise_graph"])
-def test_validate_ascend_gqa_pcp_uses_mla_baseline_validation(case):
+@pytest.mark.parametrize("case", ["dtype", "quantization", "piecewise_graph", "hybrid"])
+def test_validate_ascend_gqa_pcp_allows_supported_startup(case):
     vllm_config = _make_gqa_pcp_config()
     if case == "dtype":
         vllm_config.model_config.dtype = torch.float16
@@ -301,11 +301,13 @@ def test_validate_ascend_gqa_pcp_uses_mla_baseline_validation(case):
         vllm_config.model_config.quantization = "ascend"
     elif case == "piecewise_graph":
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    elif case == "hybrid":
+        vllm_config.model_config.is_hybrid = True
 
     validate_ascend_pcp_config(vllm_config, supports_mm_inputs=False)
 
 
-def test_validate_ascend_pcp_calls_upstream_validation_before_mla_return():
+def test_validate_ascend_pcp_calls_upstream_validation_for_mla():
     vllm_config = _make_gqa_pcp_config()
     vllm_config.model_config.use_mla = True
     vllm_config.parallel_config.decode_context_parallel_size = 2
@@ -316,3 +318,13 @@ def test_validate_ascend_pcp_calls_upstream_validation_before_mla_return():
         validate_ascend_pcp_config(vllm_config, supports_mm_inputs=False)
 
     validate_upstream.assert_called_once_with(vllm_config, False)
+
+
+def test_validate_ascend_pcp_skips_upstream_for_gqa_hybrid():
+    vllm_config = _make_gqa_pcp_config()
+    vllm_config.model_config.is_hybrid = True
+
+    with patch.object(pcp_manager_module.PCPManager, "validate_config") as validate_upstream:
+        validate_ascend_pcp_config(vllm_config, supports_mm_inputs=False)
+
+    validate_upstream.assert_not_called()

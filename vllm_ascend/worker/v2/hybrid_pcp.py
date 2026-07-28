@@ -87,28 +87,6 @@ def get_linear_rank_segments(
     return rank_segments
 
 
-def _decode_prefix_num_tokens(
-    is_prefilling: np.ndarray,
-    query_start_loc_np: np.ndarray,
-) -> int:
-    """Decode-token prefix length under the shared decode-first contract.
-
-    Same assumption as attention ``split_decodes_and_prefills``: decode requests
-    are packed before prefills, so ``query_start_loc[first_prefill]`` is ``D``.
-    """
-    num_reqs = int(is_prefilling.shape[0])
-    if num_reqs == 0:
-        return 0
-    if not np.any(is_prefilling):
-        return int(query_start_loc_np[num_reqs])
-    first_prefill = int(np.argmax(is_prefilling))
-    if np.any(is_prefilling[:first_prefill]) or np.any(~is_prefilling[first_prefill:]):
-        raise RuntimeError(
-            "Sequential PCP requires decode requests before prefill requests."
-        )
-    return int(query_start_loc_np[first_prefill])
-
-
 class LinearBatchPartitioner:
     """Materialize the sequential causal local batch (single view)."""
 
@@ -391,59 +369,48 @@ def build_linear_hidden_restore_idx(
     *,
     pcp_world_size: int,
     device: torch.device,
-    num_decode_tokens: int,
     global_num_tokens: int,
     linear_num_tokens_padded: int,
     segments_by_rank: list[list[RankSegment]],
     is_prefilling: np.ndarray,
 ) -> torch.Tensor:
-    """Build restore idx reused as ``PCPManager._hidden_restore_idx``.
+    """Build DualChunk-compatible ``_hidden_restore_idx`` for sequential layout.
 
-    Semantics for sequential Hybrid PCP (differs from DualChunk):
-    ``AG(linear_prefill padded by rank) → global_prefill`` with shape ``T - D``.
-    Decode is replicated and bypasses this path. Pad/valid info stays on the
-    local ``InputBatch`` (``num_tokens`` / ``is_padding``).
+    Matches upstream ``restore_hidden_states``:
+    ``AG(full local hidden padded by rank)[idx] → global_hidden`` with shape ``T``.
+    Decode is replicated on every rank; only rank 0's decode slots are indexed
+    (same convention as DualChunk). Prefill slots use the owning rank.
     """
     if len(segments_by_rank) != pcp_world_size:
         raise ValueError("Segments must cover every PCP rank.")
 
-    decode = num_decode_tokens
-    global_prefill_tokens = global_num_tokens - decode
-    linear_prefill_pad = linear_num_tokens_padded - decode
-    if global_prefill_tokens < 0 or linear_prefill_pad < 0:
-        raise ValueError("Decode prefix exceeds a view's token count.")
-
-    restore = np.full(global_prefill_tokens, -1, dtype=np.int64)
+    restore = np.full(global_num_tokens, -1, dtype=np.int64)
+    padded = linear_num_tokens_padded
     for rank, segments in enumerate(segments_by_rank):
+        rank_base = rank * padded
         for segment in segments:
-            if not bool(is_prefilling[segment.global_batch_req_idx]):
+            # Decode is replicated; keep a single source (rank 0), like DualChunk.
+            if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                 continue
-            for offset, global_idx in enumerate(
-                range(segment.global_batch_slice.start, segment.global_batch_slice.stop)
-            ):
-                local_pos = segment.rank_local_batch_slice.start + offset
-                if local_pos < decode:
-                    raise RuntimeError(
-                        "Prefill segment overlaps the decode prefix."
-                    )
-                local_prefill_offset = local_pos - decode
-                if local_prefill_offset >= linear_prefill_pad:
-                    raise RuntimeError(
-                        "Prefill offset exceeds the linear AG pad width."
-                    )
-                gp = global_idx - decode
-                if gp < 0 or gp >= global_prefill_tokens:
-                    raise RuntimeError(
-                        "Segment maps outside the global prefill range."
-                    )
-                if restore[gp] >= 0:
-                    raise ValueError(
-                        "Duplicate sequential ownership for a global prefill token."
-                    )
-                restore[gp] = rank * linear_prefill_pad + local_prefill_offset
+            local_start = segment.rank_local_batch_slice.start
+            local_stop = segment.rank_local_batch_slice.stop
+            g_start = segment.global_batch_slice.start
+            g_stop = segment.global_batch_slice.stop
+            if g_stop - g_start != local_stop - local_start:
+                raise RuntimeError("Segment global/local lengths differ.")
+            if local_stop > padded:
+                raise RuntimeError("Segment exceeds the padded local width.")
+            slot = restore[g_start:g_stop]
+            if np.any(slot >= 0):
+                raise ValueError("Duplicate sequential ownership for a global token.")
+            restore[g_start:g_stop] = np.arange(
+                rank_base + local_start,
+                rank_base + local_stop,
+                dtype=np.int64,
+            )
 
-    if global_prefill_tokens and np.any(restore < 0):
-        raise ValueError("Sequential layout is missing some global prefill tokens.")
+    if global_num_tokens and np.any(restore < 0):
+        raise ValueError("Sequential layout is missing some global tokens.")
 
     return async_copy_to_gpu(restore, device=device)
 
@@ -485,22 +452,17 @@ def partition_sequential_batch(
 
     Writes:
       - ``manager._global_batch``
-      - ``manager._hidden_restore_idx`` (linear prefill AG restore semantics)
+      - ``manager._hidden_restore_idx`` (DualChunk-compatible full-AG semantics)
     Returns the local ``InputBatch`` as the Runner main path (pad via
     ``num_tokens`` / ``is_padding``). Does not call DualChunk ``partition_batch``.
     """
     local_batch, linear_num_tokens_padded, segments_by_rank = (
         manager.partition_linear_batch(global_batch)
     )
-    num_decode_tokens = _decode_prefix_num_tokens(
-        global_batch.is_prefilling_np,
-        global_batch.query_start_loc_np,
-    )
     manager._global_batch = global_batch
     manager._hidden_restore_idx = build_linear_hidden_restore_idx(
         pcp_world_size=manager.pcp_world_size,
         device=manager.device,
-        num_decode_tokens=num_decode_tokens,
         global_num_tokens=global_batch.num_tokens,
         linear_num_tokens_padded=linear_num_tokens_padded,
         segments_by_rank=segments_by_rank,

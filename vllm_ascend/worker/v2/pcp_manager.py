@@ -19,7 +19,6 @@
 
 import torch
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -39,23 +38,48 @@ def validate_ascend_pcp_config(
     vllm_config: VllmConfig,
     supports_mm_inputs: bool,
 ) -> None:
-    """Validate the PCP subset implemented by the Ascend MRV2 runner."""
+    """Validate Ascend MRV2 PCP (aligned with li1how/pcp-integration intent).
+
+    - MLA: delegate to upstream ``PCPManager.validate_config``.
+    - GQA / hybrid: skip the upstream MLA-only gate; apply shared rejects plus
+      GQA-specific DCP / prefix / chunked / head-layout checks.
+    """
     parallel_config = vllm_config.parallel_config
     model_config = vllm_config.model_config
     if parallel_config.prefill_context_parallel_size <= 1:
         return
 
-    PCPManager.validate_config(vllm_config, supports_mm_inputs)
     if model_config.use_mla:
+        PCPManager.validate_config(vllm_config, supports_mm_inputs)
         return
 
+    # Non-MLA (pure GQA or hybrid GQA+GDN): do not call upstream (MLA-only).
     if parallel_config.decode_context_parallel_size > 1:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support PCP and DCP simultaneously yet.")
+        raise NotImplementedError(
+            "Ascend MRV2 GQA PCP does not support PCP and DCP simultaneously yet."
+        )
+    if parallel_config.pipeline_parallel_size > 1:
+        raise NotImplementedError("Ascend MRV2 GQA PCP does not support PP yet.")
+    if model_config.is_encoder_decoder:
+        raise NotImplementedError(
+            "Ascend MRV2 GQA PCP does not support encoder-decoder models yet."
+        )
+    if supports_mm_inputs:
+        raise NotImplementedError("Ascend MRV2 GQA PCP does not support MM inputs yet.")
+    if vllm_config.lora_config is not None:
+        raise NotImplementedError("Ascend MRV2 GQA PCP does not support LoRA yet.")
+    if vllm_config.speculative_config is not None:
+        raise NotImplementedError(
+            "Ascend MRV2 GQA PCP does not support speculative decoding yet."
+        )
     if vllm_config.cache_config.enable_prefix_caching:
-        raise NotImplementedError("Ascend MRV2 GQA PCP does not support prefix caching yet. Disable prefix caching.")
+        raise NotImplementedError(
+            "Ascend MRV2 GQA PCP does not support prefix caching yet. Disable prefix caching."
+        )
     if vllm_config.scheduler_config.enable_chunked_prefill:
         raise NotImplementedError(
-            "Ascend MRV2 GQA PCP does not support scheduler chunked prefill yet. Disable chunked prefill."
+            "Ascend MRV2 GQA PCP does not support scheduler chunked prefill yet. "
+            "Disable chunked prefill."
         )
 
     text_config = model_config.hf_text_config
@@ -72,6 +96,7 @@ def validate_ascend_pcp_config(
             "Ascend MRV2 GQA PCP requires num_attention_heads to be an "
             "integer multiple greater than num_key_value_heads."
         )
+
 
 
 class AscendPCPManager(PCPManager):
@@ -94,44 +119,6 @@ class AscendPCPManager(PCPManager):
             max_num_reqs=max_num_reqs,
             max_num_tokens=max_num_tokens,
         )
-
-    @staticmethod
-    def validate_config(
-        vllm_config: VllmConfig,
-        supports_mm_inputs: bool,
-    ) -> None:
-        """Override upstream validate_config: drop the MLA-only restriction."""
-        parallel_config = vllm_config.parallel_config
-        model_config = vllm_config.model_config
-        pcp_size = parallel_config.prefill_context_parallel_size
-        if pcp_size <= 1:
-            return
-
-        if parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError("MRV2 PCP does not support PP yet.")
-        if model_config.is_encoder_decoder:
-            raise NotImplementedError(
-                "MRV2 PCP does not support encoder-decoder models yet."
-            )
-        if supports_mm_inputs:
-            raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
-        if vllm_config.lora_config is not None:
-            raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError(
-                "MRV2 PCP does not support speculative decoding yet."
-            )
-        is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
-        if (
-            is_sparse_mla
-            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
-            raise NotImplementedError(
-                "MRV2 sparse MLA PCP does not support CUDA graphs yet. "
-                "Set -cc.cudagraph_mode=NONE."
-            )
-        if vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            raise NotImplementedError("MRV2 PCP supports PIECEWISE CUDA graphs only.")
 
     def partition_batch(self, input_batch: AscendInputBatch) -> AscendInputBatch:
         """DualChunk partition + Ascend metadata (non-hybrid / FA-only path)."""
