@@ -799,6 +799,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
 
 class AscendGDNAttentionBackend(GDNAttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        # Upstream check_attention_cp_compatibility requires every layer backend
+        # to opt in. GDN has no AttentionImpl; declare on the backend class.
+        # Sequential Hybrid PCP SSM/conv sync lives in gdn_pcp_*.py.
+        return True
+
     @staticmethod
     def get_builder_cls() -> type[AscendGDNAttentionMetadataBuilder]:
         return AscendGDNAttentionMetadataBuilder

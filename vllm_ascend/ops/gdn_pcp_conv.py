@@ -143,7 +143,8 @@ def transfer_pcp_prefill_conv_state(
     previous, final = _chain_histories(local_tail, local_lens, initial)
 
     if get_pcp_group().rank_in_group > 0:
-        conv_state[cache_indices, :state_len, :].copy_(previous.transpose(-1, -2))
+        # Advanced indexing returns a copy; use __setitem__ so the write sticks.
+        conv_state[cache_indices, :state_len, :] = previous.transpose(-1, -2)
 
     return PcpPrefillConvTransfer(
         _conv_state=conv_state,
