@@ -8,10 +8,10 @@
 #   1. Each rank already ran local chunk_h with its own initial_state (s0)
 #   2. Compute per-rank transition matrix for the local segment
 #   3. AG (local_final_state, transition)
-#   4. Gather + correct prev states: correct_i = final_i + T_i @ (correct_{i-1} - s0)
+#   4. Gather + correct: correct_i = final_i + T_i @ (correct_{i-1} - s0)
 #   5. Rank > 0: recompute local h with correct_{r-1} as initial
-#   6. Decode final_state = last valid rank's kernel end state (AG + pick),
-#      NOT the AscendC_final × Triton_Φ formula end (that mismatches step 5)
+#   6. All ranks take corrected[-1] (last valid rank via identity empty rows)
+#      as decode final_state
 #
 # Call site (thin, inside chunk after local fwd_h, before fwd_o):
 #   if get_pcp_group().world_size > 1:
@@ -134,16 +134,16 @@ def _recompute_local_h(
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Recompute local ``fwd_h`` with a corrected initial state.
 
     Only needed for rank > 0: their first ``h`` / ``v_new`` used the wrong
-    initial (local s0).
+    initial (local s0). Rank 0's token outputs are already correct under
+    causal order; decode end-state comes from the chained ``corrected[-1]``.
 
-    Returns AscendC-layout ``(h, v_new)`` for ``fwd_o``, plus the recomputed
-    ``final_state`` from the same kernel (needed for decode write-back).
+    Returns AscendC-layout ``(h, v_new)`` for ``fwd_o``.
     """
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    h, v_new, _final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
         u=u,
@@ -154,47 +154,7 @@ def _recompute_local_h(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
-    return (
-        h.transpose(1, 2).contiguous(),
-        v_new.transpose(1, 2).contiguous(),
-        final_state,
-    )
-
-
-def _pick_last_valid_end_state(
-    local_end_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-) -> torch.Tensor:
-    """All-gather per-rank end states and keep the last valid rank's copy.
-
-    Decode must consume the end state from the same kernel path that produced
-    the last prefill tokens. Empty local rows are skipped so a short request
-    that only touched early ranks still picks the correct end.
-    """
-    pcp_group = get_pcp_group()
-    local_valid = (cu_seqlens[1:] - cu_seqlens[:-1]) > 0
-    valid_marker = local_valid[:, None, None, None].expand(
-        -1,
-        local_end_state.shape[1],
-        local_end_state.shape[2],
-        1,
-    )
-    payload = torch.cat(
-        (local_end_state, valid_marker.to(local_end_state.dtype)),
-        dim=-1,
-    )
-    gathered = pcp_group.all_gather(payload.unsqueeze(0).contiguous(), 0)
-    all_ends = gathered[..., :-1]
-    valid_by_rank = gathered[:, :, 0, 0, -1] > 0
-
-    decode_final = all_ends[0]
-    for rank in range(1, gathered.shape[0]):
-        decode_final = torch.where(
-            valid_by_rank[rank][:, None, None, None],
-            all_ends[rank],
-            decode_final,
-        )
-    return decode_final
+    return h.transpose(1, 2).contiguous(), v_new.transpose(1, 2).contiguous()
 
 
 def correct_pcp_prefill_ssm_state(
@@ -226,7 +186,7 @@ def correct_pcp_prefill_ssm_state(
     Returns:
         ``(h, v_new, final_state)`` ready for ``fwd_o`` and decode write-back.
         Rank 0 keeps local ``h`` / ``v_new``; rank > 0 recomputes them. All ranks
-        share the same decode ``final_state`` from the last valid rank's kernel.
+        share the same decode ``final_state`` (``corrected[-1]``).
     """
     local_transition = _compute_local_transition(
         k=k,
@@ -237,10 +197,7 @@ def correct_pcp_prefill_ssm_state(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
-    # Formula final is only used to derive prev_state for rank>0 recompute.
-    # Decode write-back must NOT trust AscendC_final + Triton_Φ composition:
-    # last-rank tokens come from Triton recompute, so decode state must too.
-    _, prev_state = _gather_and_correct_ssm_states(
+    final_state, prev_state = _gather_and_correct_ssm_states(
         initial_state=initial_state,
         local_final_state=local_final_state,
         local_transition=local_transition,
@@ -250,9 +207,8 @@ def correct_pcp_prefill_ssm_state(
     local_has_tokens = bool(((cu_seqlens[1:] - cu_seqlens[:-1]) > 0).any().item())
     if get_pcp_group().rank_in_group == 0 or not local_has_tokens:
         h, v_new = local_h, local_v_new
-        local_end_state = local_final_state
     else:
-        h, v_new, local_end_state = _recompute_local_h(
+        h, v_new = _recompute_local_h(
             k=k,
             w=w,
             u=u,
@@ -263,5 +219,4 @@ def correct_pcp_prefill_ssm_state(
             chunk_offsets=chunk_offsets,
         )
 
-    final_state = _pick_last_valid_end_state(local_end_state, cu_seqlens)
     return h, v_new, final_state
