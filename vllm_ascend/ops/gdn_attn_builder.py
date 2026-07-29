@@ -632,6 +632,14 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
                 prefill_has_initial_state = has_initial_state
+            # Hybrid PCP inflates context_lens with segment_offset, so rank>0
+            # would look like has_init=True even on cold prefill. SSM has no
+            # pre-inject (unlike conv); phase-1 also bans prefix-cache, so clear
+            # on every PCP rank. Conv still uses has_initial_state + rank>0 force.
+            if get_pcp_group().world_size > 1:
+                prefill_has_initial_state = torch.zeros_like(
+                    prefill_has_initial_state, dtype=torch.bool
+                )
         else:
             has_initial_state = None
 
