@@ -115,10 +115,10 @@ def chunk_gated_delta_rule_fwd_kernel_hupdate_blockdim64(
             b_hupd_local_11 = b_hupd_local_11 * b_g_last
             b_hupd_local_22 = b_hupd_local_22 * b_g_last
 
-        b_hupd_local_11 -= tl.dot(b_k_upd1, b_w_upd1.to(b_k_upd1.dtype))
-        b_hupd_local_22 -= tl.dot(b_k_upd2, b_w_upd2.to(b_k_upd2.dtype))
-        b_hupd_local_12 = -tl.dot(b_k_upd1, b_w_upd2.to(b_k_upd1.dtype)).to(tl.float32)
-        b_hupd_local_21 = -tl.dot(b_k_upd2, b_w_upd1.to(b_k_upd2.dtype)).to(tl.float32)
+        b_hupd_local_11 -= tl.dot(b_k_upd1.to(tl.float32), b_w_upd1)
+        b_hupd_local_22 -= tl.dot(b_k_upd2.to(tl.float32), b_w_upd2)
+        b_hupd_local_12 = -tl.dot(b_k_upd1.to(tl.float32), b_w_upd2)
+        b_hupd_local_21 = -tl.dot(b_k_upd2.to(tl.float32), b_w_upd1)
 
         hupd_base = h_update + (boh + i_t + i_n) * H * K * K + i_h * K * K
         p_hupd_11 = tl.make_block_ptr(hupd_base, (K, K), (K, 1), (0, 0), (64, 64), (1, 0))

@@ -135,7 +135,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         ptr_v1 = v_base + offs_t_v * stride_v + offs_v1 * 1
         b_v1 = tl.load(ptr_v1, mask=mask_v1, other=0.0)
         b_v_new1 = b_v1.to(tl.float32)
-        b_v_new1 -= tl.dot(b_w, b_h1_bv1.to(b_w.dtype))
+        b_v_new1 -= tl.dot(b_w.to(tl.float32), b_h1_bv1)
 
         if SAVE_NEW_VALUE:
             p_v_new1 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start1), (BT, 64), (1, 0))
@@ -145,14 +145,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_v_new1 = b_v_new1 * b_g[:, None]
             b_h1_bv1 = b_h1_bv1 * b_g_last
 
-        b_v_new1 = b_v_new1.to(k.dtype.element_ty)
-        b_h1_bv1 += tl.dot(b_k, b_v_new1)
+        b_h1_bv1 += tl.dot(b_k.to(tl.float32), b_v_new1)
 
         mask_v2 = (offs_t_v < T) & (offs_v2 < V)
         ptr_v2 = v_base + offs_t_v * stride_v + offs_v2 * 1
         b_v2 = tl.load(ptr_v2, mask=mask_v2, other=0.0)
         b_v_new2 = b_v2.to(tl.float32)
-        b_v_new2 -= tl.dot(b_w, b_h1_bv2.to(b_w.dtype))
+        b_v_new2 -= tl.dot(b_w.to(tl.float32), b_h1_bv2)
 
         if SAVE_NEW_VALUE:
             p_v_new2 = tl.make_block_ptr(v_new_base, (T, V), (stride_v, 1), (i_t * BT, v_start2), (BT, 64), (1, 0))
@@ -162,8 +161,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_v_new2 = b_v_new2 * b_g[:, None]
             b_h1_bv2 = b_h1_bv2 * b_g_last
 
-        b_v_new2 = b_v_new2.to(k.dtype.element_ty)
-        b_h1_bv2 += tl.dot(b_k, b_v_new2)
+        b_h1_bv2 += tl.dot(b_k.to(tl.float32), b_v_new2)
 
     # epilogue
     if STORE_FINAL_STATE:

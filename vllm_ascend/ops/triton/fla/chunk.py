@@ -8,6 +8,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 # mypy: ignore-errors
+import os
 import warnings
 
 import torch
@@ -126,6 +127,25 @@ def chunk_gated_delta_rule_fwd(
         _fs_full = initial_state.clone()
         _fs_full[keep_meta] = final_state
         final_state = _fs_full
+
+    # Verification-only path: use the same high-precision Triton recurrence
+    # for PCP=1 and PCP>1 so local final states and transition matrices share
+    # one numerical contract. This is deliberately opt-in until its accuracy
+    # and performance have been validated on NPU.
+    if os.getenv("VLLM_ASCEND_GDN_AFFINE_VERIFY") == "1":
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+            chunk_offsets=chunk_offsets_chunk64,
+        )
+        h = h.transpose(1, 2).contiguous()
+        v_new = v_new.transpose(1, 2).contiguous()
 
     if get_pcp_group().world_size > 1:
         assert cu_seqlens is not None
