@@ -13,17 +13,17 @@ import warnings
 import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
+from vllm_ascend.ops.gdn_pcp_ssm import correct_dual_chunk_pcp_ssm_state
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
-from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_o import chunk_fwd_o  # noqa: F401
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
-from .utils import input_guard, prepare_final_chunk_indices
+from .utils import input_guard
 from .wy_fast import recompute_w_u_fwd
 
 
@@ -39,21 +39,12 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     prebuilt_meta=None,
 ):
-    forward_context = get_forward_context()
-    num_decodes = 0
-    attn_metadata = forward_context.attn_metadata
-    if attn_metadata is not None and isinstance(attn_metadata, dict):
-        attn_metadata = next(iter(attn_metadata.values()), None)
-    if attn_metadata is not None:
-        num_decodes = attn_metadata.num_decodes
     chunk_size = 64
     block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
     cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
     chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
     chunk_indices_chunk64_host = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64_host
     chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_chunk64
-    update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
-    final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
     chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
     g = chunk_local_cumsum(
         g,
@@ -135,64 +126,23 @@ def chunk_gated_delta_rule_fwd(
         _fs_full[keep_meta] = final_state
         final_state = _fs_full
 
-    if get_pcp_group().world_size > 1:
-        # When integrating mtp, since `mix_qkv` has been split, `num_decode`
-        # cannot be directly obtained from the metadata and needs to be recalculated.
-        actual_num_decodes = getattr(prebuilt_meta, "num_decodes", None)
-        if actual_num_decodes is None:
-            actual_num_decodes = num_decodes
-        h_update = chunk_gated_delta_rule_fwd_hupdate(
+    if (
+        get_pcp_group().world_size > 1
+        and prebuilt_meta is not None
+        and prebuilt_meta.pcp_segment_ids is not None
+    ):
+        h, v_new, final_state = correct_dual_chunk_pcp_ssm_state(
+            local_final_state=final_state,
             k=k,
             w=w,
             u=u,
             g=g,
             cu_seqlens=cu_seqlens,
+            segment_ids=prebuilt_meta.pcp_segment_ids,
+            segment_capacity=prebuilt_meta.pcp_segment_capacity,
             chunk_indices=chunk_indices_chunk64,
             chunk_offsets=chunk_offsets_chunk64,
-            update_chunk_offsets=update_chunk_offsets_chunk64,
-            num_decodes=actual_num_decodes,
         )
-        all_final_state = get_pcp_group().all_gather(final_state.unsqueeze(0), 0)
-        final_chunk_indices = final_chunk_indices_chunk64
-        if final_chunk_indices is None:
-            final_chunk_indices = prepare_final_chunk_indices(cu_seqlens, chunk_size)
-        final_h_update = h_update[:, final_chunk_indices, :, :, :]
-        all_final_h_update = get_pcp_group().all_gather(final_h_update, 0)
-
-        updated_state = final_state.new_empty(get_pcp_group().world_size, *final_state.shape)
-        updated_state[0, ...] = all_final_state[0]
-        for i in range(1, get_pcp_group().world_size):
-            # correct_i = all_final_state[i] + Φ_i · (correct_{i-1} - s0) = Φ_i · correct_{i-1} + p_i
-            updated_final_state = all_final_state[i] + torch.matmul(
-                all_final_h_update[i, ...], updated_state[i - 1, ...] - initial_state
-            )
-            updated_state[i, ...] = updated_final_state
-
-        final_state = updated_state[-1, ...]
-
-        if get_pcp_group().rank_in_group == 0:
-            updated_h_state = torch.zeros_like(final_state)
-        else:
-            updated_h_state = updated_state[get_pcp_group().rank_in_group - 1, ...]
-
-        if get_pcp_group().rank_in_group > 0:
-            rerun_initial_state = initial_state.clone()
-            prefill_seq_offset = actual_num_decodes
-            prefill_slice = slice(prefill_seq_offset, final_state.shape[0])
-            rerun_initial_state[prefill_slice] = updated_h_state[prefill_slice]
-            h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-                k=k,
-                w=w,
-                u=u,
-                g=g,
-                initial_state=rerun_initial_state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices_chunk64,
-                chunk_offsets=chunk_offsets_chunk64,
-            )
-            h = h.transpose(1, 2).contiguous()
-            v_new = v_new.transpose(1, 2).contiguous()
 
     o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
         q_ascendc,

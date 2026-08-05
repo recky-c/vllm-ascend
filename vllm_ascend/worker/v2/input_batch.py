@@ -73,6 +73,11 @@ class AscendInputBatch(InputBatch):
     seq_lens_np: np.ndarray
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
+    # Canonical DualChunk segment id for every rank-local request row. Decode
+    # rows use -1. Hybrid GDN uses these ids to restore causal head/tail order.
+    pcp_segment_ids: torch.Tensor | None = None
+    # Fixed per-rank collective width: two possible segments per global row.
+    pcp_segment_capacity: int = 0
 
     @classmethod
     def make_dummy(

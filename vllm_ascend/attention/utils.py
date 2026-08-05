@@ -241,6 +241,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     # Metadata for Decode Context Parallelism (DCP) operations.
     context_parallel_metadata: AscendDCPMetadata | None = None
+    # Rank-local DualChunk row -> canonical global segment id. These fields are
+    # consumed only by recurrent hybrid layers; GQA keeps the upstream layout.
+    pcp_segment_ids: torch.Tensor | None = None
+    pcp_segment_capacity: int = 0
     group_len: torch.Tensor = None
     group_key_idx: torch.Tensor = None
     group_key_cache_idx: torch.Tensor = None

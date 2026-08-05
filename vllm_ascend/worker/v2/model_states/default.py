@@ -80,6 +80,8 @@ class AscendAttentionMetadataMixin:
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_attn_metadata,
             for_cudagraph_capture=for_capture,
+            pcp_segment_ids=getattr(input_batch, "pcp_segment_ids", None),
+            pcp_segment_capacity=getattr(input_batch, "pcp_segment_capacity", 0),
         )
         return self.attn_metadata
 

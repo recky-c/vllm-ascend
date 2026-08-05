@@ -191,6 +191,8 @@ def test_partition_batch_refreshes_local_ascend_input_batch_metadata():
     assert result.num_tokens == 8
     assert result.num_tokens_after_padding == 10
     assert torch.equal(result.input_ids[:8], torch.tensor([15, 16, 17, 0, 1, 2, 3, 4], dtype=torch.int32))
+    assert torch.equal(result.pcp_segment_ids, torch.tensor([3, 0]))
+    assert result.pcp_segment_capacity == 2
 
     # dataclasses.replace() retains the global Ascend-only fields by default;
     # the override must refresh them from real PCP-local CPU rows.
@@ -204,6 +206,44 @@ def test_partition_batch_refreshes_local_ascend_input_batch_metadata():
     assert args[2] == 2
     np.testing.assert_array_equal(args[3], np.array([3, 5], dtype=np.int32))
     np.testing.assert_array_equal(args[4], np.array([3, 5], dtype=np.int32))
+
+
+def test_hybrid_dual_chunk_rejects_prefill_shorter_than_pcp_size():
+    vllm_config = _make_gqa_pcp_config()
+    vllm_config.model_config.is_hybrid = True
+    manager = AscendPCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        vllm_config=vllm_config,
+    )
+
+    with pytest.raises(NotImplementedError, match="at least one token per PCP rank"):
+        manager._build_batch_layout(
+            np.array([1], dtype=np.int32),
+            np.array([0], dtype=np.int32),
+            np.array([True]),
+            np.array([0, 1], dtype=np.int32),
+        )
+
+
+def test_hybrid_dual_chunk_rejects_continued_prefill():
+    vllm_config = _make_gqa_pcp_config()
+    vllm_config.model_config.is_hybrid = True
+    manager = AscendPCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        vllm_config=vllm_config,
+    )
+
+    with pytest.raises(NotImplementedError, match="continued prefill"):
+        manager._build_batch_layout(
+            np.array([8], dtype=np.int32),
+            np.array([4], dtype=np.int32),
+            np.array([True]),
+            np.array([0, 8], dtype=np.int32),
+        )
 
 
 def test_maybe_build_ascend_pcp_manager_returns_none_when_pcp_is_disabled():

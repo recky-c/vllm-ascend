@@ -30,10 +30,10 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
+from vllm_ascend.ops.gdn_pcp_conv import prepare_dual_chunk_pcp_conv
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
-from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -222,52 +222,77 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 query_start_loc_opt = non_spec_causal_conv1d_meta.query_start_loc
                 cache_indices_opt = non_spec_causal_conv1d_meta.cache_indices
                 initial_state_mode_opt = non_spec_causal_conv1d_meta.initial_state_mode
-                if get_pcp_group().world_size > 1:
-                    conv_weights_T = conv_weights.transpose(0, 1)
-                    activation_num = 1 if self.activation else 0
-                    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-                    assert non_spec_query_start_loc is not None
-                    non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
-                    width = conv_weights.shape[1]
-                    state_len = width - 1
-                    num_seqs = non_spec_query_start_loc.shape[0] - 1
-                    prefill_seq_offset = max(0, num_seqs - attn_metadata.num_prefills)
-                    prefill_cache_indices = non_spec_state_indices_tensor[prefill_seq_offset:]
-                    mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
-                    last_width_prefill_x = extract_last_width(
-                        mixed_qkv_non_spec_T, non_spec_query_start_loc[prefill_seq_offset:], state_len
-                    )
-                    pcp_rank = get_pcp_group().rank_in_group
-                    all_last_width_prefill_x = get_pcp_group().all_gather(
-                        last_width_prefill_x.unsqueeze(0).contiguous(), 0
-                    )
-                    if pcp_rank > 0 and prefill_cache_indices.shape[0] > 0:
-                        self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
-                            pcp_rank - 1, ...
-                        ].transpose(-1, -2)
-                    mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
-                        mixed_qkv_non_spec_output,
-                        mixed_qkv_non_spec,
-                        conv_weights_T,
+                conv_weights_T = conv_weights.transpose(0, 1)
+                activation_num = 1 if self.activation else 0
+                chunk_meta = attn_metadata.non_spec_prefill_metadata.chunk
+                if (
+                    get_pcp_group().world_size > 1
+                    and chunk_meta.pcp_segment_ids is not None
+                ):
+                    prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+                    prefill_state_indices = attn_metadata.prefill_state_indices
+                    assert prefill_query_start_loc is not None
+                    assert prefill_state_indices is not None
+                    num_decode_tokens = attn_metadata.num_decode_tokens
+                    mixed_qkv_prefill = mixed_qkv_non_spec[num_decode_tokens:]
+                    conv_plan = prepare_dual_chunk_pcp_conv(
                         conv_state=self_kv_cache[0],
+                        mixed_qkv=mixed_qkv_prefill,
+                        query_start_loc=prefill_query_start_loc,
+                        state_indices=prefill_state_indices,
+                        segment_ids=chunk_meta.pcp_segment_ids,
+                        segment_capacity=chunk_meta.pcp_segment_capacity,
+                        state_len=conv_weights.shape[1] - 1,
+                    )
+
+                    output_prefill = torch.empty_like(mixed_qkv_prefill)
+                    torch.ops._C_ascend.npu_causal_conv1d_custom(
+                        output_prefill,
+                        mixed_qkv_prefill,
+                        conv_weights_T,
+                        conv_state=conv_plan.conv_state,
                         bias_opt=self.conv1d.bias,
-                        query_start_loc_opt=query_start_loc_opt,
-                        cache_indices_opt=cache_indices_opt,
-                        initial_state_mode_opt=initial_state_mode_opt,
+                        query_start_loc_opt=prefill_query_start_loc,
+                        cache_indices_opt=conv_plan.cache_indices,
+                        initial_state_mode_opt=conv_plan.initial_state_mode,
                         num_accepted_tokens_opt=None,
                         activation_mode=activation_num,
                         pad_slot_id=PAD_SLOT_ID,
                         run_mode=0,
                     )
-                    mixed_qkv_non_spec = mixed_qkv_non_spec_output
-                    if prefill_cache_indices.shape[0] > 0:
-                        self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
-                            -1, ...
-                        ].transpose(-1, -2)
+                    conv_plan.write_back_final_state()
+
+                    if num_decode_tokens > 0:
+                        mixed_qkv_decode = mixed_qkv_non_spec[:num_decode_tokens]
+                        output_decode = torch.empty_like(mixed_qkv_decode)
+                        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+                        assert non_spec_query_start_loc is not None
+                        assert non_spec_state_indices_tensor is not None
+                        torch.ops._C_ascend.npu_causal_conv1d_custom(
+                            output_decode,
+                            mixed_qkv_decode,
+                            conv_weights_T,
+                            conv_state=self_kv_cache[0],
+                            bias_opt=self.conv1d.bias,
+                            query_start_loc_opt=non_spec_query_start_loc[
+                                : attn_metadata.num_decodes + 1
+                            ],
+                            cache_indices_opt=non_spec_state_indices_tensor[
+                                : attn_metadata.num_decodes
+                            ],
+                            initial_state_mode_opt=None,
+                            num_accepted_tokens_opt=None,
+                            activation_mode=activation_num,
+                            pad_slot_id=PAD_SLOT_ID,
+                            run_mode=1,
+                        )
+                        mixed_qkv_non_spec = torch.cat(
+                            (output_decode, output_prefill),
+                            dim=0,
+                        )
+                    else:
+                        mixed_qkv_non_spec = output_prefill
                 else:
-                    conv_weights_T = conv_weights.transpose(0, 1)
-                    activation_num = 1 if self.activation else 0
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         mixed_qkv_non_spec_output,
@@ -414,7 +439,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+            chunk_meta = attn_metadata.non_spec_prefill_metadata.chunk
+            if (
+                get_pcp_group().world_size > 1
+                and chunk_meta.pcp_segment_ids is not None
+            ):
+                num_chunks = 2 * get_pcp_group().world_size
+                local_head = (
+                    torch.remainder(chunk_meta.pcp_segment_ids, num_chunks)
+                    < get_pcp_group().world_size
+                )
+                prefill_state_indices = prefill_state_indices[local_head]
+                last_recurrent_state = last_recurrent_state[local_head]
+            ssm_state[prefill_state_indices] = (
+                last_recurrent_state.transpose(-1, -2)
+                .contiguous()
+                .to(ssm_state.dtype)
+            )
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],

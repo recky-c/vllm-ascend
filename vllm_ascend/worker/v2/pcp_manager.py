@@ -17,12 +17,14 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
@@ -72,8 +74,79 @@ class AscendPCPManager(PCPManager):
     """PCP manager that refreshes Ascend-only local-batch metadata."""
 
     def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
+        max_num_reqs = kwargs.get("max_num_reqs")
         super().__init__(*args, **kwargs)
         self.vllm_config = vllm_config
+        model_config = getattr(vllm_config, "model_config", None)
+        self._is_hybrid = bool(getattr(model_config, "is_hybrid", False))
+        self._pcp_segment_ids_by_rank: list[list[int]] | None = None
+        self._pcp_segment_capacity = 0
+        self._pcp_segment_ids_buffer = (
+            torch.empty(2 * max_num_reqs, dtype=torch.int64, device=self.device)
+            if max_num_reqs is not None
+            else None
+        )
+
+    def _build_batch_layout(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        num_computed_tokens: np.ndarray,
+        is_prefilling: np.ndarray,
+        query_start_loc_np: np.ndarray,
+    ) -> tuple[list[list[RankSegment]], list[int]]:
+        """Build upstream DualChunk rows plus stable ids for recurrent layers.
+
+        Canonical ids are ``request_index * (2 * P) + chunk_index``. They are
+        independent of the backend row reorder and therefore let GDN restore
+        the causal order ``head ranks ascending, tail ranks descending``.
+        """
+        if self._is_hybrid:
+            continued_prefills = np.flatnonzero(
+                is_prefilling & (num_computed_tokens > 0)
+            )
+            if continued_prefills.size:
+                raise NotImplementedError(
+                    "Ascend MRV2 Hybrid PCP DualChunk does not support "
+                    "continued prefill yet; requests "
+                    f"{continued_prefills.tolist()} have computed lengths "
+                    f"{num_computed_tokens[continued_prefills].tolist()}."
+                )
+            short_prefills = np.flatnonzero(
+                is_prefilling & (num_scheduled_tokens < self.pcp_world_size)
+            )
+            if short_prefills.size:
+                raise NotImplementedError(
+                    "Ascend MRV2 Hybrid PCP DualChunk requires every prefill "
+                    "query to contain at least one token per PCP rank; "
+                    f"requests {short_prefills.tolist()} have lengths "
+                    f"{num_scheduled_tokens[short_prefills].tolist()} with "
+                    f"pcp_size={self.pcp_world_size}."
+                )
+
+        segments_by_rank, per_rank_num_tokens = super()._build_batch_layout(
+            num_scheduled_tokens,
+            num_computed_tokens,
+            is_prefilling,
+            query_start_loc_np,
+        )
+        num_chunks = 2 * self.pcp_world_size
+        ids_by_rank: list[list[int]] = []
+        for segments in segments_by_rank:
+            rank_ids: list[int] = []
+            for segment in segments:
+                req_idx = segment.global_batch_req_idx
+                if not bool(is_prefilling[req_idx]):
+                    rank_ids.append(-1)
+                    continue
+                query_len = int(num_scheduled_tokens[req_idx])
+                chunk_size = (query_len + num_chunks - 1) // num_chunks
+                global_start = int(query_start_loc_np[req_idx])
+                chunk_idx = (segment.global_batch_slice.start - global_start) // chunk_size
+                rank_ids.append(req_idx * num_chunks + chunk_idx)
+            ids_by_rank.append(rank_ids)
+        self._pcp_segment_ids_by_rank = ids_by_rank
+        self._pcp_segment_capacity = 2 * len(num_scheduled_tokens)
+        return segments_by_rank, per_rank_num_tokens
 
     @staticmethod
     def validate_config(
@@ -127,6 +200,20 @@ class AscendPCPManager(PCPManager):
             local_batch.num_scheduled_tokens,
             local_batch.num_scheduled_tokens,
         )
+        assert self._pcp_segment_ids_by_rank is not None
+        local_segment_ids_np = np.asarray(
+            self._pcp_segment_ids_by_rank[self.pcp_rank], dtype=np.int64
+        )
+        if self._pcp_segment_ids_buffer is None:
+            local_batch.pcp_segment_ids = async_copy_to_gpu(
+                local_segment_ids_np, device=self.device
+            )
+        else:
+            local_batch.pcp_segment_ids = async_copy_to_gpu(
+                local_segment_ids_np,
+                out=self._pcp_segment_ids_buffer[: local_segment_ids_np.size],
+            )
+        local_batch.pcp_segment_capacity = self._pcp_segment_capacity
         return local_batch
 
 

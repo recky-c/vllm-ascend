@@ -64,6 +64,8 @@ class GDNChunkedPrefillMetadata:
     num_decodes: int = 0
     cu_seqlens_kern: tuple[int, ...] | None = None
     keep_meta: torch.Tensor | None = None
+    pcp_segment_ids: torch.Tensor | None = None
+    pcp_segment_capacity: int = 0
 
 
 @dataclass
@@ -316,12 +318,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if non_spec_cache_indices is None:
             raise RuntimeError("Expected non_spec_cache_indices for Ascend GDN prefill conv1d path.")
         prefill_num_rows = attn_metadata.non_spec_query_start_loc.size(0) - 1
-        pcp_size = getattr(self.vllm_config.parallel_config, "prefill_context_parallel_size", 1)
-        pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
-        if pcp_rank > 0 and attn_metadata.num_prefills > 0:
-            prefill_seq_offset = max(0, prefill_num_rows - attn_metadata.num_prefills)
-            initial_state_mode = initial_state_mode.clone()
-            initial_state_mode[prefill_seq_offset:] = True
         attn_metadata.non_spec_prefill_metadata = GDNPrefillMetadata(
             causal_conv1d=GDNCausalConv1dMetadata(
                 query_start_loc=attn_metadata.non_spec_query_start_loc,
@@ -608,6 +604,20 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 prefill_query_start_loc_cpu,
                 query_start_loc.device,
             )
+            if get_pcp_group().world_size > 1:
+                pcp_segment_ids = getattr(m, "pcp_segment_ids", None)
+                pcp_segment_capacity = int(getattr(m, "pcp_segment_capacity", 0))
+                # Profile/dummy batches do not pass through PCP partition and
+                # intentionally have no segment plan. They run locally only.
+                if pcp_segment_ids is not None and pcp_segment_capacity > 0:
+                    if spec_sequence_masks is None and num_decodes > 0:
+                        pcp_segment_ids = pcp_segment_ids[num_decodes:]
+                    non_spec_chunked_prefill_metadata.pcp_segment_ids = (
+                        pcp_segment_ids
+                    )
+                    non_spec_chunked_prefill_metadata.pcp_segment_capacity = (
+                        pcp_segment_capacity
+                    )
             # Preserve upstream GDNAttentionMetadata fields for callers that
             # still use the chunk_gated_delta_rule API directly.
             chunk_indices = non_spec_chunked_prefill_metadata.chunk_indices_chunk64
@@ -633,6 +643,14 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
                 prefill_has_initial_state = has_initial_state
+            # Phase one rejects prefix caching and continued prefills. Every
+            # DualChunk segment must therefore build its provisional summary
+            # from zero; corrected causal inputs are injected by gdn_pcp_*.
+            if get_pcp_group().world_size > 1:
+                prefill_has_initial_state = torch.zeros_like(
+                    prefill_has_initial_state,
+                    dtype=torch.bool,
+                )
         else:
             has_initial_state = None
 
@@ -800,6 +818,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
 
 class AscendGDNAttentionBackend(GDNAttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_builder_cls() -> type[AscendGDNAttentionMetadataBuilder]:
         return AscendGDNAttentionMetadataBuilder
