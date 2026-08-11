@@ -427,6 +427,13 @@ class NPUPlatform(Platform):
         cls._validate_draft_decode_context_parallel_config(vllm_config)
         cls._validate_parallel_config(vllm_config)
 
+        if vllm_config.parallel_config.kvpp_size > 1:
+            from vllm_ascend.core.kvpp_allocation import (
+                register_kvpp_allocation_hook,
+            )
+
+            register_kvpp_allocation_hook()
+
         # initialize ascend config from vllm additional_config
         cls._fix_incompatible_config(vllm_config)
 

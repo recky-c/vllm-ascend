@@ -521,6 +521,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        # KVPP runtime hook. Set by NPUModelRunner.initialize_kv_cache when
+        # kvpp_size > 1; stays None otherwise so the attention hot path is
+        # unchanged.
+        self.kvpp_context = None
 
         # MLA Args
         self.q_lora_rank = kwargs["q_lora_rank"]
@@ -1554,6 +1558,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
 
+        if self.kvpp_context is not None:
+            self.kvpp_context.begin_layer(layer_name)
+
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
         o_proj_full_param_handles = None
@@ -1849,6 +1856,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
+        if self.kvpp_context is not None:
+            # Submit the next layer's transfer now so it overlaps the SFA
+            # kernel, which runs on MIX_AIC and leaves AI_VECTOR_CORE + HCCS
+            # bandwidth free for the MTE transport. Non-blocking.
+            self.kvpp_context.prepare_for_attention(layer_name)
+
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope,
             q_pe,
@@ -1860,6 +1873,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
         attn_output = self._v_up_proj(attn_output)
+
+        if self.kvpp_context is not None:
+            # The next layer's transfer was submitted before this attention
+            # and uses the other scratch buffer. This marks the point after
+            # which a later layer may eventually cycle back to this buffer.
+            self.kvpp_context.finish_layer_attention(layer_name)
 
         if self.enable_dsa_cp_with_o_proj_tp:
             # SFA DSA-CP mixed mode keeps o_proj weight sharded in the TP domain:

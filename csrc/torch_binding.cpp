@@ -246,6 +246,102 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
 // 310P and A5 builds.
+#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
+namespace vllm_ascend {
+void kvpp_mte_copy_pages_impl(
+    void* stream, void* local_base, void* page_ids, void* valid_mask,
+    void* local_base_offsets, void* block_strides, void* block_bytes,
+    void* staging_buffer_offsets, uint64_t num_pages, uint64_t num_buffers,
+    void* staging_base, int32_t source_rank, int32_t destination_rank,
+    uint32_t shm_id);
+} // namespace vllm_ascend
+
+void kvpp_mte_copy(const torch::Tensor& anchor,
+                   const torch::Tensor& page_ids,
+                   const torch::Tensor& valid_mask,
+                   const torch::Tensor& local_base_offsets,
+                   const torch::Tensor& block_strides,
+                   const torch::Tensor& block_bytes,
+                   const torch::Tensor& staging_buffer_offsets,
+                   int64_t num_pages,
+                   int64_t num_buffers,
+                   int64_t staging_base,
+                   int64_t source_rank,
+                   int64_t destination_rank,
+                   int64_t shm_id)
+{
+    TORCH_CHECK(anchor.is_privateuseone(), "anchor must be an NPU tensor");
+    TORCH_CHECK(page_ids.is_privateuseone(), "page_ids must be an NPU tensor");
+    TORCH_CHECK(valid_mask.is_privateuseone(), "valid_mask must be an NPU tensor");
+    TORCH_CHECK(local_base_offsets.is_privateuseone(),
+                "local_base_offsets must be an NPU tensor");
+    TORCH_CHECK(block_strides.is_privateuseone(),
+                "block_strides must be an NPU tensor");
+    TORCH_CHECK(block_bytes.is_privateuseone(),
+                "block_bytes must be an NPU tensor");
+    TORCH_CHECK(staging_buffer_offsets.is_privateuseone(),
+                "staging_buffer_offsets must be an NPU tensor");
+    TORCH_CHECK(
+        page_ids.device() == anchor.device() &&
+            valid_mask.device() == anchor.device() &&
+            local_base_offsets.device() == anchor.device() &&
+            block_strides.device() == anchor.device() &&
+            block_bytes.device() == anchor.device() &&
+            staging_buffer_offsets.device() == anchor.device(),
+        "KVPP MTE tensors and anchor must share one NPU device");
+    TORCH_CHECK(page_ids.dtype() == torch::kInt64, "page_ids must be int64");
+    TORCH_CHECK(valid_mask.dtype() == torch::kInt8, "valid_mask must be int8");
+    TORCH_CHECK(local_base_offsets.dtype() == torch::kInt64,
+                "local_base_offsets must be int64");
+    TORCH_CHECK(block_strides.dtype() == torch::kInt64,
+                "block_strides must be int64");
+    TORCH_CHECK(block_bytes.dtype() == torch::kInt64,
+                "block_bytes must be int64");
+    TORCH_CHECK(staging_buffer_offsets.dtype() == torch::kInt64,
+                "staging_buffer_offsets must be int64");
+    TORCH_CHECK(page_ids.dim() == 1 && valid_mask.dim() == 1,
+                "page_ids and valid_mask must be one-dimensional");
+    TORCH_CHECK(page_ids.numel() == valid_mask.numel(),
+                "page_ids and valid_mask lengths must match");
+    TORCH_CHECK(page_ids.numel() == num_pages,
+                "page_ids length must match num_pages");
+    TORCH_CHECK(local_base_offsets.numel() == num_buffers &&
+                    block_strides.numel() == num_buffers &&
+                    block_bytes.numel() == num_buffers &&
+                    staging_buffer_offsets.numel() == num_buffers,
+                "layout tensors must have num_buffers elements");
+    TORCH_CHECK(page_ids.is_contiguous() && valid_mask.is_contiguous() &&
+                    local_base_offsets.is_contiguous() &&
+                    block_strides.is_contiguous() &&
+                    block_bytes.is_contiguous() &&
+                    staging_buffer_offsets.is_contiguous(),
+                "KVPP MTE tensors must be contiguous");
+    TORCH_CHECK(source_rank >= -1 && destination_rank >= -1,
+                "KVPP MTE ranks must be -1 or non-negative");
+    TORCH_CHECK((source_rank >= 0) != (destination_rank >= 0),
+                "exactly one KVPP MTE endpoint must be SHM staging");
+    TORCH_CHECK(staging_base > 0, "staging_base must be positive");
+    TORCH_CHECK(shm_id >= 0 && shm_id < 64,
+                "KVPP MTE shm_id must be in [0, 64)");
+
+    const c10_npu::OptionalNPUGuard npu_guard(anchor.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    if (num_pages != 0 && num_buffers != 0) {
+        vllm_ascend::kvpp_mte_copy_pages_impl(
+            stream, anchor.data_ptr(), page_ids.data_ptr(),
+            valid_mask.data_ptr(), local_base_offsets.data_ptr<int64_t>(),
+            block_strides.data_ptr<int64_t>(),
+            block_bytes.data_ptr<int64_t>(),
+            staging_buffer_offsets.data_ptr<int64_t>(),
+            static_cast<uint64_t>(num_pages),
+            static_cast<uint64_t>(num_buffers),
+            reinterpret_cast<void*>(staging_base),
+            static_cast<int32_t>(source_rank),
+            static_cast<int32_t>(destination_rank),
+            static_cast<uint32_t>(shm_id));
+    }
+}
+#endif
 void swap_blocks_impl(torch::Tensor& src, torch::Tensor& dst,
                  const torch::Tensor& block_mapping, aclrtStream stream)
 {
@@ -2163,6 +2259,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
+#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
+    ops.def(
+        "kvpp_mte_copy(Tensor anchor, Tensor page_ids, Tensor valid_mask, "
+        "Tensor local_base_offsets, Tensor block_strides, Tensor block_bytes, "
+        "Tensor staging_buffer_offsets, int num_pages, int num_buffers, "
+        "int staging_base, int source_rank, int destination_rank, "
+        "int shm_id) -> ()");
+    ops.impl("kvpp_mte_copy", torch::kPrivateUse1,
+             &vllm_ascend::kvpp_mte_copy);
+#endif
 #endif
 
     // swap_blocks_batch takes CPU tensors (int64 pointer/size arrays), not NPU

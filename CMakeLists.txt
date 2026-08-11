@@ -54,6 +54,13 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 file(GLOB KERNEL_FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
 
+# KVPP MTE kernel depends on MemFabric Hybrid headers; build it separately
+# below only when the headers are present, and keep it out of the default
+# kernel glob so community builds stay independent of MemFabric.
+set(KVPP_MTE_KERNEL
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/kvpp_mte_copy.cpp)
+list(REMOVE_ITEM KERNEL_FILES ${KVPP_MTE_KERNEL})
+
 set(VLLM_ASCEND_CUSTOM_OP
     ${KERNEL_FILES}
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
@@ -77,6 +84,28 @@ else()
     ascendc_library(vllm_ascend_kernels SHARED
         ${VLLM_ASCEND_CUSTOM_OP}
     )
+endif()
+
+# MemFabric Hybrid exposes the MTE data plane only as an AscendC device API.
+# Build the optional KVPP kernel when the serving image has its headers; normal
+# community builds remain independent of MemFabric.
+file(GLOB MEMFABRIC_HYBRID_INCLUDE_CANDIDATES
+    LIST_DIRECTORIES true
+    "/usr/local/memfabric_hybrid/*/include")
+find_path(MEMFABRIC_MTE_INCLUDE_DIR
+    NAMES smem/device/smem_shm_aicore_base_api.h
+    HINTS "$ENV{MEMFABRIC_HYBRID_HOME_PATH}/include"
+          ${MEMFABRIC_HYBRID_INCLUDE_CANDIDATES})
+if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950") AND
+   MEMFABRIC_MTE_INCLUDE_DIR)
+    message(STATUS "MemFabric Hybrid MTE: enabled from ${MEMFABRIC_MTE_INCLUDE_DIR}")
+    ascendc_library(vllm_ascend_kvpp_mte_kernels SHARED
+        ${KVPP_MTE_KERNEL})
+    ascendc_include_directories(vllm_ascend_kvpp_mte_kernels PRIVATE
+        "${MEMFABRIC_MTE_INCLUDE_DIR}")
+    set(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE ON)
+else()
+    message(STATUS "MemFabric Hybrid MTE: disabled (device header not found)")
 endif()
 
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
@@ -160,6 +189,11 @@ if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
 
+if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    target_compile_definitions(vllm_ascend_C PRIVATE
+        -DVLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+endif()
+
 target_link_directories(
   vllm_ascend_C
   PRIVATE
@@ -187,10 +221,15 @@ if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
     ${VLLM_ASCEND_C_COMMON_LIBS}
   )
 else()
+  set(VLLM_ASCEND_DIRECT_KERNEL_LIBS vllm_ascend_kernels)
+  if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    list(APPEND VLLM_ASCEND_DIRECT_KERNEL_LIBS
+      vllm_ascend_kvpp_mte_kernels)
+  endif()
   target_link_libraries(
     vllm_ascend_C
     PUBLIC
-    vllm_ascend_kernels
+    ${VLLM_ASCEND_DIRECT_KERNEL_LIBS}
     ${VLLM_ASCEND_C_COMMON_LIBS}
   )
 endif()
@@ -200,5 +239,11 @@ target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGI
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
-  install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  set(VLLM_ASCEND_INSTALL_TARGETS vllm_ascend_C vllm_ascend_kernels)
+  if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    list(APPEND VLLM_ASCEND_INSTALL_TARGETS
+      vllm_ascend_kvpp_mte_kernels)
+  endif()
+  install(TARGETS ${VLLM_ASCEND_INSTALL_TARGETS}
+    DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()

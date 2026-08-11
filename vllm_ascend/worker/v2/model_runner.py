@@ -18,6 +18,7 @@
 #
 
 from contextlib import contextmanager
+from typing import Any
 
 import numpy as np
 import torch
@@ -53,6 +54,7 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
+from vllm_ascend.worker.v2.kvpp import initialize_kvpp_for_runner
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -139,9 +141,69 @@ class NPUModelRunner(GPUModelRunner):
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
 
+        # KVPP runtime state. Populated in initialize_kv_cache when
+        # kvpp_size > 1; stays None otherwise so the hot path can skip
+        # KVPP entirely.
+        self.kvpp_size = vllm_config.parallel_config.kvpp_size
+        self.kvpp_context: Any = None
+        self._kvpp_kv_caches: dict[str, Any] | None = None
+
+    def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
+        # Retain the layer mapping only through transport registration.
+        # Keeping it longer would add tensor references that interfere with
+        # cache sleep.
+        if self.kvpp_size > 1:
+            self._kvpp_kv_caches = kv_caches_dict
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)
+
+        if self.kvpp_size > 1:
+            self.kvpp_context = initialize_kvpp_for_runner(
+                self, self._kvpp_kv_caches
+            )
+            self._kvpp_kv_caches = None
+
+    def prepare_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_attn(input_batch)
+        if self.kvpp_context is not None:
+            if len(block_tables) != 1:
+                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            # MemFabric consumes the same physical page IDs already gathered
+            # for attention. No KVPP-specific block table or slot mapping is
+            # constructed.
+            self.kvpp_context.prepare_batch(
+                block_tables[0],
+                input_batch.seq_lens_np[: input_batch.num_reqs],
+            )
+        return block_tables, slot_mappings
+
+    def prepare_dummy_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_dummy_attn(input_batch)
+        if self.kvpp_context is not None:
+            if len(block_tables) != 1:
+                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            self.kvpp_context.prepare_batch(
+                block_tables[0],
+                input_batch.seq_lens_np[: input_batch.num_reqs],
+            )
+        return block_tables, slot_mappings
+
+    def shutdown(self) -> None:
+        # Let the base runner synchronize the device and release model/KV
+        # tensors first. Once all device work is drained, the KVPP transport
+        # worker has no in-flight transfers, so joining its thread and
+        # releasing the MemFabric session is safe and cannot hang on an
+        # outstanding device dependency.
+        super().shutdown()
+        if self.kvpp_context is not None:
+            self.kvpp_context.close()
+            self.kvpp_context = None
 
     @torch.inference_mode()
     def profile_run(self) -> None:
