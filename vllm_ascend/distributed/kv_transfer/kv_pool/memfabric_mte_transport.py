@@ -100,6 +100,11 @@ class _MTELayerLayout:
 class MemFabricMTEKVPPTransport:
     """Move active physical pages through bounded symmetric MTE staging."""
 
+    # Owner pushes land in transport-owned staging rather than the attention
+    # scratch tensor. The runtime may therefore overlap that push with the
+    # previous reader and wait for scratch safety only before receive/unpack.
+    uses_staging_buffer = True
+
     def __init__(
         self,
         group: GroupCoordinator,
@@ -122,6 +127,8 @@ class MemFabricMTEKVPPTransport:
         self._layers: dict[str, tuple[KVPPBufferMetadata, ...]] = {}
         self._layouts: dict[str, _MTELayerLayout] = {}
         self._shm_id = _DEFAULT_SHM_ID
+        self._batch_pages: KVPPActivePages | None = None
+        self._batch_valid_mask_int8: torch.Tensor | None = None
 
     def initialize(self, kv_caches: dict[str, Any]) -> None:
         if not os.getenv("MEMFABRIC_HYBRID_HOME_PATH"):
@@ -302,15 +309,14 @@ class MemFabricMTEKVPPTransport:
         )
 
     def prepare_batch(self, pages: KVPPActivePages) -> None:
-        """No-op batch hook.
+        """Reset batch-scoped metadata reused by every layer and peer.
 
-        The descriptorless kernel reads ``valid_mask`` as int8 and casts it
-        inside ``_launch``. The cast is a cheap elementwise op on a compacted
-        tensor (``count_upper_bound`` bytes), so per-layer allocation is
-        preferable to maintaining a cached buffer that would need to track
-        the batch capacity and be synchronized with the compute stream.
+        The int8 view is created lazily by the first launch on the communication
+        stream. Keeping it for the batch avoids one cast/allocation per layer
+        and per destination without introducing a cross-stream dependency.
         """
-        return
+        self._batch_pages = pages
+        self._batch_valid_mask_int8 = None
 
     def _check_staging_capacity(
         self, layer_name: str, pages: KVPPActivePages
@@ -343,11 +349,15 @@ class MemFabricMTEKVPPTransport:
         assert self._copy_op is not None
         layout = self._layouts[layer_name]
         capacity = pages.page_ids.numel()
-        # bool -> int8 cast. The kernel reads int8 to avoid the AscendC
-        # GlobalTensor<bool> pitfall. This is a compacted tensor of at most
-        # count_upper_bound bytes, so the per-launch allocation is negligible
-        # compared to the cumsum chain it replaces.
-        valid_mask_int8 = pages.valid_mask.to(dtype=torch.int8)
+        if self._batch_pages is not pages:
+            raise RuntimeError(
+                "KVPP MTE received pages that were not prepared for this batch."
+            )
+        if self._batch_valid_mask_int8 is None:
+            # Created on the active communication stream and retained until
+            # prepare_batch() starts the next batch.
+            self._batch_valid_mask_int8 = pages.valid_mask.to(dtype=torch.int8)
+        valid_mask_int8 = self._batch_valid_mask_int8
         self._copy_op(
             layout.anchor,
             pages.page_ids,
@@ -423,3 +433,5 @@ class MemFabricMTEKVPPTransport:
         self._local_metadata = None
         self._layers.clear()
         self._layouts.clear()
+        self._batch_pages = None
+        self._batch_valid_mask_int8 = None

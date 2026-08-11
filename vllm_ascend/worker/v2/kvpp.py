@@ -348,9 +348,10 @@ class KVPPContext:
     def _start_overlap_transfer(self, layer_name: str) -> None:
         """Submit the transfer for ``layer_name`` off the compute thread.
 
-        Records a compute-stream event that the transport worker waits on
-        before writing into the scratch buffer (ensuring the previous
-        reader has finished). The actual owner/consumer protocol and
+        Records a compute-stream event that protects scratch reuse. Direct
+        transports wait before the owner writes; staged transports may fill
+        staging first and wait immediately before consumer-side unpack. The
+        actual owner/consumer protocol and
         ``transport.push/receive`` run inside ``_run_overlap_transfer``
         on the transport worker thread.
 
@@ -372,13 +373,15 @@ class KVPPContext:
         if self._executor is None or self._comm_stream is None:
             raise RuntimeError("KVPP overlap worker was not initialized.")
 
-        # All ranks publish a local safe point. Alternating layers use
-        # distinct scratch buffers. When a buffer cycles back after two
-        # layers, this event is ordered after all earlier attention work
-        # on the compute stream, so the owner cannot overwrite a buffer
-        # that is still being read.
-        scratch_ready = torch.npu.Event()
-        scratch_ready.record(torch.npu.current_stream())
+        # Only consumers need a local scratch safe point; the owner reads its
+        # persistent cache and never unpacks this layer into scratch. When a
+        # consumer buffer cycles back after two layers, this event is ordered
+        # after all earlier attention work on the compute stream. Staged
+        # transports consume it only immediately before local unpack.
+        scratch_ready = None
+        if self._execution_owners[layer_name] != self.group.rank_in_group:
+            scratch_ready = torch.npu.Event()
+            scratch_ready.record(torch.npu.current_stream())
         pages = self._selected_pages
         assert pages is not None
         self._transfer_future = self._executor.submit(
@@ -389,14 +392,15 @@ class KVPPContext:
         self,
         layer_name: str,
         pages: KVPPActivePages,
-        scratch_ready: Any,
+        scratch_ready: Any | None,
     ) -> None:
         """Run safe-point and completion notification off the compute thread.
 
-        Owner rank: wait for all consumers' scratch-ready, push active
-        pages to every peer, then notify done.
-        Consumer rank: notify owner scratch-ready, wait for owner done,
-        then receive active pages into local scratch.
+        Owner rank: wait for all consumers' destination-ready notification,
+        push active pages to every peer, then notify done.
+        Consumer rank: notify owner, wait for owner done, then receive active
+        pages into local scratch. For a staged backend, scratch readiness is
+        delayed until immediately before receive/unpack.
 
         The transport is ``NullTransport`` when ``kvpp_size <= 1`` or when no
         real backend was wired; in that case push/receive are no-ops and the
@@ -429,14 +433,25 @@ class KVPPContext:
         with torch.profiler.record_function(
             f"kvpp.comm_total.layer_{layer_index}"
         ):
-            with torch.profiler.record_function(
-                f"kvpp.scratch_ready.layer_{layer_index}"
-            ):
-                scratch_ready.synchronize()
-
             if local_rank != owner_rank:
-                # Consumer: tell owner our scratch is safe to write, wait for
-                # owner's push to finish, then unpack into local scratch.
+                if scratch_ready is None:
+                    raise RuntimeError(
+                        f"KVPP consumer {local_rank} has no scratch-safe event "
+                        f"for {layer_name}."
+                    )
+                # For staged transports, this notification means the staging
+                # segment is reusable: the single worker guarantees the prior
+                # receive/unpack has completed. The owner can fill staging
+                # while the current attention still reads the target scratch.
+                # Direct transports retain the original scratch-safe barrier.
+                uses_staging = bool(
+                    getattr(self.transport, "uses_staging_buffer", False)
+                )
+                if not uses_staging:
+                    with torch.profiler.record_function(
+                        f"kvpp.scratch_ready.layer_{layer_index}"
+                    ):
+                        scratch_ready.synchronize()
                 with torch.profiler.record_function(
                     f"kvpp.ready_send.layer_{layer_index}"
                 ):
@@ -455,6 +470,14 @@ class KVPPContext:
                         group=self.group.cpu_group,
                         tag=done_tag,
                     )
+                if uses_staging:
+                    # The remote copy only touched staging. Delay the scratch
+                    # dependency until immediately before local unpack so the
+                    # remote push overlaps the previous scratch reader.
+                    with torch.profiler.record_function(
+                        f"kvpp.scratch_ready.layer_{layer_index}"
+                    ):
+                        scratch_ready.synchronize()
                 with torch.profiler.record_function(
                     f"kvpp.transport_receive.layer_{layer_index}"
                 ):

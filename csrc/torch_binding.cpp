@@ -247,14 +247,14 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
 // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
 // 310P and A5 builds.
 #ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
-namespace vllm_ascend {
+// Already inside namespace vllm_ascend (opened at top of file); declaring the
+// prototype directly here must match the definition in kvpp_mte_copy.cpp.
 void kvpp_mte_copy_pages_impl(
     void* stream, void* local_base, void* page_ids, void* valid_mask,
     void* local_base_offsets, void* block_strides, void* block_bytes,
     void* staging_buffer_offsets, uint64_t num_pages, uint64_t num_buffers,
     void* staging_base, int32_t source_rank, int32_t destination_rank,
     uint32_t shm_id);
-} // namespace vllm_ascend
 
 void kvpp_mte_copy(const torch::Tensor& anchor,
                    const torch::Tensor& page_ids,
@@ -327,7 +327,7 @@ void kvpp_mte_copy(const torch::Tensor& anchor,
     const c10_npu::OptionalNPUGuard npu_guard(anchor.device());
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     if (num_pages != 0 && num_buffers != 0) {
-        vllm_ascend::kvpp_mte_copy_pages_impl(
+        kvpp_mte_copy_pages_impl(
             stream, anchor.data_ptr(), page_ids.data_ptr(),
             valid_mask.data_ptr(), local_base_offsets.data_ptr<int64_t>(),
             block_strides.data_ptr<int64_t>(),
