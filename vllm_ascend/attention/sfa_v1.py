@@ -1599,6 +1599,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
+            # Wait for prompt KV blocks before reading kv_cache in mlapo.
+            # Mirrors the prolog_v3 / native branches, which place this wait
+            # before the first kv_cache use.
+            wait_for_kv_layer_from_connector(layer_name)
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -1615,7 +1619,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             else:
                 k_li, k_li_scale = None, None
-            wait_for_kv_layer_from_connector(layer_name)
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
