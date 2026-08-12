@@ -1377,6 +1377,27 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
             f"Got prefill_context_parallel_size={parallel_config.prefill_context_parallel_size}."
         )
 
+    kvpp_size = parallel_config.kvpp_size
+    if kvpp_size > 1:
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError("KVPP is only supported by Ascend Model Runner V2.")
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("KVPP does not support pipeline parallelism yet.")
+        if parallel_config.prefill_context_parallel_size != 1:
+            raise ValueError("KVPP does not support PCP yet.")
+        if parallel_config.decode_context_parallel_size != 1:
+            raise ValueError("KVPP and DCP cannot be enabled at the same time.")
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError("KVPP does not support KV connectors or offload yet.")
+
+        model_config = vllm_config.model_config
+        if not model_config.use_mla or model_config.is_hybrid:
+            raise ValueError("KVPP currently supports only non-hybrid MLA models.")
+        if not model_config.enforce_eager:
+            raise ValueError("KVPP currently requires eager execution.")
+        if vllm_config.speculative_config is not None:
+            raise ValueError("KVPP does not support speculative decoding yet.")
+
     sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
     if sfa_dcp_replicated_indexer:
         if parallel_config.decode_context_parallel_size != parallel_config.tensor_parallel_size:

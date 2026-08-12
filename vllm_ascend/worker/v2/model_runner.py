@@ -18,11 +18,13 @@
 #
 
 from contextlib import contextmanager
+from typing import Any
 
 import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.distributed import get_kvpp_group
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -50,12 +52,16 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_mask,
     set_mc2_tokens_capacity,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
+    MemFabricMTEKVPPTransport,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import enable_sp, set_potential_max_tokens
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.kvpp import KVPPScheduler
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 from vllm_ascend.worker.v2.sp_utils import (
     _all_gather_hidden_states_and_aux,
@@ -120,6 +126,9 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.kvpp_size = vllm_config.parallel_config.kvpp_size
+        self.kvpp_scheduler: KVPPScheduler | None = None
+        self._kvpp_kv_caches: dict[str, Any] | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -219,6 +228,90 @@ class NPUModelRunner(GPUModelRunner):
                 self.block_tables,
             )
 
+        if self.kvpp_size <= 1:
+            return
+
+        layer_owners = self.kv_cache_config.kvpp_layer_owners
+        if layer_owners is None:
+            raise RuntimeError("KVPP cache placement is missing from KVCacheConfig.")
+
+        kvpp_group = get_kvpp_group()
+        if self.kv_cache_config.kvpp_rank != kvpp_group.rank_in_group:
+            raise RuntimeError(
+                "KVPP physical cache placement does not match the runtime "
+                f"communication rank: planned={self.kv_cache_config.kvpp_rank}, "
+                f"runtime={kvpp_group.rank_in_group}."
+            )
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            raise RuntimeError("KVPP currently requires exactly one KV cache group.")
+
+        blocks_per_kv_block = self.block_tables.blocks_per_kv_block[0]
+        num_kernel_blocks = self.kv_cache_config.num_blocks * blocks_per_kv_block
+        block_size = self.block_tables.kernel_block_sizes[0]
+        kvpp_impls: dict[str, Any] = {}
+        for layer_name, module in self.compilation_config.static_forward_context.items():
+            if layer_name not in layer_owners:
+                continue
+            impl = getattr(module, "impl", None)
+            if impl is not None and hasattr(impl, "layerwise_kv_cache_hook"):
+                kvpp_impls[layer_name] = impl
+        if not kvpp_impls:
+            raise RuntimeError(
+                "KVPP did not find an MLA or SFA attention implementation to "
+                "drive layer transfers."
+            )
+
+        transport = MemFabricMTEKVPPTransport(
+            kvpp_group, layer_owners, num_kernel_blocks
+        )
+        kvpp_scheduler = KVPPScheduler(
+            group=kvpp_group,
+            layer_owners=layer_owners,
+            num_blocks=num_kernel_blocks,
+            block_size=block_size,
+            transport=transport,
+            execution_layers=tuple(kvpp_impls),
+        )
+        if self._kvpp_kv_caches is None:
+            raise RuntimeError("KVPP cache tensors were not retained during allocation.")
+        kvpp_scheduler.initialize_transport(self._kvpp_kv_caches)
+        self._kvpp_kv_caches = None
+        self.kvpp_scheduler = kvpp_scheduler
+        for impl in kvpp_impls.values():
+            impl.layerwise_kv_cache_hook = kvpp_scheduler
+
+    def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
+        if self.kvpp_size > 1:
+            self._kvpp_kv_caches = kv_caches_dict
+
+    def prepare_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_attn(input_batch)
+        if self.kvpp_scheduler is not None:
+            if len(block_tables) != 1:
+                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            self.kvpp_scheduler.begin_batch(
+                block_tables[0],
+                input_batch.seq_lens_np[: input_batch.num_reqs],
+            )
+            self.kvpp_scheduler.begin_forward()
+        return block_tables, slot_mappings
+
+    def prepare_dummy_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_dummy_attn(input_batch)
+        if self.kvpp_scheduler is not None:
+            if len(block_tables) != 1:
+                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            self.kvpp_scheduler.begin_batch(
+                block_tables[0],
+                input_batch.seq_lens_np[: input_batch.num_reqs],
+            )
+            self.kvpp_scheduler.begin_forward()
+        return block_tables, slot_mappings
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -228,40 +321,55 @@ class NPUModelRunner(GPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ):
-        with flashcomm_dispatch_wrapper(self.vllm_config):
-            output = super().execute_model(
-                scheduler_output,
-                intermediate_tensors=intermediate_tensors,
-                dummy_run=dummy_run,
-                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                is_profile=is_profile,
-            )
+        try:
+            with flashcomm_dispatch_wrapper(self.vllm_config):
+                output = super().execute_model(
+                    scheduler_output,
+                    intermediate_tensors=intermediate_tensors,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    is_profile=is_profile,
+                )
 
-        state = self.execute_model_state
-        if (
-            self.is_last_pp_rank
-            and state is not None
-            and _flashcomm_enabled(self.vllm_config, state.input_batch.num_tokens_after_padding)
-        ):
-            num_tokens = state.input_batch.num_tokens
-            assert state.hidden_states is not None
-            gathered_output = _all_gather_hidden_states_and_aux(
-                (state.hidden_states, state.aux_hidden_states)
-                if state.aux_hidden_states is not None
-                else state.hidden_states,
-                num_tokens,
-            )
-            if isinstance(gathered_output, tuple):
-                hidden_states, aux_hidden_states = gathered_output
-            else:
-                hidden_states = gathered_output
-                aux_hidden_states = state.aux_hidden_states
-            self.execute_model_state = state._replace(
-                hidden_states=hidden_states,
-                aux_hidden_states=aux_hidden_states,
-            )
+            if self.kvpp_scheduler is not None:
+                if dummy_run and skip_attn_for_dummy_run:
+                    self.kvpp_scheduler.abort_batch()
+                else:
+                    self.kvpp_scheduler.finish_forward()
+                    self.kvpp_scheduler.finish_batch()
 
-        return output
+            state = self.execute_model_state
+            if (
+                self.is_last_pp_rank
+                and state is not None
+                and _flashcomm_enabled(
+                    self.vllm_config,
+                    state.input_batch.num_tokens_after_padding,
+                )
+            ):
+                num_tokens = state.input_batch.num_tokens
+                assert state.hidden_states is not None
+                gathered_output = _all_gather_hidden_states_and_aux(
+                    (state.hidden_states, state.aux_hidden_states)
+                    if state.aux_hidden_states is not None
+                    else state.hidden_states,
+                    num_tokens,
+                )
+                if isinstance(gathered_output, tuple):
+                    hidden_states, aux_hidden_states = gathered_output
+                else:
+                    hidden_states = gathered_output
+                    aux_hidden_states = state.aux_hidden_states
+                self.execute_model_state = state._replace(
+                    hidden_states=hidden_states,
+                    aux_hidden_states=aux_hidden_states,
+                )
+
+            return output
+        except BaseException:
+            if self.kvpp_scheduler is not None:
+                self.kvpp_scheduler.abort_batch()
+            raise
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -554,6 +662,12 @@ class NPUModelRunner(GPUModelRunner):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
             self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+
+    def shutdown(self) -> None:
+        if self.kvpp_scheduler is not None:
+            self.kvpp_scheduler.close()
+            self.kvpp_scheduler = None
+        super().shutdown()
 
     def _pad_query_start_loc_for_fia(
         self,
