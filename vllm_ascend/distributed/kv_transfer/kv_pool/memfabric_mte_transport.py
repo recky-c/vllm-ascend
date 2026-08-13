@@ -315,6 +315,65 @@ class MemFabricMTEKVPPTransport:
         )
         return offsets.flatten()
 
+    def _bundle_staging_offsets(
+        self,
+        layer_names: tuple[str, ...],
+        pages: KVPPActivePages,
+        staging_bytes: int,
+    ) -> dict[str, torch.Tensor]:
+        """Lay out all caches used by one transformer layer in one segment.
+
+        Main SFA and Lightning Indexer caches are pushed before the owner
+        publishes the completion token.  Giving each cache an independent
+        zero-based layout would let a later push overwrite an earlier one.
+        Reserve capacity for every buffer in bundle order instead.
+        """
+        if not layer_names:
+            raise ValueError("KVPP MTE cache bundle cannot be empty.")
+
+        bytes_per_slot = sum(
+            self._device_layers[layer_name].staging_bytes_per_slot
+            for layer_name in layer_names
+        )
+        max_active_pages = staging_bytes // bytes_per_slot
+        if max_active_pages == 0:
+            raise RuntimeError(
+                "KVPP MTE staging segment cannot hold one page for the full "
+                f"cache bundle: page_bytes={bytes_per_slot}, "
+                f"capacity={staging_bytes}."
+            )
+        if pages.count_upper_bound > max_active_pages:
+            raise RuntimeError(
+                "KVPP MTE active-page upper bound exceeds bundle staging "
+                f"capacity: upper_bound={pages.count_upper_bound}, "
+                f"capacity={max_active_pages}, staging_bytes={staging_bytes}. "
+                "Increase ASCEND_KVPP_MTE_STAGING_BYTES."
+            )
+
+        active_ordinals = torch.cumsum(
+            pages.valid_mask.to(dtype=torch.int64), dim=0
+        ) - 1
+        result: dict[str, torch.Tensor] = {}
+        bundle_base: torch.Tensor | None = None
+        for layer_name in layer_names:
+            metadata = self._device_layers[layer_name]
+            per_buffer_capacity = metadata.block_bytes * max_active_pages
+            buffer_offsets = torch.cumsum(per_buffer_capacity, dim=0)
+            buffer_offsets = buffer_offsets - per_buffer_capacity
+            if bundle_base is not None:
+                buffer_offsets = buffer_offsets + bundle_base
+            result[layer_name] = (
+                buffer_offsets[:, None]
+                + active_ordinals[None, :] * metadata.block_bytes[:, None]
+            ).flatten()
+            layer_capacity = per_buffer_capacity.sum()
+            bundle_base = (
+                layer_capacity
+                if bundle_base is None
+                else bundle_base + layer_capacity
+            )
+        return result
+
     def _launch(
         self,
         layer_name: str,
@@ -338,58 +397,98 @@ class MemFabricMTEKVPPTransport:
     def push_active_pages(
         self, layer_name: str, pages: KVPPActivePages, stream: Any
     ) -> KVPPCompletion:
-        owner_rank = self.layer_owners[layer_name]
+        return self.push_active_bundle((layer_name,), pages, stream)
+
+    def push_active_bundle(
+        self,
+        layer_names: tuple[str, ...],
+        pages: KVPPActivePages,
+        stream: Any,
+    ) -> KVPPCompletion:
+        if not layer_names:
+            raise ValueError("KVPP MTE cache bundle cannot be empty.")
+        owners = {self.layer_owners[layer_name] for layer_name in layer_names}
+        if len(owners) != 1:
+            raise RuntimeError(
+                f"KVPP MTE cache bundle spans owners {sorted(owners)}."
+            )
+        owner_rank = owners.pop()
         if owner_rank != self.group.rank_in_group:
             return MemFabricMTECompletion.record(stream)
         if self._local_metadata is None or not self._peer_metadata:
             raise RuntimeError("KVPP MTE transport was not initialized.")
 
-        local_offsets, lengths = self._local_descriptors(layer_name, pages)
-        retained: list[torch.Tensor] = [local_offsets, lengths]
+        retained: list[torch.Tensor] = []
         for peer_rank, peer in enumerate(self._peer_metadata):
             if peer_rank == owner_rank:
                 continue
-            staging_offsets = self._staging_offsets(
-                layer_name,
+            bundle_offsets = self._bundle_staging_offsets(
+                layer_names,
                 pages,
                 peer.staging_bytes,
             )
-            descriptors = _MTEDeviceDescriptors(
-                local_offsets, staging_offsets, lengths, peer.staging_addr
-            )
-            self._launch(
-                layer_name, descriptors, destination_rank=peer.rank
-            )
-            retained.append(staging_offsets)
+            for layer_name in layer_names:
+                local_offsets, lengths = self._local_descriptors(
+                    layer_name, pages
+                )
+                staging_offsets = bundle_offsets[layer_name]
+                descriptors = _MTEDeviceDescriptors(
+                    local_offsets,
+                    staging_offsets,
+                    lengths,
+                    peer.staging_addr,
+                )
+                self._launch(
+                    layer_name, descriptors, destination_rank=peer.rank
+                )
+                retained.extend(descriptors.tensors())
         return MemFabricMTECompletion.record(stream, tuple(retained))
 
     def receive_active_pages(
         self, layer_name: str, pages: KVPPActivePages, stream: Any
     ) -> KVPPCompletion:
-        owner_rank = self.layer_owners[layer_name]
+        return self.receive_active_bundle((layer_name,), pages, stream)
+
+    def receive_active_bundle(
+        self,
+        layer_names: tuple[str, ...],
+        pages: KVPPActivePages,
+        stream: Any,
+    ) -> KVPPCompletion:
+        if not layer_names:
+            raise ValueError("KVPP MTE cache bundle cannot be empty.")
+        owners = {self.layer_owners[layer_name] for layer_name in layer_names}
+        if len(owners) != 1:
+            raise RuntimeError(
+                f"KVPP MTE cache bundle spans owners {sorted(owners)}."
+            )
+        owner_rank = owners.pop()
         if owner_rank == self.group.rank_in_group:
             return MemFabricMTECompletion.record(stream)
         if self._local_metadata is None:
             raise RuntimeError("KVPP MTE transport was not initialized.")
 
-        local_offsets, lengths = self._local_descriptors(layer_name, pages)
-        staging_offsets = self._staging_offsets(
-            layer_name,
+        bundle_offsets = self._bundle_staging_offsets(
+            layer_names,
             pages,
             self._local_metadata.staging_bytes,
         )
-        descriptors = _MTEDeviceDescriptors(
-            local_offsets=local_offsets,
-            staging_offsets=staging_offsets,
-            lengths=lengths,
-            staging_base=self._local_metadata.staging_addr,
-        )
-        self._launch(
-            layer_name,
-            descriptors,
-            source_rank=self._local_metadata.rank,
-        )
-        return MemFabricMTECompletion.record(stream, descriptors.tensors())
+        retained: list[torch.Tensor] = []
+        for layer_name in layer_names:
+            local_offsets, lengths = self._local_descriptors(layer_name, pages)
+            descriptors = _MTEDeviceDescriptors(
+                local_offsets=local_offsets,
+                staging_offsets=bundle_offsets[layer_name],
+                lengths=lengths,
+                staging_base=self._local_metadata.staging_addr,
+            )
+            self._launch(
+                layer_name,
+                descriptors,
+                source_rank=self._local_metadata.rank,
+            )
+            retained.extend(descriptors.tensors())
+        return MemFabricMTECompletion.record(stream, tuple(retained))
 
     def close(self) -> None:
         if self._memory is not None:

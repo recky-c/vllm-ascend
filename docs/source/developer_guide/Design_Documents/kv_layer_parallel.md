@@ -248,6 +248,17 @@ land in the layer's persistent cache. On non-owners, they land in the shared
 scratch cache and may be overwritten after the layer completes. Thus only the
 owner retains the layer's long-term KV state.
 
+### SFA cache bundles
+
+Main SFA and Lightning Indexer caches form one transport bundle. MTE assigns
+non-overlapping staging ranges to every tensor in that bundle and uses the
+same layout for owner push and consumer unpack. This prevents the indexer push
+from overwriting Main KV before the consumer receives it.
+
+DSA-CP compatibility is intentionally deferred. Its KVPP lifecycle integration
+cannot be accepted until the prerequisite GLM sequence-parallel path is
+functionally validated. DCP remains unsupported with KVPP.
+
 ## Correctness invariants
 
 The implementation maintains the following invariants:
@@ -261,6 +272,7 @@ The implementation maintains the following invariants:
 6. Owner and destination use the same physical page ID.
 7. Only pages referenced by the current batch are transferred.
 8. KVPP does not change scheduler block allocation or slot-mapping semantics.
+9. Main and Indexer cache tensors use disjoint ranges in bundle staging.
 
 ## Supported configuration
 
@@ -275,6 +287,7 @@ The initial vLLM Ascend implementation requires:
 | Pipeline parallelism | Disabled |
 | PCP | Disabled |
 | DCP | Disabled when KVPP is enabled |
+| DSA-CP | Deferred pending SP validation |
 | Speculative decoding | Disabled |
 | KV connectors and offload | Disabled |
 | MemFabric protocol | MTE |
@@ -302,6 +315,7 @@ The commits add tests for:
 - CPU block-table access.
 - Active-page filtering, deduplication, and ordering.
 - MTE device descriptors for masked pages and multiple cache tensors.
+- Non-overlapping Main/Indexer bundle staging for SFA models.
 - Owner staging and consumer unpack into original physical page IDs.
 - Identity block-table and slot-mapping views.
 

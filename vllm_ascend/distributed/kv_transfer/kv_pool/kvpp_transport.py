@@ -149,5 +149,26 @@ class KVPPTransport(Protocol):
     ) -> KVPPCompletion:
         """Unpack MTE staging into the original physical page IDs."""
 
+    def push_active_bundle(
+        self,
+        layer_names: tuple[str, ...],
+        pages: KVPPActivePages,
+        stream: Any,
+    ) -> KVPPCompletion:
+        """Enqueue one execution layer's complete cache bundle.
+
+        A bundle may contain both the main MLA/SFA cache and a separate
+        Lightning Indexer cache.  The transport must assign non-overlapping
+        staging ranges to every cache in the bundle.
+        """
+
+    def receive_active_bundle(
+        self,
+        layer_names: tuple[str, ...],
+        pages: KVPPActivePages,
+        stream: Any,
+    ) -> KVPPCompletion:
+        """Unpack one complete cache bundle from transport staging."""
+
     def close(self) -> None:
         """Release backend-owned sessions and memory metadata."""

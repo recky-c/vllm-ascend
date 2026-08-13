@@ -222,6 +222,152 @@ def test_mte_builds_one_device_batch_for_masked_pages_and_multiple_buffers(
     ]
 
 
+def test_mte_bundle_assigns_disjoint_main_and_indexer_staging(monkeypatch):
+    class FakeEvent:
+        def record(self, stream):
+            self.stream = stream
+
+        def synchronize(self):
+            pass
+
+    monkeypatch.setattr(torch.npu, "Event", FakeEvent)
+    calls = []
+
+    def copy_op(
+        anchor,
+        local_offsets,
+        staging_offsets,
+        lengths,
+        staging_base,
+        source_rank,
+        destination_rank,
+        shm_id,
+    ):
+        calls.append(
+            (
+                "main" if anchor is main_anchor else "indexer",
+                tuple(staging_offsets.tolist()),
+                source_rank,
+                destination_rank,
+            )
+        )
+
+    main_anchor = torch.empty(1)
+    indexer_anchor = torch.empty(1)
+    transport = MemFabricMTEKVPPTransport(
+        SimpleNamespace(rank_in_group=0, world_size=2),
+        {"main": 0, "indexer": 0},
+        10,
+        copy_op=copy_op,
+    )
+    transport._anchors = {
+        "main": main_anchor,
+        "indexer": indexer_anchor,
+    }
+    transport._device_layers = {
+        "main": _MTEDeviceBufferMetadata(
+            torch.tensor([0]),
+            torch.tensor([16]),
+            torch.tensor([16]),
+            16,
+        ),
+        "indexer": _MTEDeviceBufferMetadata(
+            torch.tensor([0]),
+            torch.tensor([8]),
+            torch.tensor([8]),
+            8,
+        ),
+    }
+    transport._local_metadata = KVPPMTEPeerMetadata(8000, 240, 0)
+    transport._peer_metadata = [
+        transport._local_metadata,
+        KVPPMTEPeerMetadata(8000, 240, 1),
+    ]
+
+    transport.push_active_bundle(
+        ("main", "indexer"),
+        _active_page_tensor(2, 7),
+        SimpleNamespace(),
+    )
+
+    # 240 / (16 + 8) reserves ten active pages. Main owns [0, 160),
+    # and the indexer starts at 160 instead of overwriting main at zero.
+    assert calls == [
+        ("main", (0, 16), -1, 1),
+        ("indexer", (160, 168), -1, 1),
+    ]
+
+
+def test_mte_bundle_uses_identical_layout_when_consumer_unpacks(monkeypatch):
+    class FakeEvent:
+        def record(self, stream):
+            self.stream = stream
+
+        def synchronize(self):
+            pass
+
+    monkeypatch.setattr(torch.npu, "Event", FakeEvent)
+    calls = []
+
+    def copy_op(
+        anchor,
+        local_offsets,
+        staging_offsets,
+        lengths,
+        staging_base,
+        source_rank,
+        destination_rank,
+        shm_id,
+    ):
+        calls.append(
+            (
+                "main" if anchor is main_anchor else "indexer",
+                tuple(staging_offsets.tolist()),
+                source_rank,
+                destination_rank,
+            )
+        )
+
+    main_anchor = torch.empty(1)
+    indexer_anchor = torch.empty(1)
+    transport = MemFabricMTEKVPPTransport(
+        SimpleNamespace(rank_in_group=1, world_size=2),
+        {"main": 0, "indexer": 0},
+        10,
+        copy_op=copy_op,
+    )
+    transport._anchors = {
+        "main": main_anchor,
+        "indexer": indexer_anchor,
+    }
+    transport._device_layers = {
+        "main": _MTEDeviceBufferMetadata(
+            torch.tensor([0]),
+            torch.tensor([16]),
+            torch.tensor([16]),
+            16,
+        ),
+        "indexer": _MTEDeviceBufferMetadata(
+            torch.tensor([0]),
+            torch.tensor([8]),
+            torch.tensor([8]),
+            8,
+        ),
+    }
+    transport._local_metadata = KVPPMTEPeerMetadata(8000, 240, 1)
+
+    transport.receive_active_bundle(
+        ("main", "indexer"),
+        _active_page_tensor(2, 7),
+        SimpleNamespace(),
+    )
+
+    assert calls == [
+        ("main", (0, 16), 1, -1),
+        ("indexer", (160, 168), 1, -1),
+    ]
+
+
 def test_mte_rejects_host_upper_bound_larger_than_staging_capacity():
     transport = MemFabricMTEKVPPTransport(
         SimpleNamespace(rank_in_group=0, world_size=2),

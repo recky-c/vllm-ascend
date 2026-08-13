@@ -440,14 +440,14 @@ class KVPPScheduler:
                     f"kvpp.transport_receive.layer_{layer_index}"
                 ):
                     with torch.npu.stream(self._comm_stream):
-                        receive_completions = [
-                            self.transport.receive_active_pages(
-                                cache_layer_name, pages, self._comm_stream
+                        receive_completion = (
+                            self.transport.receive_active_bundle(
+                                self.plan.cache_bundles[layer_name],
+                                pages,
+                                self._comm_stream,
                             )
-                            for cache_layer_name in self.plan.cache_bundles[layer_name]
-                        ]
-                    for completion in receive_completions:
-                        completion.wait()
+                        )
+                    receive_completion.wait()
                 return
 
             with torch.profiler.record_function(
@@ -467,17 +467,15 @@ class KVPPScheduler:
                 f"kvpp.transport_push.layer_{layer_index}"
             ):
                 with torch.npu.stream(self._comm_stream):
-                    completions = [
-                        self.transport.push_active_pages(
-                            cache_layer_name, pages, self._comm_stream
-                        )
-                        for cache_layer_name in self.plan.cache_bundles[layer_name]
-                    ]
+                    completion = self.transport.push_active_bundle(
+                        self.plan.cache_bundles[layer_name],
+                        pages,
+                        self._comm_stream,
+                    )
                 # Only the communication worker waits on the host. The compute
                 # thread continues until this layer first writes/reads its
                 # paged KV cache.
-                for completion in completions:
-                    completion.wait()
+                completion.wait()
 
             with torch.profiler.record_function(
                 f"kvpp.done_send.layer_{layer_index}"
