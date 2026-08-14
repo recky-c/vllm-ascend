@@ -61,7 +61,11 @@ from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
-from vllm_ascend.worker.v2.kvpp import KVPPScheduler
+from vllm_ascend.worker.v2.kvpp import (
+    KVPPScheduler,
+    get_kvpp_managed_group_index,
+    select_kvpp_managed_caches,
+)
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 from vllm_ascend.worker.v2.sp_utils import (
     _all_gather_hidden_states_and_aux,
@@ -128,6 +132,7 @@ class NPUModelRunner(GPUModelRunner):
         self.ascend_config = get_ascend_config()
         self.kvpp_size = vllm_config.parallel_config.kvpp_size
         self.kvpp_scheduler: KVPPScheduler | None = None
+        self.kvpp_cache_group_index: int | None = None
         self._kvpp_kv_caches: dict[str, Any] | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
@@ -242,12 +247,30 @@ class NPUModelRunner(GPUModelRunner):
                 f"communication rank: planned={self.kv_cache_config.kvpp_rank}, "
                 f"runtime={kvpp_group.rank_in_group}."
             )
-        if len(self.kv_cache_config.kv_cache_groups) != 1:
-            raise RuntimeError("KVPP currently requires exactly one KV cache group.")
+        kvpp_cache_group_index = get_kvpp_managed_group_index(
+            self.kv_cache_config.kv_cache_groups, layer_owners
+        )
+        self.kvpp_cache_group_index = kvpp_cache_group_index
 
-        blocks_per_kv_block = self.block_tables.blocks_per_kv_block[0]
+        if self.speculator is not None:
+            draft_layer_names = self.speculator.draft_attn_layer_names or set()
+            managed_draft_layers = set(layer_owners).intersection(
+                draft_layer_names
+            )
+            if managed_draft_layers:
+                raise RuntimeError(
+                    "MTP attention layers must be replicated outside KVPP, "
+                    "but these layers have KVPP owners: "
+                    f"{sorted(managed_draft_layers)}."
+                )
+
+        blocks_per_kv_block = self.block_tables.blocks_per_kv_block[
+            kvpp_cache_group_index
+        ]
         num_kernel_blocks = self.kv_cache_config.num_blocks * blocks_per_kv_block
-        block_size = self.block_tables.kernel_block_sizes[0]
+        block_size = self.block_tables.kernel_block_sizes[
+            kvpp_cache_group_index
+        ]
         kvpp_impls: dict[str, Any] = {}
         for layer_name, module in self.compilation_config.static_forward_context.items():
             if layer_name not in layer_owners:
@@ -274,7 +297,10 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self._kvpp_kv_caches is None:
             raise RuntimeError("KVPP cache tensors were not retained during allocation.")
-        kvpp_scheduler.initialize_transport(self._kvpp_kv_caches)
+        managed_kv_caches = select_kvpp_managed_caches(
+            self._kvpp_kv_caches, layer_owners
+        )
+        kvpp_scheduler.initialize_transport(managed_kv_caches)
         self._kvpp_kv_caches = None
         self.kvpp_scheduler = kvpp_scheduler
         for impl in kvpp_impls.values():
@@ -289,10 +315,10 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         block_tables, slot_mappings = super().prepare_attn(input_batch)
         if self.kvpp_scheduler is not None:
-            if len(block_tables) != 1:
-                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            if self.kvpp_cache_group_index is None:
+                raise RuntimeError("KVPP cache group was not initialized.")
             self.kvpp_scheduler.begin_batch(
-                block_tables[0],
+                block_tables[self.kvpp_cache_group_index],
                 input_batch.seq_lens_np[: input_batch.num_reqs],
             )
             self.kvpp_scheduler.begin_forward()
@@ -303,10 +329,10 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         block_tables, slot_mappings = super().prepare_dummy_attn(input_batch)
         if self.kvpp_scheduler is not None:
-            if len(block_tables) != 1:
-                raise RuntimeError("KVPP received an unexpected KV cache group.")
+            if self.kvpp_cache_group_index is None:
+                raise RuntimeError("KVPP cache group was not initialized.")
             self.kvpp_scheduler.begin_batch(
-                block_tables[0],
+                block_tables[self.kvpp_cache_group_index],
                 input_batch.seq_lens_np[: input_batch.num_reqs],
             )
             self.kvpp_scheduler.begin_forward()

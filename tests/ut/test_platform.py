@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1276,6 +1277,47 @@ class TestNPUPlatform(TestBase):
         vllm_config.kv_transfer_config = None
 
         self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_accepts_kvpp_with_fixed_mtp(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.kvpp_size = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens_per_batch_size=None,
+        )
+
+        self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_rejects_kvpp_with_non_mtp_spec(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.kvpp_size = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.speculative_config = SimpleNamespace(
+            method="eagle",
+            num_speculative_tokens_per_batch_size=None,
+        )
+
+        with pytest.raises(ValueError, match="only with method='mtp'"):
+            self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_rejects_kvpp_with_dynamic_mtp(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.kvpp_size = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens_per_batch_size={1: 1, 8: 3},
+        )
+
+        with pytest.raises(ValueError, match="fixed number"):
+            self.platform._validate_parallel_config(vllm_config)
 
     def test_validate_parallel_config_rejects_kvpp_with_dcp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()

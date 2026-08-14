@@ -1395,8 +1395,22 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
             raise ValueError("KVPP currently supports only non-hybrid MLA models.")
         if not model_config.enforce_eager:
             raise ValueError("KVPP currently requires eager execution.")
-        if vllm_config.speculative_config is not None:
-            raise ValueError("KVPP does not support speculative decoding yet.")
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None:
+            if speculative_config.method != "mtp":
+                raise ValueError(
+                    "KVPP currently supports speculative decoding only with "
+                    "method='mtp'."
+                )
+            if getattr(
+                speculative_config,
+                "num_speculative_tokens_per_batch_size",
+                None,
+            ):
+                raise ValueError(
+                    "KVPP currently supports only a fixed number of MTP "
+                    "speculative tokens."
+                )
 
     sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
     if sfa_dcp_replicated_indexer:

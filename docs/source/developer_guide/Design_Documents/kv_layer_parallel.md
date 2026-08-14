@@ -282,13 +282,13 @@ The initial vLLM Ascend implementation requires:
 | --- | --- |
 | Model runner | Ascend Model Runner V2 |
 | Attention | Non-hybrid MLA |
-| KV-cache groups | Exactly one |
+| KV-cache groups | One KVPP-managed Target group; replicated MTP groups allowed |
 | Execution mode | Eager |
 | Pipeline parallelism | Disabled |
 | PCP | Disabled |
 | DCP | Disabled when KVPP is enabled |
 | DSA-CP | Deferred pending SP validation |
-| Speculative decoding | Disabled |
+| Speculative decoding | Fixed-step MTP in eager mode |
 | KV connectors and offload | Disabled |
 | MemFabric protocol | MTE |
 

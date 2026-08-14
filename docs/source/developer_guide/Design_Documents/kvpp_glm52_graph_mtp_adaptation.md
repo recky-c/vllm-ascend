@@ -21,9 +21,8 @@ using overlapping MemFabric staging addresses and is required independently
 of DSA-CP.
 
 Upstream graph and MTP support means that GLM-5.2 can use each feature without
-KVPP. It does not make either feature automatically compatible with KVPP. The
-KVPP configuration checks deliberately continue to require eager execution
-and reject speculative decoding until the work below is complete.
+KVPP. The KVPP integration supports fixed-step MTP in eager mode. Graph mode
+remains outside the KVPP support boundary.
 
 ## Current KVPP boundary
 
@@ -36,9 +35,10 @@ KVPP has three responsibilities:
    so a host-side scheduler can overlap MemFabric MTE transfer with projection
    and layer compute.
 
-This boundary works for one eager target-model traversal. Graph replay removes
-the Python layer callbacks, while MTP introduces draft-model cache groups and
-additional forward traversals. These are the two integration gaps.
+This boundary works for one eager target-model traversal. MTP draft forwards
+remain outside the KVPP lifecycle by keeping their caches replicated locally.
+Graph replay still removes the Python layer callbacks and remains a separate
+integration gap.
 
 ## MTP adaptation
 
@@ -48,12 +48,13 @@ PR #14105 teaches the Ascend autoregressive speculator to recognize SFA and
 SFA Indexer backends, lets SFA own its draft-step metadata, and adds an eager
 GLM-5.2 MTP end-to-end case. It is a prerequisite, not the KVPP integration.
 
-### Recommended design
+### Implemented design
 
 Replicate the small MTP draft cache on every KVPP rank and layer-split only the
-target model cache. vLLM already identifies draft/EAGLE cache groups through
-`KVCacheGroupSpec.is_eagle_group`; use that boundary in cache placement instead
-of assigning the draft layer to a KVPP owner.
+target model cache. MTP cache layers are identified by their model-layer range:
+they begin at `num_hidden_layers` and extend for
+`num_nextn_predict_layers`. This works whether Target and MTP caches share one
+logical cache group or use separate groups; `is_eagle_group` is not required.
 
 This design is preferable to transferring the draft cache on every speculative
 step:
@@ -65,24 +66,23 @@ step:
 - one small replicated draft cache costs much less memory than replicating the
   target cache and avoids communication in the latency-sensitive draft loop.
 
-### Required changes
+### Integration rules
 
-1. Change vLLM KV-cache placement to exclude `is_eagle_group` layers from
-   KVPP owner partitioning and scratch aliasing. Allocate those groups normally
-   on every rank.
+1. Exclude MTP layer caches from KVPP owner partitioning and scratch aliasing.
+   Allocate those layers normally on every rank.
 2. Store owners only for layer-split target cache layers. Do not require an
    owner for replicated draft layers.
 3. In the Ascend model runner, inject the KVPP hook only into target SFA/MLA
    implementations. The speculator's draft implementation must not share the
    target scheduler.
-4. Make active-page selection include every target verification slot. The
-   safest interface is the target slot mapping (or its referenced blocks), not
-   only `seq_lens`, so a speculative step crossing a block boundary cannot omit
-   the newly written page.
-5. Relax the platform gate only for `method="mtp"` after the layout above is
-   enforced. Keep other speculative methods and dynamic speculative decoding
-   rejected initially.
-6. Validate rejection/rollback semantics: rejected KV entries may remain in a
+4. Use the one cache group containing KVPP-managed Target layers to select the
+   block table and block size. Other groups may contain only replicated MTP
+   caches.
+5. Build active pages from the post-rollback computed length plus all currently
+   scheduled Target verification tokens, including block-boundary crossings.
+6. Allow only fixed-step `method="mtp"`. Keep other speculative methods and
+   dynamic speculative decoding rejected initially.
+7. Validate rejection/rollback semantics: rejected KV entries may remain in a
    page, but the next accepted write must overwrite the same logical slots and
    every owner transfer must expose an identical history to non-owners.
 

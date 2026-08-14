@@ -12,7 +12,62 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
     MemFabricMTEKVPPTransport,
     _MTEDeviceBufferMetadata,
 )
-from vllm_ascend.worker.v2.kvpp import KVPPScheduler, _active_pages
+from vllm_ascend.worker.v2.kvpp import (
+    KVPPScheduler,
+    _active_pages,
+    get_kvpp_managed_group_index,
+    select_kvpp_managed_caches,
+)
+
+
+def test_managed_group_allows_replicated_mtp_groups():
+    groups = [
+        SimpleNamespace(layer_names=["target.0", "mtp.4"]),
+        SimpleNamespace(layer_names=["mtp.5"]),
+    ]
+
+    assert get_kvpp_managed_group_index(groups, {"target.0": 0}) == 0
+
+
+def test_managed_group_rejects_target_layers_across_groups():
+    groups = [
+        SimpleNamespace(layer_names=["target.0", "mtp.4"]),
+        SimpleNamespace(layer_names=["target.1", "mtp.5"]),
+    ]
+
+    with pytest.raises(ValueError, match="one KV cache group"):
+        get_kvpp_managed_group_index(
+            groups,
+            {"target.0": 0, "target.1": 1},
+        )
+
+
+def test_transport_cache_selection_excludes_replicated_mtp_layers():
+    target_cache = object()
+    indexer_cache = object()
+    caches = {
+        "target.0": target_cache,
+        "target.0.indexer": indexer_cache,
+        "mtp.4": object(),
+    }
+
+    selected = select_kvpp_managed_caches(
+        caches,
+        {"target.0": 0, "target.0.indexer": 0},
+    )
+
+    assert selected == {
+        "target.0": target_cache,
+        "target.0.indexer": indexer_cache,
+    }
+
+
+def test_transport_cache_selection_requires_every_owned_layer():
+    with pytest.raises(ValueError, match="not initialized"):
+        select_kvpp_managed_caches(
+            {"target.0": object()},
+            {"target.0": 0, "target.0.indexer": 0},
+        )
 
 
 def test_active_pages_uses_only_pages_covered_by_sequence_lengths():

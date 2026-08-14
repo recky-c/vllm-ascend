@@ -97,6 +97,53 @@ class KVPPExecutionPlan:
         )
 
 
+def get_kvpp_managed_group_index(
+    kv_cache_groups: list[Any],
+    layer_owners: dict[str, int],
+) -> int:
+    managed_layers = set(layer_owners)
+    configured_layers = {
+        layer_name
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    }
+    missing_layers = managed_layers - configured_layers
+    if missing_layers:
+        raise ValueError(
+            "KVPP-owned cache layers are missing from KV cache groups: "
+            f"{sorted(missing_layers)}."
+        )
+
+    managed_group_indices = {
+        index
+        for index, group in enumerate(kv_cache_groups)
+        if managed_layers.intersection(group.layer_names)
+    }
+    if len(managed_group_indices) != 1:
+        raise ValueError(
+            "KVPP currently requires all managed Target KV layers to use "
+            "one KV cache group, but found managed groups "
+            f"{sorted(managed_group_indices)}."
+        )
+    return managed_group_indices.pop()
+
+
+def select_kvpp_managed_caches(
+    kv_caches: dict[str, Any],
+    layer_owners: dict[str, int],
+) -> dict[str, Any]:
+    missing_layers = set(layer_owners) - set(kv_caches)
+    if missing_layers:
+        raise ValueError(
+            "KVPP-owned cache tensors were not initialized: "
+            f"{sorted(missing_layers)}."
+        )
+    return {
+        layer_name: kv_caches[layer_name]
+        for layer_name in layer_owners
+    }
+
+
 def _active_pages(
     block_table: torch.Tensor,
     seq_lens: Any,
