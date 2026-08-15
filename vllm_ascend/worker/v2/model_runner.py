@@ -333,7 +333,8 @@ class NPUModelRunner(GPUModelRunner):
         if self.kvpp_cache_group_index is None:
             raise RuntimeError("KVPP cache group was not initialized.")
         active_pages = self.kvpp_scheduler.stage_graph_capture(
-            block_tables[self.kvpp_cache_group_index]
+            block_tables[self.kvpp_cache_group_index],
+            input_batch.num_reqs,
         )
         self._kvpp_graph_capture_inputs = (
             active_pages,
@@ -372,10 +373,10 @@ class NPUModelRunner(GPUModelRunner):
         finally:
             self._kvpp_graph_capture_active = False
 
-    def prepare_kvpp_fullgraph_replay(self) -> None:
+    def prepare_kvpp_fullgraph_replay(self, graph_num_requests: int) -> None:
         """Discard the eager lifecycle; captured KVPP ops drive FULL replay."""
         if self.kvpp_scheduler is not None:
-            self.kvpp_scheduler.prepare_graph_replay()
+            self.kvpp_scheduler.prepare_graph_replay(graph_num_requests)
             self.kvpp_scheduler.abort_batch()
 
     def prepare_attn(

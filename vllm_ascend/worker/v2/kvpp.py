@@ -290,9 +290,19 @@ class KVPPScheduler:
     def stage_graph_capture(
         self,
         block_table: torch.Tensor,
+        num_requests: int,
     ) -> KVPPActivePages:
         """Allocate persistent page inputs before entering graph capture."""
         descriptor_count = block_table.numel()
+        existing = self._graph_capture_pages.get(num_requests)
+        if existing is not None:
+            if existing.page_ids.numel() != descriptor_count:
+                raise RuntimeError(
+                    "KVPP graph capture changed descriptor capacity for batch "
+                    f"size {num_requests}: captured={existing.page_ids.numel()}, "
+                    f"new={descriptor_count}."
+                )
+            return existing
         pages = KVPPActivePages(
             page_ids=torch.zeros(
                 descriptor_count,
@@ -306,7 +316,7 @@ class KVPPScheduler:
             ),
             count_upper_bound=min(self.num_blocks, descriptor_count),
         )
-        self._graph_capture_pages[descriptor_count] = pages
+        self._graph_capture_pages[num_requests] = pages
         return pages
 
     def begin_graph_capture(
@@ -331,19 +341,34 @@ class KVPPScheduler:
         self._selected_pages = active_pages
         return self._batch_plan
 
-    def prepare_graph_replay(self) -> None:
-        """Copy the real batch page plan into the selected graph's inputs."""
+    def prepare_graph_replay(self, graph_num_requests: int) -> None:
+        """Pad the real batch page plan into the selected graph's inputs."""
         if self._selected_pages is None:
             raise RuntimeError("KVPP graph replay has no runtime page metadata.")
-        descriptor_count = self._selected_pages.page_ids.numel()
-        graph_pages = self._graph_capture_pages.get(descriptor_count)
+        graph_pages = self._graph_capture_pages.get(graph_num_requests)
         if graph_pages is None:
             raise RuntimeError(
-                "KVPP graph inputs were not captured for descriptor count "
-                f"{descriptor_count}."
+                "KVPP graph inputs were not captured for batch size "
+                f"{graph_num_requests}."
             )
-        graph_pages.page_ids.copy_(self._selected_pages.page_ids)
-        graph_pages.valid_mask.copy_(self._selected_pages.valid_mask)
+        runtime_count = self._selected_pages.page_ids.numel()
+        graph_capacity = graph_pages.page_ids.numel()
+        if runtime_count > graph_capacity:
+            raise RuntimeError(
+                "KVPP runtime page descriptors exceed the selected graph "
+                f"capacity: runtime={runtime_count}, graph={graph_capacity}."
+            )
+
+        graph_pages.page_ids[:runtime_count].copy_(
+            self._selected_pages.page_ids
+        )
+        # A smaller runtime batch can replay a larger captured graph. Clear the
+        # entire mask first so descriptors belonging to padded requests cannot
+        # retain valid bits from an earlier replay of the same graph.
+        graph_pages.valid_mask.zero_()
+        graph_pages.valid_mask[:runtime_count].copy_(
+            self._selected_pages.valid_mask
+        )
 
     def begin_forward(self) -> int:
         if self._batch_plan is None:

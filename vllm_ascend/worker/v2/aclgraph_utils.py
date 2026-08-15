@@ -108,7 +108,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.update_stream.wait_stream(torch.npu.current_stream())
         # prepare_attn starts the eager KVPP lifecycle before graph dispatch is
         # known.  A FULL replay executes the captured lifecycle instead.
-        self.model_runner.prepare_kvpp_fullgraph_replay()
+        if desc.num_reqs is None:
+            raise RuntimeError("FULL graph replay requires a fixed request capacity.")
+        self.model_runner.prepare_kvpp_fullgraph_replay(desc.num_reqs)
         ret = super().run_fullgraph(desc)
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to

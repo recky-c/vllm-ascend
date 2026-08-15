@@ -52,7 +52,7 @@ def test_model_runner_bridges_full_graph_capture_lifecycle():
     runner.stage_kvpp_graph_capture(block_tables, input_batch)
 
     runner.kvpp_scheduler.stage_graph_capture.assert_called_once_with(
-        block_tables[1]
+        block_tables[1], 1
     )
     runner.kvpp_scheduler.begin_graph_capture.assert_not_called()
     runner.begin_kvpp_graph_capture()
@@ -78,19 +78,47 @@ def test_graph_replay_updates_persistent_page_inputs():
         block_size=4,
         transport=SimpleNamespace(),
     )
-    block_table = torch.zeros((1, 3), dtype=torch.int32)
-    graph_pages = context.stage_graph_capture(block_table)
+    block_table = torch.zeros((4, 3), dtype=torch.int32)
+    graph_pages = context.stage_graph_capture(block_table, 4)
     runtime_pages = KVPPActivePages(
-        page_ids=torch.tensor([2, 7, 10], dtype=torch.int64),
-        valid_mask=torch.tensor([True, True, False]),
+        page_ids=torch.tensor(
+            [2, 7, 10, 3, 8, 11, 4, 9, 12], dtype=torch.int64
+        ),
+        valid_mask=torch.tensor(
+            [True, True, False, True, False, False, True, True, False]
+        ),
         count_upper_bound=2,
     )
     context._selected_pages = runtime_pages
+    graph_pages.valid_mask.fill_(True)
 
-    context.prepare_graph_replay()
+    context.prepare_graph_replay(4)
 
-    assert torch.equal(graph_pages.page_ids, runtime_pages.page_ids)
-    assert torch.equal(graph_pages.valid_mask, runtime_pages.valid_mask)
+    assert torch.equal(
+        graph_pages.page_ids[: runtime_pages.page_ids.numel()],
+        runtime_pages.page_ids,
+    )
+    assert torch.equal(
+        graph_pages.valid_mask[: runtime_pages.valid_mask.numel()],
+        runtime_pages.valid_mask,
+    )
+    assert not graph_pages.valid_mask[runtime_pages.valid_mask.numel() :].any()
+
+
+def test_graph_capture_reuses_persistent_inputs_for_same_batch_size():
+    context = KVPPScheduler(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners={"layer": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=SimpleNamespace(),
+    )
+    block_table = torch.zeros((4, 3), dtype=torch.int32)
+
+    first = context.stage_graph_capture(block_table, 4)
+    second = context.stage_graph_capture(block_table, 4)
+
+    assert first is second
 
 
 def test_graph_prefetch_uses_device_barriers_without_host_events():
