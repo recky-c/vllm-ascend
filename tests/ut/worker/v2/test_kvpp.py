@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -18,6 +19,7 @@ from vllm_ascend.worker.v2.kvpp import (
     get_kvpp_managed_group_index,
     select_kvpp_managed_caches,
 )
+from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 
 def test_managed_group_allows_replicated_mtp_groups():
@@ -27,6 +29,40 @@ def test_managed_group_allows_replicated_mtp_groups():
     ]
 
     assert get_kvpp_managed_group_index(groups, {"target.0": 0}) == 0
+
+
+def test_model_runner_bridges_full_graph_capture_lifecycle():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.kvpp_scheduler = MagicMock()
+    runner.kvpp_cache_group_index = 1
+    runner._kvpp_graph_capture_active = False
+    runner._kvpp_graph_capture_inputs = None
+    block_tables = (
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.tensor([[3]], dtype=torch.int32),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        seq_lens=torch.tensor([1]),
+        seq_lens_np=torch.tensor([1]),
+    )
+
+    runner.stage_kvpp_graph_capture(block_tables, input_batch)
+
+    runner.kvpp_scheduler.begin_graph_capture.assert_not_called()
+    runner.begin_kvpp_graph_capture()
+
+    runner.kvpp_scheduler.begin_graph_capture.assert_called_once_with(
+        block_tables[1], input_batch.seq_lens[:1]
+    )
+    runner.kvpp_scheduler.begin_forward.assert_called_once_with()
+    assert runner._kvpp_graph_capture_active
+
+    runner.finish_kvpp_graph_capture(success=True)
+
+    runner.kvpp_scheduler.finish_forward.assert_called_once_with()
+    runner.kvpp_scheduler.finish_batch.assert_called_once_with()
+    assert not runner._kvpp_graph_capture_active
 
 
 def test_managed_group_rejects_target_layers_across_groups():

@@ -149,28 +149,44 @@ def _active_pages(
     seq_lens: Any,
     block_size: int,
     num_blocks: int,
+    *,
+    for_graph_capture: bool = False,
 ) -> KVPPActivePages:
     """Return fixed-shape device pages read by the current batch.
 
     The original block table is read only. Invalid columns and duplicate page
     IDs become masked slots instead of being compacted through the host.
     """
-    if isinstance(seq_lens, torch.Tensor) and seq_lens.device.type != "cpu":
+    if (
+        not for_graph_capture
+        and isinstance(seq_lens, torch.Tensor)
+        and seq_lens.device.type != "cpu"
+    ):
         raise ValueError(
             "KVPP sequence lengths must remain on the host so the active-page "
             "capacity bound never introduces a device-to-host synchronization."
         )
-    host_lengths = torch.as_tensor(
-        seq_lens, dtype=torch.int64, device="cpu"
-    ).flatten()
     table_columns = block_table.shape[1]
-    pages_per_request_host = torch.div(
-        host_lengths + block_size - 1, block_size, rounding_mode="floor"
-    ).clamp_(min=0, max=table_columns)
-    count_upper_bound = min(
-        num_blocks, int(pages_per_request_host.sum().item())
-    )
-    lengths = host_lengths.to(device=block_table.device)
+    if for_graph_capture:
+        # Keep lengths as a graph input.  The fixed capacity is conservative,
+        # while valid_mask removes unused columns for each replay batch.
+        lengths = torch.as_tensor(
+            seq_lens, dtype=torch.int64, device=block_table.device
+        ).flatten()
+        count_upper_bound = min(num_blocks, block_table.numel())
+    else:
+        host_lengths = torch.as_tensor(
+            seq_lens, dtype=torch.int64, device="cpu"
+        ).flatten()
+        pages_per_request_host = torch.div(
+            host_lengths + block_size - 1,
+            block_size,
+            rounding_mode="floor",
+        ).clamp_(min=0, max=table_columns)
+        count_upper_bound = min(
+            num_blocks, int(pages_per_request_host.sum().item())
+        )
+        lengths = host_lengths.to(device=block_table.device)
     table = block_table[: lengths.shape[0]].to(dtype=torch.int64)
     columns = torch.arange(
         table.shape[1], dtype=torch.int64, device=block_table.device
@@ -274,6 +290,35 @@ class KVPPScheduler:
             epoch=self._batch_epoch,
             active_pages=active_pages,
             num_requests=int(torch.as_tensor(seq_lens).numel()),
+        )
+        self._selected_pages = active_pages
+        return self._batch_plan
+
+    def begin_graph_capture(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> KVPPBatchPlan:
+        """Begin a batch whose active-page selection is captured in the graph."""
+        if self._batch_plan is not None:
+            raise RuntimeError(
+                f"KVPP batch epoch {self._batch_plan.epoch} is still active."
+            )
+        if self._current_layer is not None or self._pending_layer is not None:
+            raise RuntimeError("KVPP cannot start a batch with layer work pending.")
+
+        active_pages = _active_pages(
+            block_table,
+            seq_lens,
+            self.block_size,
+            self.num_blocks,
+            for_graph_capture=True,
+        )
+        self._batch_epoch += 1
+        self._batch_plan = KVPPBatchPlan(
+            epoch=self._batch_epoch,
+            active_pages=active_pages,
+            num_requests=seq_lens.numel(),
         )
         self._selected_pages = active_pages
         return self._batch_plan

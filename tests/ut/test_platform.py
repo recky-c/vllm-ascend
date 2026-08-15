@@ -1278,6 +1278,16 @@ class TestNPUPlatform(TestBase):
 
         self.platform._validate_parallel_config(vllm_config)
 
+    def test_validate_parallel_config_accepts_kvpp_full_graph(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.kvpp_size = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = False
+        vllm_config.kv_transfer_config = None
+
+        self.platform._validate_parallel_config(vllm_config)
+
     def test_validate_parallel_config_accepts_kvpp_with_fixed_mtp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.use_v2_model_runner = True

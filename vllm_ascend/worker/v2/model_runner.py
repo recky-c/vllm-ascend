@@ -134,6 +134,10 @@ class NPUModelRunner(GPUModelRunner):
         self.kvpp_scheduler: KVPPScheduler | None = None
         self.kvpp_cache_group_index: int | None = None
         self._kvpp_kv_caches: dict[str, Any] | None = None
+        self._kvpp_graph_capture_active = False
+        self._kvpp_graph_capture_inputs: tuple[
+            tuple[torch.Tensor, ...], AscendInputBatch
+        ] | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -303,12 +307,64 @@ class NPUModelRunner(GPUModelRunner):
         kvpp_scheduler.initialize_transport(managed_kv_caches)
         self._kvpp_kv_caches = None
         self.kvpp_scheduler = kvpp_scheduler
+        # FULL graph capture creates dummy attention inputs through model_state
+        # instead of this runner's prepare_dummy_attn method.
+        self.model_state.kvpp_capture_stage = self.stage_kvpp_graph_capture
         for impl in kvpp_impls.values():
             impl.layerwise_kv_cache_hook = kvpp_scheduler
 
     def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
         if self.kvpp_size > 1:
             self._kvpp_kv_caches = kv_caches_dict
+
+    def stage_kvpp_graph_capture(
+        self,
+        block_tables: tuple[torch.Tensor, ...],
+        input_batch: AscendInputBatch,
+    ) -> None:
+        """Stage the dummy inputs consumed by the next capture forward."""
+        if self.kvpp_scheduler is None:
+            return
+        if self._kvpp_graph_capture_active:
+            raise RuntimeError("A KVPP graph capture forward is already active.")
+        self._kvpp_graph_capture_inputs = (block_tables, input_batch)
+
+    def begin_kvpp_graph_capture(self) -> None:
+        """Begin KVPP inside warmup/capture so page ops join the graph."""
+        if self.kvpp_scheduler is None:
+            return
+        if self._kvpp_graph_capture_inputs is None:
+            return
+        if self.kvpp_cache_group_index is None:
+            raise RuntimeError("KVPP cache group was not initialized.")
+
+        block_tables, input_batch = self._kvpp_graph_capture_inputs
+        self._kvpp_graph_capture_inputs = None
+        self.kvpp_scheduler.begin_graph_capture(
+            block_tables[self.kvpp_cache_group_index],
+            input_batch.seq_lens[: input_batch.num_reqs],
+        )
+        self.kvpp_scheduler.begin_forward()
+        self._kvpp_graph_capture_active = True
+
+    def finish_kvpp_graph_capture(self, success: bool) -> None:
+        """Close the capture-only KVPP lifecycle around model forward."""
+        if not self._kvpp_graph_capture_active:
+            return
+        assert self.kvpp_scheduler is not None
+        try:
+            if success:
+                self.kvpp_scheduler.finish_forward()
+                self.kvpp_scheduler.finish_batch()
+            else:
+                self.kvpp_scheduler.abort_batch()
+        finally:
+            self._kvpp_graph_capture_active = False
+
+    def prepare_kvpp_fullgraph_replay(self) -> None:
+        """Discard the eager lifecycle; captured KVPP ops drive FULL replay."""
+        if self.kvpp_scheduler is not None:
+            self.kvpp_scheduler.abort_batch()
 
     def prepare_attn(
         self, input_batch: AscendInputBatch

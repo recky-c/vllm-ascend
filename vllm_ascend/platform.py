@@ -1393,8 +1393,6 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
         model_config = vllm_config.model_config
         if not model_config.use_mla or model_config.is_hybrid:
             raise ValueError("KVPP currently supports only non-hybrid MLA models.")
-        if not model_config.enforce_eager:
-            raise ValueError("KVPP currently requires eager execution.")
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None:
             if speculative_config.method != "mtp":
