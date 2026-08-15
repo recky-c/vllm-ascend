@@ -55,6 +55,9 @@ from vllm_ascend.ascend_forward_context import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
     MemFabricMTEKVPPTransport,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.kvpp_transport import (
+    KVPPActivePages,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import enable_sp, set_potential_max_tokens
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
@@ -136,7 +139,7 @@ class NPUModelRunner(GPUModelRunner):
         self._kvpp_kv_caches: dict[str, Any] | None = None
         self._kvpp_graph_capture_active = False
         self._kvpp_graph_capture_inputs: tuple[
-            tuple[torch.Tensor, ...], AscendInputBatch
+            KVPPActivePages, int
         ] | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
@@ -327,7 +330,15 @@ class NPUModelRunner(GPUModelRunner):
             return
         if self._kvpp_graph_capture_active:
             raise RuntimeError("A KVPP graph capture forward is already active.")
-        self._kvpp_graph_capture_inputs = (block_tables, input_batch)
+        if self.kvpp_cache_group_index is None:
+            raise RuntimeError("KVPP cache group was not initialized.")
+        active_pages = self.kvpp_scheduler.stage_graph_capture(
+            block_tables[self.kvpp_cache_group_index]
+        )
+        self._kvpp_graph_capture_inputs = (
+            active_pages,
+            input_batch.num_reqs,
+        )
 
     def begin_kvpp_graph_capture(self) -> None:
         """Begin KVPP inside warmup/capture so page ops join the graph."""
@@ -338,11 +349,11 @@ class NPUModelRunner(GPUModelRunner):
         if self.kvpp_cache_group_index is None:
             raise RuntimeError("KVPP cache group was not initialized.")
 
-        block_tables, input_batch = self._kvpp_graph_capture_inputs
+        active_pages, num_requests = self._kvpp_graph_capture_inputs
         self._kvpp_graph_capture_inputs = None
         self.kvpp_scheduler.begin_graph_capture(
-            block_tables[self.kvpp_cache_group_index],
-            input_batch.seq_lens[: input_batch.num_reqs],
+            active_pages,
+            num_requests,
         )
         self.kvpp_scheduler.begin_forward()
         self._kvpp_graph_capture_active = True
@@ -364,6 +375,7 @@ class NPUModelRunner(GPUModelRunner):
     def prepare_kvpp_fullgraph_replay(self) -> None:
         """Discard the eager lifecycle; captured KVPP ops drive FULL replay."""
         if self.kvpp_scheduler is not None:
+            self.kvpp_scheduler.prepare_graph_replay()
             self.kvpp_scheduler.abort_batch()
 
     def prepare_attn(

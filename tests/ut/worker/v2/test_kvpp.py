@@ -34,6 +34,8 @@ def test_managed_group_allows_replicated_mtp_groups():
 def test_model_runner_bridges_full_graph_capture_lifecycle():
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.kvpp_scheduler = MagicMock()
+    captured_pages = MagicMock()
+    runner.kvpp_scheduler.stage_graph_capture.return_value = captured_pages
     runner.kvpp_cache_group_index = 1
     runner._kvpp_graph_capture_active = False
     runner._kvpp_graph_capture_inputs = None
@@ -49,11 +51,14 @@ def test_model_runner_bridges_full_graph_capture_lifecycle():
 
     runner.stage_kvpp_graph_capture(block_tables, input_batch)
 
+    runner.kvpp_scheduler.stage_graph_capture.assert_called_once_with(
+        block_tables[1]
+    )
     runner.kvpp_scheduler.begin_graph_capture.assert_not_called()
     runner.begin_kvpp_graph_capture()
 
     runner.kvpp_scheduler.begin_graph_capture.assert_called_once_with(
-        block_tables[1], input_batch.seq_lens[:1]
+        captured_pages, 1
     )
     runner.kvpp_scheduler.begin_forward.assert_called_once_with()
     assert runner._kvpp_graph_capture_active
@@ -63,6 +68,29 @@ def test_model_runner_bridges_full_graph_capture_lifecycle():
     runner.kvpp_scheduler.finish_forward.assert_called_once_with()
     runner.kvpp_scheduler.finish_batch.assert_called_once_with()
     assert not runner._kvpp_graph_capture_active
+
+
+def test_graph_replay_updates_persistent_page_inputs():
+    context = KVPPScheduler(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners={"layer": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=SimpleNamespace(),
+    )
+    block_table = torch.zeros((1, 3), dtype=torch.int32)
+    graph_pages = context.stage_graph_capture(block_table)
+    runtime_pages = KVPPActivePages(
+        page_ids=torch.tensor([2, 7, 10], dtype=torch.int64),
+        valid_mask=torch.tensor([True, True, False]),
+        count_upper_bound=2,
+    )
+    context._selected_pages = runtime_pages
+
+    context.prepare_graph_replay()
+
+    assert torch.equal(graph_pages.page_ids, runtime_pages.page_ids)
+    assert torch.equal(graph_pages.valid_mask, runtime_pages.valid_mask)
 
 
 def test_graph_prefetch_uses_device_barriers_without_host_events():
