@@ -244,6 +244,7 @@ class KVPPScheduler:
     _pending_layer: str | None = field(default=None, init=False)
     _transfer_waited: bool = field(default=False, init=False)
     _device_id: int | None = field(default=None, init=False)
+    _graph_sync_token: torch.Tensor | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.plan = KVPPExecutionPlan.build(
@@ -255,6 +256,9 @@ class KVPPScheduler:
         if self.group.world_size > 1:
             self._device_id = torch.npu.current_device()
             self._comm_stream = torch.npu.Stream()
+            self._graph_sync_token = torch.zeros(
+                1, dtype=torch.int32, device="npu"
+            )
             # One transfer may be in flight. Serializing jobs also preserves
             # point-to-point notification order when layer ownership changes.
             self._executor = ThreadPoolExecutor(
@@ -469,6 +473,10 @@ class KVPPScheduler:
         if self._executor is None or self._comm_stream is None:
             raise RuntimeError("KVPP prefetch worker was not initialized.")
 
+        if torch.npu.is_current_stream_capturing():
+            self._run_graph_prefetch(layer_name, self._selected_pages)
+            return
+
         # All ranks publish a local safe point. Alternating layers use distinct
         # buffers. When a buffer cycles back after two layers, this event is
         # ordered after all earlier attention work on the compute stream, so
@@ -480,6 +488,37 @@ class KVPPScheduler:
         self._transfer_future = self._executor.submit(
             self._run_prefetch, layer_name, pages, scratch_ready
         )
+
+    def _run_graph_prefetch(
+        self,
+        layer_name: str,
+        pages: KVPPActivePages | None,
+    ) -> None:
+        """Capture a host-event-free transfer sequence for FULL graph replay.
+
+        The two device collectives replace eager mode's CPU ready/done
+        protocol.  Keeping all operations on the capture stream is deliberate:
+        it provides correct cross-rank ordering without recording an NPU event
+        that a background Python thread would later synchronize.
+        """
+        if pages is None:
+            raise RuntimeError("KVPP graph capture has no active-page metadata.")
+        if self._graph_sync_token is None or self.group.device_group is None:
+            raise RuntimeError("KVPP graph synchronization was not initialized.")
+
+        stream = torch.npu.current_stream()
+        owner_rank = self.plan.owners[layer_name]
+        local_rank = self.group.rank_in_group
+        dist.all_reduce(self._graph_sync_token, group=self.group.device_group)
+        if local_rank == owner_rank:
+            self.transport.push_active_bundle(
+                self.plan.cache_bundles[layer_name], pages, stream
+            )
+        dist.all_reduce(self._graph_sync_token, group=self.group.device_group)
+        if local_rank != owner_rank:
+            self.transport.receive_active_bundle(
+                self.plan.cache_bundles[layer_name], pages, stream
+            )
 
     def _run_prefetch(
         self,

@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -63,6 +63,42 @@ def test_model_runner_bridges_full_graph_capture_lifecycle():
     runner.kvpp_scheduler.finish_forward.assert_called_once_with()
     runner.kvpp_scheduler.finish_batch.assert_called_once_with()
     assert not runner._kvpp_graph_capture_active
+
+
+def test_graph_prefetch_uses_device_barriers_without_host_events():
+    device_group = object()
+    transport = MagicMock()
+    context = KVPPScheduler(
+        group=SimpleNamespace(
+            rank_in_group=0,
+            world_size=2,
+            device_group=device_group,
+        ),
+        layer_owners={"layer": 0},
+        num_blocks=4,
+        block_size=4,
+        transport=transport,
+    )
+    context._graph_sync_token = torch.zeros(1, dtype=torch.int32)
+    pages = _active_page_tensor(1)
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.kvpp.torch.npu.current_stream",
+            return_value="capture-stream",
+        ),
+        patch("vllm_ascend.worker.v2.kvpp.dist.all_reduce") as all_reduce,
+    ):
+        context._run_graph_prefetch("layer", pages)
+
+    assert all_reduce.call_count == 2
+    all_reduce.assert_called_with(
+        context._graph_sync_token, group=device_group
+    )
+    transport.push_active_bundle.assert_called_once_with(
+        ("layer",), pages, "capture-stream"
+    )
+    transport.receive_active_bundle.assert_not_called()
 
 
 def test_managed_group_rejects_target_layers_across_groups():

@@ -55,15 +55,23 @@ class MemFabricMTECompletion:
     def record(
         cls, stream: Any, resources: tuple[Any, ...] = ()
     ) -> "MemFabricMTECompletion":
+        # Events recorded in an ACL graph capture stream cannot be host-
+        # synchronized from KVPP's worker thread.  Graph execution is ordered
+        # directly on its capture stream and retains the descriptor tensors in
+        # the graph pool, so no host completion object is needed there.
+        if torch.npu.is_current_stream_capturing():
+            return cls(None, resources)
         event = torch.npu.Event()
         event.record(stream)
         return cls(event, resources)
 
     def wait(self) -> None:
-        self.event.synchronize()
+        if self.event is not None:
+            self.event.synchronize()
 
     def wait_on_stream(self, stream: Any) -> None:
-        stream.wait_event(self.event)
+        if self.event is not None:
+            stream.wait_event(self.event)
 
 
 @dataclass(frozen=True)
