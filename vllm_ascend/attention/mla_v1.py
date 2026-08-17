@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import numpy as np
 import torch
@@ -24,7 +24,6 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.layerwise_cache import LayerwiseKVCacheHook
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -709,7 +708,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         **kwargs,
     ):
         self.vllm_config = get_current_vllm_config()
-        self.layerwise_kv_cache_hook: LayerwiseKVCacheHook | None = None
+        self.layerwise_kv_cache_hook: Any = None
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)

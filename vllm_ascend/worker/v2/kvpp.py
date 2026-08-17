@@ -443,30 +443,21 @@ class KVPPScheduler:
         with torch.profiler.record_function(
             f"kvpp.comm_total.layer_{layer_index}"
         ):
-            with torch.profiler.record_function(
-                f"kvpp.scratch_ready.layer_{layer_index}"
-            ):
-                scratch_ready.synchronize()
+            scratch_ready.synchronize()
 
             if local_rank != owner_rank:
-                with torch.profiler.record_function(
-                    f"kvpp.ready_send.layer_{layer_index}"
-                ):
-                    dist.send(
-                        token,
-                        dst=owner_global_rank,
-                        group=self.group.cpu_group,
-                        tag=ready_tag,
-                    )
-                with torch.profiler.record_function(
-                    f"kvpp.done_recv.layer_{layer_index}"
-                ):
-                    dist.recv(
-                        token,
-                        src=owner_global_rank,
-                        group=self.group.cpu_group,
-                        tag=done_tag,
-                    )
+                dist.send(
+                    token,
+                    dst=owner_global_rank,
+                    group=self.group.cpu_group,
+                    tag=ready_tag,
+                )
+                dist.recv(
+                    token,
+                    src=owner_global_rank,
+                    group=self.group.cpu_group,
+                    tag=done_tag,
+                )
                 with torch.profiler.record_function(
                     f"kvpp.transport_receive.layer_{layer_index}"
                 ):
@@ -481,18 +472,15 @@ class KVPPScheduler:
                     receive_completion.wait()
                 return
 
-            with torch.profiler.record_function(
-                f"kvpp.ready_recv.layer_{layer_index}"
-            ):
-                for peer_rank, peer_global_rank in enumerate(self.group.ranks):
-                    if peer_rank == owner_rank:
-                        continue
-                    dist.recv(
-                        token,
-                        src=peer_global_rank,
-                        group=self.group.cpu_group,
-                        tag=ready_tag,
-                    )
+            for peer_rank, peer_global_rank in enumerate(self.group.ranks):
+                if peer_rank == owner_rank:
+                    continue
+                dist.recv(
+                    token,
+                    src=peer_global_rank,
+                    group=self.group.cpu_group,
+                    tag=ready_tag,
+                )
 
             with torch.profiler.record_function(
                 f"kvpp.transport_push.layer_{layer_index}"
@@ -508,18 +496,15 @@ class KVPPScheduler:
                 # paged KV cache.
                 completion.wait()
 
-            with torch.profiler.record_function(
-                f"kvpp.done_send.layer_{layer_index}"
-            ):
-                for peer_rank, peer_global_rank in enumerate(self.group.ranks):
-                    if peer_rank == owner_rank:
-                        continue
-                    dist.send(
-                        token,
-                        dst=peer_global_rank,
-                        group=self.group.cpu_group,
-                        tag=done_tag,
-                    )
+            for peer_rank, peer_global_rank in enumerate(self.group.ranks):
+                if peer_rank == owner_rank:
+                    continue
+                dist.send(
+                    token,
+                    dst=peer_global_rank,
+                    group=self.group.cpu_group,
+                    tag=done_tag,
+                )
 
     def close(self) -> None:
         """Drain overlap work and release transport-owned resources."""

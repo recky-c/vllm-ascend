@@ -1418,43 +1418,9 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
             f"Got prefill_context_parallel_size={parallel_config.prefill_context_parallel_size}."
         )
 
-    kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
-    if kvpp_size > 1:
-        if not vllm_config.use_v2_model_runner:
-            raise ValueError("KVPP is only supported by Ascend Model Runner V2.")
-        if parallel_config.pipeline_parallel_size != 1:
-            raise ValueError("KVPP does not support pipeline parallelism yet.")
-        if parallel_config.prefill_context_parallel_size != 1:
-            raise ValueError("KVPP does not support PCP yet.")
-        if parallel_config.decode_context_parallel_size != 1:
-            raise ValueError("KVPP and DCP cannot be enabled at the same time.")
-        if parallel_config.tensor_parallel_size % kvpp_size != 0:
-            raise ValueError(
-                "tensor_parallel_size must be divisible by kvpp_size, got "
-                f"TP={parallel_config.tensor_parallel_size}, KVPP={kvpp_size}."
-            )
-        if vllm_config.kv_transfer_config is not None:
-            raise ValueError("KVPP does not support KV connectors or offload yet.")
-
-        model_config = vllm_config.model_config
-        if not model_config.use_mla or model_config.is_hybrid:
-            raise ValueError("KVPP currently supports only non-hybrid MLA models.")
-        speculative_config = vllm_config.speculative_config
-        if speculative_config is not None:
-            if speculative_config.method != "mtp":
-                raise ValueError(
-                    "KVPP currently supports speculative decoding only with "
-                    "method='mtp'."
-                )
-            if getattr(
-                speculative_config,
-                "num_speculative_tokens_per_batch_size",
-                None,
-            ):
-                raise ValueError(
-                    "KVPP currently supports only a fixed number of MTP "
-                    "speculative tokens."
-                )
+    kvpp_config = KVPPConfig.from_vllm_config(vllm_config)
+    if kvpp_config.size > 1:
+        kvpp_config.validate(vllm_config)
 
     sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
     if sfa_dcp_replicated_indexer:

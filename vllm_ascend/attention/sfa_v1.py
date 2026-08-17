@@ -23,7 +23,6 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.layerwise_cache import LayerwiseKVCacheHook
 from vllm_ascend.attention.mla_v1 import MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
@@ -480,7 +479,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
         # Optional platform service injected by the model runner. Attention
         # stays independent of KVPP scheduling and the concrete transport.
-        self.layerwise_kv_cache_hook: LayerwiseKVCacheHook | None = None
+        self.layerwise_kv_cache_hook: Any = None
 
         ascend_config = get_ascend_config()
         self.vllm_config = get_current_vllm_config()
