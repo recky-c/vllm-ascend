@@ -13,6 +13,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
 )
 from vllm_ascend.worker.v2.kvpp import (
     KVPPGraphCaptureController,
+    KVPPPhase,
     KVPPScheduler,
     _active_pages,
     get_kvpp_managed_group_index,
@@ -110,7 +111,9 @@ def test_graph_capture_reuses_persistent_inputs_for_same_batch_size():
     assert first is second
 
 
-def test_graph_prefetch_uses_device_barriers_without_host_events():
+def test_graph_prefetch_runs_on_comm_stream_with_device_dependencies():
+    """Graph-path transfer runs on the KVPP comm stream, not the capture
+    stream, and uses scratch_free/kv_ready events for device-side ordering."""
     device_group = object()
     transport = MagicMock()
     context = KVPPScheduler(
@@ -125,25 +128,120 @@ def test_graph_prefetch_uses_device_barriers_without_host_events():
         transport=transport,
     )
     context._graph_sync_token = torch.zeros(1, dtype=torch.int32)
+    # Simulate the slots/stream created by initialize_transport.
+    comm_stream = MagicMock()
+    context._comm_stream = comm_stream
+    context._graph_slots = tuple(
+        SimpleNamespace(
+            scratch_free_event=MagicMock(),
+            kv_ready_event=MagicMock(),
+        )
+        for _ in range(2)
+    )
     pages = _active_page_tensor(1)
 
     with (
         patch(
-            "vllm_ascend.worker.v2.kvpp.torch.npu.current_stream",
-            return_value="capture-stream",
+            "vllm_ascend.worker.v2.kvpp.torch.npu.is_current_stream_capturing",
+            return_value=True,
         ),
+        patch(
+            "vllm_ascend.worker.v2.kvpp.torch.npu.stream"
+        ) as stream_ctx,
         patch("vllm_ascend.worker.v2.kvpp.dist.all_reduce") as all_reduce,
     ):
         context._run_graph_prefetch("layer", pages)
 
+    # Two device-group barriers per layer.
     assert all_reduce.call_count == 2
     all_reduce.assert_called_with(
         context._graph_sync_token, group=device_group
     )
-    transport.push_active_bundle.assert_called_once_with(
-        ("layer",), pages, "capture-stream"
-    )
+    # Owner pushes on the comm stream, not the capture stream.
+    transport.push_active_bundle.assert_called_once()
+    pushed_args = transport.push_active_bundle.call_args
+    assert pushed_args.args[2] is comm_stream
     transport.receive_active_bundle.assert_not_called()
+    # Comm stream waited for scratch_free and recorded kv_ready.
+    slot = context._graph_slots[0]
+    comm_stream.wait_event.assert_called_once_with(slot.scratch_free_event)
+    slot.kv_ready_event.record.assert_called_once_with(comm_stream)
+
+
+def test_graph_wait_for_layer_uses_device_wait_event():
+    """wait_for_layer in graph mode establishes a pure device-side dependency."""
+    transport = MagicMock()
+    context = KVPPScheduler(
+        group=SimpleNamespace(rank_in_group=0, world_size=2),
+        layer_owners={"layer": 0},
+        num_blocks=4,
+        block_size=4,
+        transport=transport,
+    )
+    context._graph_slots = tuple(
+        SimpleNamespace(
+            scratch_free_event=MagicMock(),
+            kv_ready_event=MagicMock(),
+        )
+        for _ in range(2)
+    )
+    context._phase = KVPPPhase.LAYER_ENTERED
+    context._current_layer = "layer"
+    context._pending_layer = "layer"
+    capture_stream = MagicMock()
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.kvpp.torch.npu.is_current_stream_capturing",
+            return_value=True,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.kvpp.torch.npu.current_stream",
+            return_value=capture_stream,
+        ),
+    ):
+        context.wait_for_layer("layer")
+
+    slot = context._graph_slots[0]
+    capture_stream.wait_event.assert_called_once_with(slot.kv_ready_event)
+
+
+def test_graph_leave_layer_records_scratch_free_event():
+    """leave_layer in graph mode records scratch_free on the compute stream."""
+    transport = MagicMock()
+    context = KVPPScheduler(
+        group=SimpleNamespace(rank_in_group=0, world_size=2),
+        layer_owners={"layer": 0},
+        num_blocks=4,
+        block_size=4,
+        transport=transport,
+    )
+    context._graph_slots = tuple(
+        SimpleNamespace(
+            scratch_free_event=MagicMock(),
+            kv_ready_event=MagicMock(),
+        )
+        for _ in range(2)
+    )
+    context._phase = KVPPPhase.LAYER_WAITED
+    context._current_layer = "layer"
+    capture_stream = MagicMock()
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.kvpp.torch.npu.is_current_stream_capturing",
+            return_value=True,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.kvpp.torch.npu.current_stream",
+            return_value=capture_stream,
+        ),
+    ):
+        context.leave_layer("layer")
+
+    slot = context._graph_slots[0]
+    slot.scratch_free_event.record.assert_called_once_with(capture_stream)
+    assert context._phase is KVPPPhase.FORWARD_ACTIVE
 
 
 def test_managed_group_rejects_target_layers_across_groups():

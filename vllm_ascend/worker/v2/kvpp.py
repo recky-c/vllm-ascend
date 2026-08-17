@@ -174,6 +174,22 @@ class KVPPPhase(Enum):
     LAYER_WAITED = auto()
 
 
+@dataclass
+class _GraphScratchSlot:
+    """Per-scratch-slot device-side dependency events for graph capture.
+
+    ``scratch_free_event`` is recorded on the compute stream when a layer
+    finishes reading its scratch, and waited on by the comm stream before the
+    next layer reuses the same scratch buffer.
+
+    ``kv_ready_event`` is recorded on the comm stream when the KV transfer for
+    a layer completes, and waited on by the compute stream before attention.
+    """
+
+    scratch_free_event: Any
+    kv_ready_event: Any
+
+
 class KVPPScheduler:
     """Schedule stream-ordered layer prefetch over an injected transport.
 
@@ -211,6 +227,7 @@ class KVPPScheduler:
         self._pending_layer: str | None = None
         self._device_id: int | None = None
         self._graph_sync_token: torch.Tensor | None = None
+        self._graph_slots: tuple[_GraphScratchSlot, ...] = ()
 
     def initialize_transport(self, kv_caches: dict[str, Any]) -> None:
         self._validate_plan_across_ranks()
@@ -225,6 +242,15 @@ class KVPPScheduler:
             # point-to-point notification order when layer ownership changes.
             self._executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="kvpp-prefetch"
+            )
+            # Pre-create the two scratch-slot event pairs used by the graph
+            # path so capture never allocates a new event mid-graph.
+            self._graph_slots = tuple(
+                _GraphScratchSlot(
+                    scratch_free_event=torch.npu.Event(),
+                    kv_ready_event=torch.npu.Event(),
+                )
+                for _ in range(2)
             )
 
     def _validate_plan_across_ranks(self) -> None:
@@ -357,9 +383,18 @@ class KVPPScheduler:
             raise RuntimeError(
                 f"No pending KVPP prefetch for layer {layer_name}."
             )
-        if self._transfer_future is not None:
-            # This blocks only for the residual transfer time because this
-            # layer was prefetched while the preceding layer was executing.
+
+        if torch.npu.is_current_stream_capturing():
+            # Graph path: establish a pure device-side dependency. The
+            # compute stream waits for the comm stream's kv_ready_event
+            # before submitting attention kernels. No host synchronization.
+            layer_index = extract_layer_index(layer_name)
+            slot = self._graph_slots[layer_index % 2]
+            torch.npu.current_stream().wait_event(slot.kv_ready_event)
+        elif self._transfer_future is not None:
+            # Eager path: this blocks only for the residual transfer time
+            # because this layer was prefetched while the preceding layer
+            # was executing.
             layer_index = extract_layer_index(layer_name)
             with torch.profiler.record_function(
                 f"kvpp.wait.previous_layer.layer_{layer_index}"
@@ -382,6 +417,10 @@ class KVPPScheduler:
         dual scratch buffers the next transfer was already submitted just
         before this attention. Compute-stream ordering protects reuse when the
         buffer cycles back two layers later.
+
+        In graph capture, this also records ``scratch_free_event`` on the
+        compute stream so the comm stream's next use of the same slot is
+        ordered after this attention finishes reading it.
         """
         if (
             self._phase is not KVPPPhase.LAYER_WAITED
@@ -391,6 +430,11 @@ class KVPPScheduler:
                 f"KVPP attention for layer {layer_name} finished before its "
                 "transfer was consumed."
             )
+
+        if torch.npu.is_current_stream_capturing() and self._graph_slots:
+            layer_index = extract_layer_index(layer_name)
+            slot = self._graph_slots[layer_index % 2]
+            slot.scratch_free_event.record(torch.npu.current_stream())
 
         self._current_layer = None
         self._phase = KVPPPhase.FORWARD_ACTIVE
@@ -430,29 +474,52 @@ class KVPPScheduler:
     ) -> None:
         """Capture a host-event-free transfer sequence for FULL graph replay.
 
-        The two device collectives replace eager mode's CPU ready/done
-        protocol.  Keeping all operations on the capture stream is deliberate:
-        it provides correct cross-rank ordering without recording an NPU event
-        that a background Python thread would later synchronize.
+        Runs entirely on the pre-created KVPP comm stream so the capture
+        stream's compute kernels overlap with the KV transfer. All
+        cross-stream ordering is expressed as device-side ``wait_event`` /
+        ``record`` pairs - no host synchronization, no background thread.
+
+        The two device-group barriers replace eager mode's CPU ready/done
+        protocol: the first ensures every non-owner is ready to receive
+        before the owner pushes; the second ensures the push is remotely
+        visible before non-owners receive.
         """
         if pages is None:
             raise RuntimeError("KVPP graph capture has no active-page metadata.")
         if self._graph_sync_token is None or self.group.device_group is None:
             raise RuntimeError("KVPP graph synchronization was not initialized.")
+        if not self._graph_slots:
+            raise RuntimeError("KVPP graph scratch slots were not initialized.")
+        if self._comm_stream is None:
+            raise RuntimeError("KVPP comm stream was not initialized.")
 
-        stream = torch.npu.current_stream()
+        layer_index = extract_layer_index(layer_name)
+        slot = self._graph_slots[layer_index % 2]
         owner_rank = self.layer_owners[layer_name]
         local_rank = self.group.rank_in_group
-        dist.all_reduce(self._graph_sync_token, group=self.group.device_group)
-        if local_rank == owner_rank:
-            self.transport.push_active_bundle(
-                self.plan.cache_bundles[layer_name], pages, stream
+        bundle = self.plan.cache_bundles[layer_name]
+
+        # Comm stream waits for the compute stream to release this scratch
+        # slot (set by leave_layer of the layer that previously used it).
+        # For the first use of each slot the event is fresh and wait is a
+        # no-op; for reused slots it is ordered after the earlier attention.
+        with torch.npu.stream(self._comm_stream):
+            self._comm_stream.wait_event(slot.scratch_free_event)
+
+            dist.all_reduce(
+                self._graph_sync_token, group=self.group.device_group
             )
-        dist.all_reduce(self._graph_sync_token, group=self.group.device_group)
-        if local_rank != owner_rank:
-            self.transport.receive_active_bundle(
-                self.plan.cache_bundles[layer_name], pages, stream
+            if local_rank == owner_rank:
+                self.transport.push_active_bundle(bundle, pages, self._comm_stream)
+            dist.all_reduce(
+                self._graph_sync_token, group=self.group.device_group
             )
+            if local_rank != owner_rank:
+                self.transport.receive_active_bundle(
+                    bundle, pages, self._comm_stream
+                )
+
+            slot.kv_ready_event.record(self._comm_stream)
 
     def _run_prefetch(
         self,
