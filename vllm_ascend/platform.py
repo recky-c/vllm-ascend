@@ -34,6 +34,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.kvpp_config import KVPPConfig
 
 # isort: off
 from vllm_ascend.utils import (
@@ -159,6 +160,46 @@ class NPUPlatform(Platform):
         from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
 
         register_ascend_kv_cache_specs()
+
+    @classmethod
+    def get_kv_cache_groups_for_worker(
+        cls,
+        vllm_config: VllmConfig,
+        global_kv_cache_groups,
+        worker_kv_cache_spec,
+        worker_index: int,
+    ):
+        from vllm_ascend.v1.core.kv_cache_placement import (
+            get_kv_cache_groups_for_worker,
+        )
+
+        return get_kv_cache_groups_for_worker(
+            vllm_config,
+            global_kv_cache_groups,
+            worker_kv_cache_spec,
+            worker_index,
+        )
+
+    @classmethod
+    def finalize_kv_cache_config(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_config,
+        global_kv_cache_groups,
+        worker_kv_cache_spec,
+        worker_index: int,
+    ) -> None:
+        from vllm_ascend.v1.core.kv_cache_placement import (
+            finalize_kv_cache_config,
+        )
+
+        finalize_kv_cache_config(
+            vllm_config,
+            kv_cache_config,
+            global_kv_cache_groups,
+            worker_kv_cache_spec,
+            worker_index,
+        )
 
     @classmethod
     def get_pass_manager_cls(cls) -> str:
@@ -1376,6 +1417,44 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
             "Please set --prefill-context-parallel-size to 1. "
             f"Got prefill_context_parallel_size={parallel_config.prefill_context_parallel_size}."
         )
+
+    kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
+    if kvpp_size > 1:
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError("KVPP is only supported by Ascend Model Runner V2.")
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError("KVPP does not support pipeline parallelism yet.")
+        if parallel_config.prefill_context_parallel_size != 1:
+            raise ValueError("KVPP does not support PCP yet.")
+        if parallel_config.decode_context_parallel_size != 1:
+            raise ValueError("KVPP and DCP cannot be enabled at the same time.")
+        if parallel_config.tensor_parallel_size % kvpp_size != 0:
+            raise ValueError(
+                "tensor_parallel_size must be divisible by kvpp_size, got "
+                f"TP={parallel_config.tensor_parallel_size}, KVPP={kvpp_size}."
+            )
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError("KVPP does not support KV connectors or offload yet.")
+
+        model_config = vllm_config.model_config
+        if not model_config.use_mla or model_config.is_hybrid:
+            raise ValueError("KVPP currently supports only non-hybrid MLA models.")
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None:
+            if speculative_config.method != "mtp":
+                raise ValueError(
+                    "KVPP currently supports speculative decoding only with "
+                    "method='mtp'."
+                )
+            if getattr(
+                speculative_config,
+                "num_speculative_tokens_per_batch_size",
+                None,
+            ):
+                raise ValueError(
+                    "KVPP currently supports only a fixed number of MTP "
+                    "speculative tokens."
+                )
 
     sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
     if sfa_dcp_replicated_indexer:
