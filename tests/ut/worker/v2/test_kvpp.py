@@ -719,6 +719,57 @@ def test_sfa_execution_layers_bundle_main_and_indexer_caches():
     context.leave_layer(attn_layers[0])
 
 
+def test_sfa_cache_bundle_order_is_stable_across_owner_dict_orders():
+    attn_layer = "model.layers.0.self_attn.attn"
+    indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
+    expected_bundle = (attn_layer, indexer_layer)
+
+    plans = []
+    for owners in (
+        {attn_layer: 0, indexer_layer: 0},
+        {indexer_layer: 0, attn_layer: 0},
+    ):
+        scheduler = KVPPScheduler(
+            group=SimpleNamespace(rank_in_group=0, world_size=1),
+            layer_owners=owners,
+            num_blocks=10,
+            block_size=4,
+            execution_layers=(attn_layer,),
+            transport=SimpleNamespace(),
+        )
+        plans.append(scheduler.plan.cache_bundles[attn_layer])
+
+    assert plans == [expected_bundle, expected_bundle]
+
+
+def test_plan_validation_rejects_cross_rank_bundle_order_mismatch():
+    attn_layer = "model.layers.0.self_attn.attn"
+    indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
+    scheduler = KVPPScheduler(
+        group=SimpleNamespace(world_size=2, cpu_group=object()),
+        layer_owners={attn_layer: 0, indexer_layer: 0},
+        num_blocks=10,
+        block_size=4,
+        execution_layers=(attn_layer,),
+        transport=SimpleNamespace(),
+    )
+
+    def gather_mismatched(output, local_signature, group):
+        output[:] = [
+            local_signature,
+            ((attn_layer, 0, (indexer_layer, attn_layer)),),
+        ]
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.kvpp.dist.all_gather_object",
+            side_effect=gather_mismatched,
+        ),
+        pytest.raises(RuntimeError, match="execution plans differ"),
+    ):
+        scheduler._validate_plan_across_ranks()
+
+
 def test_sfa_cache_bundle_rejects_mismatched_owners():
     attn_layer = "model.layers.0.self_attn.attn"
     indexer_layer = "model.layers.0.self_attn.indexer.k_cache"

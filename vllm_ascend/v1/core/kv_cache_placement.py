@@ -75,7 +75,15 @@ def get_kvpp_layer_owners(
     vllm_config: VllmConfig, layer_names: Iterable[str]
 ) -> dict[str, int]:
     kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
-    layer_names = tuple(layer_names)
+    # Workers are separate Python processes and may receive layer names from
+    # sets or differently ordered dictionaries. Keep both owner insertion
+    # order and per-layer cache-bundle order identical on every rank.
+    layer_names = tuple(
+        sorted(
+            layer_names,
+            key=lambda name: (extract_layer_index(name), name),
+        )
+    )
     replicated_layers = _get_replicated_mtp_layers(vllm_config, layer_names)
     layers_by_index: dict[int, list[str]] = defaultdict(list)
     for layer_name in layer_names:

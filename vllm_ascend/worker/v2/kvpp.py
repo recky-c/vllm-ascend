@@ -39,7 +39,10 @@ class KVPPExecutionPlan:
             cache_bundles = {layer_name: (layer_name,) for layer_name in layers}
         else:
             cache_layers_by_index: dict[int, list[str]] = {}
-            for cache_layer_name in layer_owners:
+            for cache_layer_name in sorted(
+                layer_owners,
+                key=lambda name: (extract_layer_index(name), name),
+            ):
                 cache_layers_by_index.setdefault(
                     extract_layer_index(cache_layer_name), []
                 ).append(cache_layer_name)
@@ -210,6 +213,7 @@ class KVPPScheduler:
         self._graph_sync_token: torch.Tensor | None = None
 
     def initialize_transport(self, kv_caches: dict[str, Any]) -> None:
+        self._validate_plan_across_ranks()
         self.transport.initialize(kv_caches)
         if self.group.world_size > 1:
             self._device_id = torch.npu.current_device()
@@ -221,6 +225,36 @@ class KVPPScheduler:
             # point-to-point notification order when layer ownership changes.
             self._executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="kvpp-prefetch"
+            )
+
+    def _validate_plan_across_ranks(self) -> None:
+        """Fail before transport setup if ranks disagree on bundle layout."""
+        if self.group.world_size <= 1:
+            return
+        signature = tuple(
+            (
+                layer_name,
+                self.layer_owners[layer_name],
+                self.plan.cache_bundles[layer_name],
+            )
+            for layer_name in self.plan.layers
+        )
+        peer_signatures: list[Any] = [None] * self.group.world_size
+        dist.all_gather_object(
+            peer_signatures,
+            signature,
+            group=self.group.cpu_group,
+        )
+        mismatched_ranks = [
+            rank
+            for rank, peer_signature in enumerate(peer_signatures)
+            if peer_signature != signature
+        ]
+        if mismatched_ranks:
+            raise RuntimeError(
+                "KVPP execution plans differ across ranks; refusing to start "
+                "with incompatible cache-bundle layouts from ranks "
+                f"{mismatched_ranks}."
             )
 
     @property

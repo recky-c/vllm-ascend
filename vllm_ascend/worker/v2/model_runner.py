@@ -241,11 +241,13 @@ class NPUModelRunner(GPUModelRunner):
     def _initialize_kvpp_scheduler(self) -> None:
         if self.kvpp_size <= 1:
             return
-        layer_names = {
-            layer_name
-            for group in self.kv_cache_config.kv_cache_groups
-            for layer_name in group.layer_names
-        }
+        layer_names = tuple(
+            dict.fromkeys(
+                layer_name
+                for group in self.kv_cache_config.kv_cache_groups
+                for layer_name in group.layer_names
+            )
+        )
         layer_owners = get_kvpp_layer_owners(self.vllm_config, layer_names)
         kvpp_group = get_kvpp_group()
         kvpp_cache_group_index = get_kvpp_managed_group_index(

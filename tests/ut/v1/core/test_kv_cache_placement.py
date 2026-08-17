@@ -44,6 +44,25 @@ def test_owner_plan_keeps_mtp_cache_replicated():
     assert not set(mtp_layers).intersection(owners)
 
 
+def test_owner_plan_order_is_stable_for_reordered_cache_names():
+    attn_layers = [
+        f"model.layers.{index}.self_attn.attn" for index in range(3)
+    ]
+    indexer_layers = [
+        f"model.layers.{index}.self_attn.indexer.k_cache" for index in range(3)
+    ]
+    names = [
+        name
+        for layer_names in zip(attn_layers, indexer_layers)
+        for name in layer_names
+    ]
+
+    forward = get_kvpp_layer_owners(_config(), names)
+    reverse = get_kvpp_layer_owners(_config(), reversed(names))
+
+    assert list(forward.items()) == list(reverse.items())
+
+
 def test_allocation_keeps_two_scratch_caches_per_layout():
     layer_names = [f"model.layers.{index}.self_attn.attn" for index in range(3)]
     spec = _spec()
