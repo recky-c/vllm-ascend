@@ -9,12 +9,14 @@ from vllm_ascend.distributed.parallel_state import (
     _MC2,
     _OTP,
     _P_TP,
+    _KVPP,
     destroy_ascend_model_parallel,
     get_global_rank,
     get_lmhead_tp_group,
     get_mc2_group,
     get_otp_group,
     get_p_tp_group,
+    get_kvpp_group,
     init_ascend_model_parallel,
 )
 
@@ -51,6 +53,7 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
     mock_ascend_config.num_head_replica = 0
     mock_ascend_config.pd_head_ratio = 2
     mock_ascend_config.enable_context_parallel = False
+    mock_ascend_config.kvpp_config.size = 1
     mock_vllm_config = MagicMock()
     mock_vllm_config.kv_transfer_config.is_kv_producer = True
     with (
@@ -66,16 +69,19 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
         lmheadtp_group = get_lmhead_tp_group()
         otp_group = get_otp_group()
         p_tp_group = get_p_tp_group()
+        kvpp_group = get_kvpp_group()
         assert mc2_group is not None
         assert otp_group is not None
         assert lmheadtp_group is not None
         assert p_tp_group is not None
+        assert kvpp_group is not None
 
         destroy_ascend_model_parallel()
         assert _MC2 is None
         assert _LMTP is None
         assert _OTP is None
         assert _P_TP is None
+        assert _KVPP is None
 
 
 def _build_parallel_config(
