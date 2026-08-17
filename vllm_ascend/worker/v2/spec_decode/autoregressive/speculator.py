@@ -90,6 +90,11 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         super().__init__(vllm_config, device)
 
         self.attn_architecture: str | None = None
+        # KVPP draft controller is injected by NPUModelRunner after KV cache
+        # initialization when KVPP owns the MTP/Eagle layers. None when KVPP
+        # is disabled, single-rank, or no speculator is configured.
+        self.kvpp_draft_controller: Any = None
+        self.kvpp_draft_cache_group_index: int | None = None
 
         del self.input_buffers
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
@@ -155,27 +160,57 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         generate_draft.
         """
         self.input_batch = input_batch
-        # wrap build_attn_metadata to use Ascend attention metadata building.
-        # so we can call super().propose() directly.
-        with build_attn_metadata_wrapper(), torch_gather_wrapper():
-            return super().propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings,
-                last_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                num_tokens_across_dp,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                mm_inputs,
-                is_profile=is_profile,
+        # Refresh non-owner MTP/Eagle scratch once for the whole draft batch.
+        # The same scratch is then reused across prefill and every speculative
+        # step; no per-step transfer happens inside super().propose().
+        draft_ctrl = self.kvpp_draft_controller
+        draft_started = draft_ctrl is not None and not skip_attn_for_dummy_run
+        try:
+            if draft_started:
+                draft_block_table = self._kvpp_draft_block_table()
+                draft_ctrl.begin_batch(
+                    draft_block_table,
+                    input_batch.seq_lens_np[: input_batch.num_reqs],
+                )
+            # wrap build_attn_metadata to use Ascend attention metadata building.
+            # so we can call super().propose() directly.
+            with build_attn_metadata_wrapper(), torch_gather_wrapper():
+                return super().propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    num_tokens_across_dp,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    mm_inputs,
+                    is_profile=is_profile,
+                )
+        except BaseException:
+            if draft_started:
+                draft_ctrl.abort_batch()
+            raise
+        finally:
+            if draft_started:
+                draft_ctrl.finish_batch()
+
+    def _kvpp_draft_block_table(self) -> torch.Tensor:
+        """Return the block table for the KVPP-managed draft KV cache group."""
+        assert self.block_tables is not None
+        draft_group_index = self.kvpp_draft_cache_group_index
+        if draft_group_index is None:
+            raise RuntimeError(
+                "KVPP draft block table requested but no draft KV cache group "
+                "is configured."
             )
+        return self.block_tables.block_tables[draft_group_index].gpu
 
     def set_attn(
         self,

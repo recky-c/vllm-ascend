@@ -82,10 +82,17 @@ class KVPPExecutionPlan:
         return cls(cache_bundles=cache_bundles)
 
 
-def get_kvpp_managed_group_index(
+def get_kvpp_managed_group_indices(
     kv_cache_groups: list[Any],
     layer_owners: dict[str, int],
-) -> int:
+) -> tuple[int, int | None]:
+    """Return (target_group_index, draft_group_index) for KVPP-managed groups.
+
+    Target KVPP layers must all live in one group. Draft (MTP/Eagle) layers
+    may live in a separate ``is_eagle_group`` group, or absent when no
+    speculator is configured. Each managed layer must belong to exactly one
+    of these two groups.
+    """
     managed_layers = set(layer_owners)
     configured_layers = {
         layer_name
@@ -99,18 +106,37 @@ def get_kvpp_managed_group_index(
             f"{sorted(missing_layers)}."
         )
 
-    managed_group_indices = {
-        index
-        for index, group in enumerate(kv_cache_groups)
-        if managed_layers.intersection(group.layer_names)
-    }
-    if len(managed_group_indices) != 1:
+    target_indices: set[int] = set()
+    draft_indices: set[int] = set()
+    for index, group in enumerate(kv_cache_groups):
+        if not managed_layers.intersection(group.layer_names):
+            continue
+        if getattr(group, "is_eagle_group", False):
+            draft_indices.add(index)
+        else:
+            target_indices.add(index)
+
+    if len(target_indices) != 1:
         raise ValueError(
             "KVPP currently requires all managed Target KV layers to use "
-            "one KV cache group, but found managed groups "
-            f"{sorted(managed_group_indices)}."
+            "one KV cache group, but found managed Target groups "
+            f"{sorted(target_indices)}."
         )
-    return managed_group_indices.pop()
+    if len(draft_indices) > 1:
+        raise ValueError(
+            "KVPP found multiple managed draft KV cache groups: "
+            f"{sorted(draft_indices)}."
+        )
+    return target_indices.pop(), (draft_indices.pop() if draft_indices else None)
+
+
+def get_kvpp_managed_group_index(
+    kv_cache_groups: list[Any],
+    layer_owners: dict[str, int],
+) -> int:
+    """Legacy single-group accessor; see ``get_kvpp_managed_group_indices``."""
+    target_index, _ = get_kvpp_managed_group_indices(kv_cache_groups, layer_owners)
+    return target_index
 
 
 def _active_pages(
@@ -513,6 +539,138 @@ class KVPPScheduler:
             self._executor.shutdown(wait=True)
             self._executor = None
         self.transport.close()
+
+
+class KVPPDraftPhase(Enum):
+    IDLE = auto()
+    BATCH_ACTIVE = auto()
+
+
+class KVPPDraftController:
+    """Batch-level KV refresh for MTP/Eagle draft layers under KVPP.
+
+    Unlike :class:`KVPPScheduler` (Target layers, per-layer streaming with
+    dual rotating scratch), the draft controller refreshes every non-owner
+    draft KV cache **once per ``propose()``**, synchronously, before the
+    first MTP attention. The same scratch is then read and written by the
+    prefill and every speculative step; no further transfer happens until
+    the next batch. Owner ranks write new KV directly to persistent cache;
+    non-owner ranks write to their per-layer dedicated scratch. Nothing is
+    written back from scratch to owner at batch end.
+    """
+
+    def __init__(
+        self,
+        group: GroupCoordinator,
+        layer_owners: dict[str, int],
+        draft_layer_names: tuple[str, ...],
+        num_blocks: int,
+        block_size: int,
+        transport: MemFabricMTEKVPPTransport,
+    ) -> None:
+        if not draft_layer_names:
+            raise ValueError("KVPPDraftController requires at least one draft layer.")
+        self.group = group
+        self.layer_owners = layer_owners
+        self.draft_layer_names = draft_layer_names
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.transport = transport
+        self._phase = KVPPDraftPhase.IDLE
+        self._active_pages: KVPPActivePages | None = None
+        self._graph_sync_token: torch.Tensor | None = None
+
+    def initialize(self) -> None:
+        if self.group.world_size > 1:
+            self._graph_sync_token = torch.zeros(
+                1, dtype=torch.int32, device="npu"
+            )
+
+    def begin_batch(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: Any,
+    ) -> None:
+        """Refresh every non-owner draft scratch once for this batch.
+
+        Synchronous: returns only after owner pushes are remotely visible on
+        the current stream. Owners and single-rank groups no-op.
+        """
+        if self._phase is not KVPPDraftPhase.IDLE:
+            raise RuntimeError(
+                f"KVPP draft batch already active (phase={self._phase.name})."
+            )
+        if self.group.world_size <= 1:
+            self._phase = KVPPDraftPhase.BATCH_ACTIVE
+            return
+
+        pages = _active_pages(
+            block_table, seq_lens, self.block_size, self.num_blocks
+        )
+        self._active_pages = pages
+        self._phase = KVPPDraftPhase.BATCH_ACTIVE
+
+        if torch.npu.is_current_stream_capturing():
+            self._run_graph_refresh(pages)
+        else:
+            self._run_eager_refresh(pages)
+
+    def _run_eager_refresh(self, pages: KVPPActivePages) -> None:
+        stream = torch.npu.current_stream()
+        comm_stream = torch.npu.Stream()
+        comm_stream.wait_stream(stream)
+        local_rank = self.group.rank_in_group
+        with torch.npu.stream(comm_stream):
+            for layer_name in self.draft_layer_names:
+                owner_rank = self.layer_owners[layer_name]
+                bundle = (layer_name,)
+                if local_rank == owner_rank:
+                    completion = self.transport.push_active_bundle(
+                        bundle, pages, comm_stream
+                    )
+                else:
+                    completion = self.transport.receive_active_bundle(
+                        bundle, pages, comm_stream
+                    )
+                completion.wait()
+        stream.wait_stream(comm_stream)
+
+    def _run_graph_refresh(self, pages: KVPPActivePages) -> None:
+        if self._graph_sync_token is None or self.group.device_group is None:
+            raise RuntimeError(
+                "KVPP draft graph synchronization was not initialized."
+            )
+        stream = torch.npu.current_stream()
+        local_rank = self.group.rank_in_group
+        for layer_name in self.draft_layer_names:
+            owner_rank = self.layer_owners[layer_name]
+            bundle = (layer_name,)
+            dist.all_reduce(
+                self._graph_sync_token, group=self.group.device_group
+            )
+            if local_rank == owner_rank:
+                self.transport.push_active_bundle(bundle, pages, stream)
+            dist.all_reduce(
+                self._graph_sync_token, group=self.group.device_group
+            )
+            if local_rank != owner_rank:
+                self.transport.receive_active_bundle(bundle, pages, stream)
+
+    def finish_batch(self) -> None:
+        """End the draft batch. Scratch is discarded; nothing written back."""
+        if self._phase is KVPPDraftPhase.IDLE:
+            return
+        self._active_pages = None
+        self._phase = KVPPDraftPhase.IDLE
+
+    def abort_batch(self) -> None:
+        """Recover after a failed/aborted propose."""
+        self._active_pages = None
+        self._phase = KVPPDraftPhase.IDLE
+
+    def close(self) -> None:
+        """Release only local state. Transport is owned by the Target scheduler."""
+        self.abort_batch()
 
 
 class KVPPGraphCaptureController:

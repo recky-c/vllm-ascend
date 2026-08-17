@@ -64,9 +64,11 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import (
+    KVPPDraftController,
     KVPPGraphCaptureController,
     KVPPScheduler,
     get_kvpp_managed_group_index,
+    get_kvpp_managed_group_indices,
 )
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 from vllm_ascend.worker.v2.sp_utils import (
@@ -134,7 +136,9 @@ class NPUModelRunner(GPUModelRunner):
         self.ascend_config = get_ascend_config()
         self.kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
         self.kvpp_scheduler: KVPPScheduler | None = None
+        self.kvpp_draft_controller: KVPPDraftController | None = None
         self.kvpp_cache_group_index: int | None = None
+        self.kvpp_draft_cache_group_index: int | None = None
         self._kvpp_kv_caches: dict[str, Any] | None = None
         self.kvpp_graph_controller: KVPPGraphCaptureController | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
@@ -248,41 +252,59 @@ class NPUModelRunner(GPUModelRunner):
         }
         layer_owners = get_kvpp_layer_owners(self.vllm_config, layer_names)
         kvpp_group = get_kvpp_group()
-        kvpp_cache_group_index = get_kvpp_managed_group_index(
+        target_group_index, draft_group_index = get_kvpp_managed_group_indices(
             self.kv_cache_config.kv_cache_groups, layer_owners
         )
-        self.kvpp_cache_group_index = kvpp_cache_group_index
+        self.kvpp_cache_group_index = target_group_index
+        self.kvpp_draft_cache_group_index = draft_group_index
 
         if self.speculator is not None:
             draft_layer_names = self.speculator.draft_attn_layer_names or set()
             managed_draft_layers = set(layer_owners).intersection(
                 draft_layer_names
             )
-            if managed_draft_layers:
+            if not managed_draft_layers:
                 raise RuntimeError(
-                    "MTP attention layers must be replicated outside KVPP, "
-                    "but these layers have KVPP owners: "
-                    f"{sorted(managed_draft_layers)}."
+                    "KVPP expects MTP/Eagle attention layers to participate in "
+                    "layer ownership, but none of the draft layers "
+                    f"({sorted(draft_layer_names)}) have KVPP owners."
                 )
 
         blocks_per_kv_block = self.block_tables.blocks_per_kv_block[
-            kvpp_cache_group_index
+            target_group_index
         ]
         num_kernel_blocks = self.kv_cache_config.num_blocks * blocks_per_kv_block
         block_size = self.block_tables.kernel_block_sizes[
-            kvpp_cache_group_index
+            target_group_index
         ]
-        kvpp_impls: dict[str, Any] = {}
+
+        draft_layer_names: tuple[str, ...] = ()
+        if draft_group_index is not None:
+            draft_layer_names = tuple(
+                name
+                for name in self.kv_cache_config.kv_cache_groups[
+                    draft_group_index
+                ].layer_names
+                if name in layer_owners
+            )
+
+        target_impls: dict[str, Any] = {}
+        draft_impls: dict[str, Any] = {}
+        draft_layer_set = set(draft_layer_names)
         for layer_name, module in self.compilation_config.static_forward_context.items():
             if layer_name not in layer_owners:
                 continue
             impl = getattr(module, "impl", None)
-            if impl is not None and hasattr(impl, "layerwise_kv_cache_hook"):
-                kvpp_impls[layer_name] = impl
-        if not kvpp_impls:
+            if impl is None or not hasattr(impl, "layerwise_kv_cache_hook"):
+                continue
+            if layer_name in draft_layer_set:
+                draft_impls[layer_name] = impl
+            else:
+                target_impls[layer_name] = impl
+        if not target_impls:
             raise RuntimeError(
                 "KVPP did not find an MLA or SFA attention implementation to "
-                "drive layer transfers."
+                "drive Target layer transfers."
             )
 
         transport = MemFabricMTEKVPPTransport(
@@ -294,8 +316,34 @@ class NPUModelRunner(GPUModelRunner):
             num_blocks=num_kernel_blocks,
             block_size=block_size,
             transport=transport,
-            execution_layers=tuple(kvpp_impls),
+            execution_layers=tuple(target_impls),
         )
+
+        draft_controller: KVPPDraftController | None = None
+        if draft_impls:
+            if draft_group_index is None:
+                raise RuntimeError(
+                    "KVPP found draft attention layers but no draft KV cache "
+                    "group. MTP/Eagle layers must live in an is_eagle_group."
+                )
+            draft_blocks_per_kv_block = self.block_tables.blocks_per_kv_block[
+                draft_group_index
+            ]
+            draft_num_blocks = (
+                self.kv_cache_config.num_blocks * draft_blocks_per_kv_block
+            )
+            draft_block_size = self.block_tables.kernel_block_sizes[
+                draft_group_index
+            ]
+            draft_controller = KVPPDraftController(
+                group=kvpp_group,
+                layer_owners=layer_owners,
+                draft_layer_names=tuple(draft_impls),
+                num_blocks=draft_num_blocks,
+                block_size=draft_block_size,
+                transport=transport,
+            )
+
         if self._kvpp_kv_caches is None:
             raise RuntimeError("KVPP cache tensors were not retained during allocation.")
         managed_kv_caches = {
@@ -303,16 +351,27 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in layer_owners
         }
         kvpp_scheduler.initialize_transport(managed_kv_caches)
+        if draft_controller is not None:
+            draft_controller.initialize()
         self._kvpp_kv_caches = None
         self.kvpp_scheduler = kvpp_scheduler
+        self.kvpp_draft_controller = draft_controller
         self.kvpp_graph_controller = KVPPGraphCaptureController(
-            kvpp_scheduler, kvpp_cache_group_index
+            kvpp_scheduler, target_group_index
         )
         # FULL graph capture creates dummy attention inputs through model_state
         # instead of this runner's prepare_dummy_attn method.
         self.model_state.kvpp_capture_stage = self.stage_kvpp_graph_capture
-        for impl in kvpp_impls.values():
+        # Target attention layers drive the per-layer streaming hook. Draft
+        # layers intentionally do NOT bind it: their KV refresh is batch-level
+        # and owned by KVPPDraftController, invoked from the speculator.
+        for impl in target_impls.values():
             impl.layerwise_kv_cache_hook = kvpp_scheduler
+        # Inject the draft controller into the speculator so its propose()
+        # wrapper can refresh non-owner MTP/Eagle scratch once per batch.
+        if draft_controller is not None and self.speculator is not None:
+            self.speculator.kvpp_draft_controller = draft_controller
+            self.speculator.kvpp_draft_cache_group_index = draft_group_index
 
     def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
         if self.kvpp_size > 1:
@@ -725,6 +784,9 @@ class NPUModelRunner(GPUModelRunner):
         if self.kvpp_scheduler is not None:
             self.kvpp_scheduler.close()
             self.kvpp_scheduler = None
+        if self.kvpp_draft_controller is not None:
+            self.kvpp_draft_controller.close()
+            self.kvpp_draft_controller = None
         super().shutdown()
 
     def _pad_query_start_loc_for_fia(

@@ -12,21 +12,48 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
     _MTEDeviceBufferMetadata,
 )
 from vllm_ascend.worker.v2.kvpp import (
+    KVPPDraftController,
     KVPPGraphCaptureController,
     KVPPScheduler,
     _active_pages,
     get_kvpp_managed_group_index,
+    get_kvpp_managed_group_indices,
 )
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 
-def test_managed_group_allows_replicated_mtp_groups():
+def test_managed_groups_split_target_and_draft():
+    """Target layers live in one group; MTP/Eagle in a separate is_eagle_group."""
     groups = [
-        SimpleNamespace(layer_names=["target.0", "mtp.4"]),
-        SimpleNamespace(layer_names=["mtp.5"]),
+        SimpleNamespace(layer_names=["target.0", "target.1"], is_eagle_group=False),
+        SimpleNamespace(layer_names=["mtp.4"], is_eagle_group=True),
     ]
+    owners = {"target.0": 0, "target.1": 1, "mtp.4": 1}
 
-    assert get_kvpp_managed_group_index(groups, {"target.0": 0}) == 0
+    target_index, draft_index = get_kvpp_managed_group_indices(groups, owners)
+    assert target_index == 0
+    assert draft_index == 1
+
+
+def test_managed_groups_allow_no_draft_group():
+    """Without a speculator there is no draft group; only Target is managed."""
+    groups = [
+        SimpleNamespace(layer_names=["target.0"], is_eagle_group=False),
+    ]
+    owners = {"target.0": 0}
+
+    target_index, draft_index = get_kvpp_managed_group_indices(groups, owners)
+    assert target_index == 0
+    assert draft_index is None
+
+
+def test_legacy_single_group_accessor_still_returns_target():
+    groups = [
+        SimpleNamespace(layer_names=["target.0"], is_eagle_group=False),
+        SimpleNamespace(layer_names=["mtp.4"], is_eagle_group=True),
+    ]
+    owners = {"target.0": 0, "mtp.4": 0}
+    assert get_kvpp_managed_group_index(groups, owners) == 0
 
 
 def test_model_runner_bridges_full_graph_capture_lifecycle():
@@ -157,6 +184,99 @@ def test_managed_group_rejects_target_layers_across_groups():
             groups,
             {"target.0": 0, "target.1": 1},
         )
+
+
+def test_draft_controller_single_rank_skips_transport():
+    """With world_size=1 begin_batch is a no-op; finish is always safe."""
+    transport = MagicMock()
+    controller = KVPPDraftController(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners={"mtp.4": 0},
+        draft_layer_names=("mtp.4",),
+        num_blocks=4,
+        block_size=4,
+        transport=transport,
+    )
+    controller.initialize()
+
+    block_table = torch.zeros((1, 2), dtype=torch.int32)
+    seq_lens = torch.tensor([1])
+    controller.begin_batch(block_table, seq_lens)
+    controller.finish_batch()
+
+    transport.push_active_bundle.assert_not_called()
+    transport.receive_active_bundle.assert_not_called()
+
+
+def test_draft_controller_owner_pushes_once_per_batch():
+    """Owner rank pushes each draft layer exactly once per begin_batch."""
+    transport = MagicMock()
+    transport.push_active_bundle.return_value = MagicMock(wait=MagicMock())
+    controller = KVPPDraftController(
+        group=SimpleNamespace(rank_in_group=0, world_size=2),
+        layer_owners={"mtp.4": 0},
+        draft_layer_names=("mtp.4",),
+        num_blocks=4,
+        block_size=4,
+        transport=transport,
+    )
+    controller.initialize()
+
+    block_table = torch.tensor([[1, 2]], dtype=torch.int32)
+    seq_lens = torch.tensor([5])
+    with patch("vllm_ascend.worker.v2.kvpp.torch.npu.Stream"), \
+         patch("vllm_ascend.worker.v2.kvpp.torch.npu.current_stream"):
+        controller.begin_batch(block_table, seq_lens)
+
+    assert transport.push_active_bundle.call_count == 1
+    transport.receive_active_bundle.assert_not_called()
+    controller.finish_batch()
+
+
+def test_draft_controller_non_owner_receives_once_per_batch():
+    """Non-owner rank receives each draft layer exactly once per begin_batch."""
+    transport = MagicMock()
+    transport.receive_active_bundle.return_value = MagicMock(wait=MagicMock())
+    controller = KVPPDraftController(
+        group=SimpleNamespace(rank_in_group=1, world_size=2),
+        layer_owners={"mtp.4": 0},
+        draft_layer_names=("mtp.4",),
+        num_blocks=4,
+        block_size=4,
+        transport=transport,
+    )
+    controller.initialize()
+
+    block_table = torch.tensor([[1, 2]], dtype=torch.int32)
+    seq_lens = torch.tensor([5])
+    with patch("vllm_ascend.worker.v2.kvpp.torch.npu.Stream"), \
+         patch("vllm_ascend.worker.v2.kvpp.torch.npu.current_stream"):
+        controller.begin_batch(block_table, seq_lens)
+
+    assert transport.receive_active_bundle.call_count == 1
+    transport.push_active_bundle.assert_not_called()
+    controller.finish_batch()
+
+
+def test_draft_controller_abort_resets_to_idle():
+    transport = MagicMock()
+    controller = KVPPDraftController(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners={"mtp.4": 0},
+        draft_layer_names=("mtp.4",),
+        num_blocks=4,
+        block_size=4,
+        transport=transport,
+    )
+    controller.initialize()
+    controller._phase = controller._phase.BATCH_ACTIVE
+    controller._active_pages = object()
+
+    controller.abort_batch()
+
+    from vllm_ascend.worker.v2.kvpp import KVPPDraftPhase
+    assert controller._phase is KVPPDraftPhase.IDLE
+    assert controller._active_pages is None
 
 
 def test_active_pages_uses_only_pages_covered_by_sequence_lengths():

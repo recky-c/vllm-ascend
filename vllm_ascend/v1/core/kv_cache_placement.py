@@ -42,45 +42,21 @@ def project_kv_cache_groups_to_worker(
     return projected_groups
 
 
-def _get_replicated_mtp_layers(
-    vllm_config: VllmConfig, layer_names: Iterable[str]
-) -> set[str]:
-    speculative_config = vllm_config.speculative_config
-    if speculative_config is None or speculative_config.method != "mtp":
-        return set()
-
-    hf_config = vllm_config.model_config.hf_config
-    mtp_start = getattr(hf_config, "num_hidden_layers", None)
-    num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", None)
-    if mtp_start is None or not num_mtp_layers:
-        raise ValueError(
-            "KVPP with MTP requires num_hidden_layers and a positive "
-            "num_nextn_predict_layers in the model config."
-        )
-
-    mtp_end = mtp_start + num_mtp_layers
-    replicated_layers = {
-        layer_name
-        for layer_name in layer_names
-        if mtp_start <= extract_layer_index(layer_name) < mtp_end
-    }
-    if not replicated_layers:
-        raise ValueError(
-            "KVPP could not identify any MTP KV-cache layers to replicate."
-        )
-    return replicated_layers
-
-
 def get_kvpp_layer_owners(
     vllm_config: VllmConfig, layer_names: Iterable[str]
 ) -> dict[str, int]:
+    """Assign every KVPP-managed layer (Target and MTP/Eagle) to one owner.
+
+    MTP/Eagle layers participate in ownership partition exactly like Target
+    layers. The Target/Draft distinction is expressed by ``is_eagle_group`` on
+    ``KVCacheGroupSpec`` and handled by the allocation/transport layers, not by
+    excluding draft layers here.
+    """
     kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
     layer_names = tuple(layer_names)
-    replicated_layers = _get_replicated_mtp_layers(vllm_config, layer_names)
     layers_by_index: dict[int, list[str]] = defaultdict(list)
     for layer_name in layer_names:
-        if layer_name not in replicated_layers:
-            layers_by_index[extract_layer_index(layer_name)].append(layer_name)
+        layers_by_index[extract_layer_index(layer_name)].append(layer_name)
 
     layer_indices = sorted(layers_by_index)
     if len(layer_indices) < kvpp_size:
@@ -107,6 +83,14 @@ def _get_allocation_groups(
     owners: dict[str, int],
     kvpp_rank: int,
 ) -> tuple[list[KVCacheGroupSpec], dict[str, list[str]]]:
+    """Allocate persistent + scratch caches for every KVPP-managed group.
+
+    Target groups use two alternating scratch caches so layer N+1 can be
+    prefetched while layer N attention still runs. Draft (MTP/Eagle) groups
+    give each non-owner managed layer its own scratch, because draft KV must
+    stay live across the whole ``propose()`` (prefill + all speculative steps)
+    and cannot be rotated like Target layers.
+    """
     allocation_spec: dict[str, KVCacheSpec] = {}
     scratch_aliases: dict[str, list[str]] = {}
 
@@ -118,23 +102,35 @@ def _get_allocation_groups(
             for name in local_names
             if name not in owners or owners[name] == kvpp_rank
         ]
-        scratch_layout_groups: list[list[str]] = []
-        for name in managed_names:
-            if owners[name] == kvpp_rank:
-                continue
+
+        if getattr(group, "is_eagle_group", False):
+            # Draft layers: one dedicated scratch per non-owner layer.
+            for name in managed_names:
+                if owners[name] == kvpp_rank:
+                    continue
+                allocation_names.append(name)
+                scratch_aliases[name] = [name]
+        else:
+            # Target layers: two scratch caches rotated across layers of the
+            # same spec, so layer N+1 can be filled while layer N runs.
+            scratch_layout_groups: list[list[str]] = []
+            for name in managed_names:
+                if owners[name] == kvpp_rank:
+                    continue
+                for layout_names in scratch_layout_groups:
+                    if worker_spec[name] == worker_spec[layout_names[0]]:
+                        layout_names.append(name)
+                        break
+                else:
+                    scratch_layout_groups.append([name])
             for layout_names in scratch_layout_groups:
-                if worker_spec[name] == worker_spec[layout_names[0]]:
-                    layout_names.append(name)
-                    break
-            else:
-                scratch_layout_groups.append([name])
-        for layout_names in scratch_layout_groups:
-            scratch_names = layout_names[:2]
-            allocation_names.extend(scratch_names)
-            for scratch_index, scratch_name in enumerate(scratch_names):
-                scratch_aliases[scratch_name] = layout_names[
-                    scratch_index :: len(scratch_names)
-                ]
+                scratch_names = layout_names[:2]
+                allocation_names.extend(scratch_names)
+                for scratch_index, scratch_name in enumerate(scratch_names):
+                    scratch_aliases[scratch_name] = layout_names[
+                        scratch_index :: len(scratch_names)
+                    ]
+
         for layer_name in allocation_names:
             allocation_spec[layer_name] = worker_spec[layer_name]
 
