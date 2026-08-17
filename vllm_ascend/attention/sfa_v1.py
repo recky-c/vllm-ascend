@@ -23,6 +23,7 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.layerwise_cache import LayerwiseKVCacheHook
 from vllm_ascend.attention.mla_v1 import MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
@@ -477,6 +478,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.q_b_proj = kwargs["q_b_proj"]
         self.skip_topk = kwargs.get("skip_topk", False)
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
+        # Optional platform service injected by the model runner. Attention
+        # stays independent of KVPP scheduling and the concrete transport.
+        self.layerwise_kv_cache_hook: LayerwiseKVCacheHook | None = None
 
         ascend_config = get_ascend_config()
         self.vllm_config = get_current_vllm_config()
@@ -1152,9 +1156,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
 
+        cos, sin = self._indexer_rope_for_tokens(
+            cos,
+            sin,
+            k_li.shape[0],
+        )
+
         if HAS_TRITON:
-            cos = cos.view(-1, self.qk_rope_head_dim)
-            sin = sin.view(-1, self.qk_rope_head_dim)
             k_li = rope_forward_triton_siso(
                 k_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
             )
@@ -1181,6 +1189,33 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li_scale = None
 
         return k_li, k_li_scale
+
+    def _indexer_rope_for_tokens(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Remove runner padding from LI rotary tensors.
+
+        v2 metadata may retain a padded ``num_input_tokens`` extent while the
+        lightning-indexer projection contains only the actual model tokens.
+        The padding is always at the tail, so preserve the original token
+        order and reject undersized or inconsistent rotary inputs.
+        """
+        cos = cos.reshape(-1, self.qk_rope_head_dim)
+        sin = sin.reshape(-1, self.qk_rope_head_dim)
+        if cos.shape != sin.shape:
+            raise RuntimeError(
+                "SFA indexer cos/sin shapes must match, "
+                f"got cos={tuple(cos.shape)} and sin={tuple(sin.shape)}."
+            )
+        if cos.shape[0] < num_tokens:
+            raise RuntimeError(
+                "SFA indexer rotary metadata has fewer tokens than the "
+                f"projection: rope_tokens={cos.shape[0]}, projection_tokens={num_tokens}."
+            )
+        return cos[:num_tokens], sin[:num_tokens]
 
     def indexer_select_post_process(
         self,
@@ -1230,6 +1265,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             q_li, _ = self.wq_b(q_c)
         q_li = q_li.view(-1, self.n_head, self.head_dim)
+        cos, sin = self._indexer_rope_for_tokens(
+            cos,
+            sin,
+            q_li.shape[0],
+        )
         if HAS_TRITON:
             q_li = rope_forward_triton_siso(
                 q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
@@ -1239,6 +1279,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
             )
 
+            cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
+            sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
             q_li_pe = q_li_pe.unsqueeze(2)
             q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
             q_li_pe = q_li_pe.squeeze(2)
@@ -1492,6 +1534,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        if self.layerwise_kv_cache_hook is not None:
+            self.layerwise_kv_cache_hook.enter_layer(layer_name)
         composed_kv_cache = self._compose_sfa_kv_cache(kv_cache)
         assert composed_kv_cache is not None
         kv_cache = composed_kv_cache
@@ -1535,6 +1579,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 k_li, k_li_scale = None, None
             wait_for_kv_layer_from_connector(layer_name)
+            if self.layerwise_kv_cache_hook is not None:
+                # The fused preprocess is the first operation that may read or
+                # update the paged SFA and LI caches.
+                self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
 
             if fused_type == PreprocessType.PROLOG_V3:
                 hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_prolog_v3(
@@ -1575,6 +1623,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 k_li, k_li_scale = None, None
 
             wait_for_kv_layer_from_connector(layer_name)
+            if self.layerwise_kv_cache_hook is not None:
+                # Q/KV and lightning-indexer projections above overlap the
+                # active-page transfer. Wait only before the first cache write.
+                self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
 
             kv_outputs = self.exec_kv(
                 kv_no_split,
@@ -1701,6 +1753,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
+        if self.layerwise_kv_cache_hook is not None:
+            # The sparse attention kernel has consumed historical SFA and LI
+            # pages. The next transformer layer already uses the other scratch
+            # bundle and can continue transferring through v_up/o_proj/MoE.
+            self.layerwise_kv_cache_hook.leave_layer(layer_name)
 
         attn_output = self._v_up_proj(attn_output)
 
