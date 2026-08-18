@@ -175,19 +175,39 @@ class KVPPPhase(Enum):
 
 
 @dataclass
-class _GraphScratchSlot:
-    """Per-scratch-slot device-side dependency events for graph capture.
+class KVPPGraphLayerEvents:
+    """Per-layer device-side events for the Barrier Bridge graph path.
 
-    ``scratch_free_event`` is recorded on the compute stream when a layer
-    finishes reading its scratch, and waited on by the comm stream before the
-    next layer reuses the same scratch buffer.
+    The capture stream records ``push_start`` after the READY barrier and
+    ``recv_start`` after the DONE barrier; the comm stream waits on them before
+    launching the MTE push/receive. The comm stream records ``push_done`` /
+    ``recv_done`` when the MTE transfer completes; the capture stream waits on
+    them before the DONE barrier (push_done) and before attention (recv_done).
 
-    ``kv_ready_event`` is recorded on the comm stream when the KV transfer for
-    a layer completes, and waited on by the compute stream before attention.
+    This establishes the cross-rank happens-before chain required for
+    correctness::
+
+        OWNER PUSH -> push_done -> capture wait -> DONE BARRIER
+                    -> recv_start -> NON-OWNER RECEIVE
     """
 
-    scratch_free_event: Any
-    kv_ready_event: Any
+    push_start: Any
+    push_done: Any
+    recv_start: Any
+    recv_done: Any
+
+
+@dataclass
+class KVPPGraphResources:
+    """Per-graph-capacity event bundle (doc section 22).
+
+    Each captured graph (one per request capacity) owns an independent set of
+    layer events so alternating replays of different-capacity graphs do not
+    share state.
+    """
+
+    layer_events: dict[str, KVPPGraphLayerEvents]
+    retained_completions: list[Any]
 
 
 class KVPPScheduler:
@@ -227,7 +247,7 @@ class KVPPScheduler:
         self._pending_layer: str | None = None
         self._device_id: int | None = None
         self._graph_sync_token: torch.Tensor | None = None
-        self._graph_slots: tuple[_GraphScratchSlot, ...] = ()
+        self._active_graph_resources: KVPPGraphResources | None = None
 
     def initialize_transport(self, kv_caches: dict[str, Any]) -> None:
         self._validate_plan_across_ranks()
@@ -242,15 +262,6 @@ class KVPPScheduler:
             # point-to-point notification order when layer ownership changes.
             self._executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="kvpp-prefetch"
-            )
-            # Pre-create the two scratch-slot event pairs used by the graph
-            # path so capture never allocates a new event mid-graph.
-            self._graph_slots = tuple(
-                _GraphScratchSlot(
-                    scratch_free_event=torch.npu.Event(),
-                    kv_ready_event=torch.npu.Event(),
-                )
-                for _ in range(2)
             )
 
     def _validate_plan_across_ranks(self) -> None:
@@ -340,6 +351,42 @@ class KVPPScheduler:
         self._selected_pages = None
         self._phase = KVPPPhase.IDLE
 
+    def create_graph_resources(self) -> KVPPGraphResources:
+        """Allocate per-layer events for one graph capture (doc section 33).
+
+        Events are created before capture begins and reused across replays of
+        the same graph. Different graph capacities get independent resources.
+        """
+        layer_events: dict[str, KVPPGraphLayerEvents] = {}
+        for layer_name in self.plan.layers:
+            layer_events[layer_name] = KVPPGraphLayerEvents(
+                push_start=torch.npu.Event(),
+                push_done=torch.npu.Event(),
+                recv_start=torch.npu.Event(),
+                recv_done=torch.npu.Event(),
+            )
+        return KVPPGraphResources(
+            layer_events=layer_events,
+            retained_completions=[],
+        )
+
+    def set_active_graph_resources(
+        self, resources: KVPPGraphResources
+    ) -> None:
+        """Bind the resources for the graph currently being captured/replayed."""
+        self._active_graph_resources = resources
+
+    def clear_active_graph_resources(self) -> None:
+        """Unbind graph resources after capture/replay ends."""
+        self._active_graph_resources = None
+
+    def _require_active_graph_resources(self) -> KVPPGraphResources:
+        if self._active_graph_resources is None:
+            raise RuntimeError(
+                "KVPP graph resources were not set before graph capture/replay."
+            )
+        return self._active_graph_resources
+
     def enter_layer(self, layer_name: str) -> None:
         """Start owner page pushes while Q/KV projection runs on compute."""
         if self._selected_pages is None:
@@ -372,6 +419,14 @@ class KVPPScheduler:
                 f"{layer_name}."
             )
 
+        if torch.npu.is_current_stream_capturing():
+            # Graph path: _start_prefetch only started the push. Finish the
+            # push, run the DONE barrier, and start the receive here so the
+            # receive overlaps with this layer's Q/KV projection.
+            pages = self._selected_pages
+            assert pages is not None
+            self._graph_finish_push_start_receive(layer_name, pages)
+
     def wait_for_layer(self, layer_name: str) -> None:
         """Order cache use, then prefetch the next layer before attention."""
         if (
@@ -385,12 +440,12 @@ class KVPPScheduler:
             )
 
         if torch.npu.is_current_stream_capturing():
-            # Graph path: establish a pure device-side dependency. The
-            # compute stream waits for the comm stream's kv_ready_event
-            # before submitting attention kernels. No host synchronization.
-            layer_index = extract_layer_index(layer_name)
-            slot = self._graph_slots[layer_index % 2]
-            torch.npu.current_stream().wait_event(slot.kv_ready_event)
+            # Graph path: wait for the receive to complete on the comm stream
+            # before attention reads the KV. The push for this layer was
+            # started in the previous layer's wait_for_layer (or in
+            # _start_prefetch for layer 0), and the receive was started in
+            # enter_layer. Now we wait for recv_done.
+            self._graph_wait_receive(layer_name)
         elif self._transfer_future is not None:
             # Eager path: this blocks only for the residual transfer time
             # because this layer was prefetched while the preceding layer
@@ -418,9 +473,11 @@ class KVPPScheduler:
         before this attention. Compute-stream ordering protects reuse when the
         buffer cycles back two layers later.
 
-        In graph capture, this also records ``scratch_free_event`` on the
-        compute stream so the comm stream's next use of the same slot is
-        ordered after this attention finishes reading it.
+        Barrier Bridge graph path: no extra synchronization is needed here.
+        Scratch reuse safety is guaranteed naturally because receive(Layer i+2)
+        only starts at enter_layer(i+2), by which time Layer i's attention has
+        long finished (doc section 17). The next layer's PUSH only writes
+        remote staging, not local scratch (doc section 17).
         """
         if (
             self._phase is not KVPPPhase.LAYER_WAITED
@@ -430,11 +487,6 @@ class KVPPScheduler:
                 f"KVPP attention for layer {layer_name} finished before its "
                 "transfer was consumed."
             )
-
-        if torch.npu.is_current_stream_capturing() and self._graph_slots:
-            layer_index = extract_layer_index(layer_name)
-            slot = self._graph_slots[layer_index % 2]
-            slot.scratch_free_event.record(torch.npu.current_stream())
 
         self._current_layer = None
         self._phase = KVPPPhase.FORWARD_ACTIVE
@@ -452,7 +504,12 @@ class KVPPScheduler:
             raise RuntimeError("KVPP prefetch worker was not initialized.")
 
         if torch.npu.is_current_stream_capturing():
-            self._run_graph_prefetch(layer_name, self._selected_pages)
+            # Graph path: only start the push. The push is launched on the
+            # comm stream and overlaps with the previous layer's attention/
+            # o_proj/MLP. The receive is started later in enter_layer.
+            pages = self._selected_pages
+            assert pages is not None
+            self._graph_start_push(layer_name, pages)
             return
 
         # All ranks publish a local safe point. Alternating layers use distinct
@@ -467,59 +524,93 @@ class KVPPScheduler:
             self._run_prefetch, layer_name, pages, scratch_ready
         )
 
-    def _run_graph_prefetch(
+    def _graph_start_push(
         self,
         layer_name: str,
-        pages: KVPPActivePages | None,
+        pages: KVPPActivePages,
     ) -> None:
-        """Capture a host-event-free transfer sequence for FULL graph replay.
+        """Phase 1 of Barrier Bridge: READY barrier + launch push on comm stream.
 
-        Runs entirely on the pre-created KVPP comm stream so the capture
-        stream's compute kernels overlap with the KV transfer. All
-        cross-stream ordering is expressed as device-side ``wait_event`` /
-        ``record`` pairs - no host synchronization, no background thread.
-
-        The two device-group barriers replace eager mode's CPU ready/done
-        protocol: the first ensures every non-owner is ready to receive
-        before the owner pushes; the second ensures the push is remotely
-        visible before non-owners receive.
+        Collective stays on the capture stream. The MTE push runs on the
+        independent KVPP comm stream so it overlaps with the previous layer's
+        attention/o_proj/MLP compute. This function returns immediately without
+        waiting for the push to complete — that wait happens in
+        ``_graph_finish_push_start_receive``.
         """
-        if pages is None:
-            raise RuntimeError("KVPP graph capture has no active-page metadata.")
+        resources = self._require_active_graph_resources()
+        events = resources.layer_events[layer_name]
         if self._graph_sync_token is None or self.group.device_group is None:
             raise RuntimeError("KVPP graph synchronization was not initialized.")
-        if not self._graph_slots:
-            raise RuntimeError("KVPP graph scratch slots were not initialized.")
         if self._comm_stream is None:
             raise RuntimeError("KVPP comm stream was not initialized.")
 
-        layer_index = extract_layer_index(layer_name)
-        slot = self._graph_slots[layer_index % 2]
-        owner_rank = self.layer_owners[layer_name]
-        local_rank = self.group.rank_in_group
-        bundle = self.plan.cache_bundles[layer_name]
+        capture_stream = torch.npu.current_stream()
 
-        # Comm stream waits for the compute stream to release this scratch
-        # slot (set by leave_layer of the layer that previously used it).
-        # For the first use of each slot the event is fresh and wait is a
-        # no-op; for reused slots it is ordered after the earlier attention.
+        # READY barrier on capture stream: ensures every non-owner is ready
+        # to receive before the owner pushes.
+        dist.all_reduce(
+            self._graph_sync_token, group=self.group.device_group
+        )
+
+        # Signal comm stream that the ready barrier completed.
+        events.push_start.record(capture_stream)
+
+        # MTE push on comm stream (overlaps with capture stream compute).
         with torch.npu.stream(self._comm_stream):
-            self._comm_stream.wait_event(slot.scratch_free_event)
-
-            dist.all_reduce(
-                self._graph_sync_token, group=self.group.device_group
+            self._comm_stream.wait_event(events.push_start)
+            completion = self.transport.push_active_bundle(
+                self.plan.cache_bundles[layer_name], pages, self._comm_stream
             )
-            if local_rank == owner_rank:
-                self.transport.push_active_bundle(bundle, pages, self._comm_stream)
-            dist.all_reduce(
-                self._graph_sync_token, group=self.group.device_group
-            )
-            if local_rank != owner_rank:
-                self.transport.receive_active_bundle(
-                    bundle, pages, self._comm_stream
-                )
+            events.push_done.record(self._comm_stream)
 
-            slot.kv_ready_event.record(self._comm_stream)
+        resources.retained_completions.append(completion)
+
+    def _graph_finish_push_start_receive(
+        self,
+        layer_name: str,
+        pages: KVPPActivePages,
+    ) -> None:
+        """Phase 2: wait push_done, DONE barrier, launch receive on comm stream.
+
+        Core happens-before chain (doc section 26)::
+
+            OWNER PUSH -> push_done -> capture wait -> DONE BARRIER
+                        -> recv_start -> NON-OWNER RECEIVE
+
+        The receive runs on the comm stream and overlaps with this layer's
+        Q/KV projection compute on the capture stream.
+        """
+        resources = self._require_active_graph_resources()
+        events = resources.layer_events[layer_name]
+        capture_stream = torch.npu.current_stream()
+
+        # Local PUSH must complete before this rank enters the cross-rank
+        # DONE barrier so the push is remotely visible.
+        capture_stream.wait_event(events.push_done)
+
+        # DONE barrier on capture stream.
+        dist.all_reduce(
+            self._graph_sync_token, group=self.group.device_group
+        )
+
+        # Signal comm stream that the done barrier completed.
+        events.recv_start.record(capture_stream)
+
+        # MTE receive on comm stream (overlaps with capture stream QKV).
+        with torch.npu.stream(self._comm_stream):
+            self._comm_stream.wait_event(events.recv_start)
+            completion = self.transport.receive_active_bundle(
+                self.plan.cache_bundles[layer_name], pages, self._comm_stream
+            )
+            events.recv_done.record(self._comm_stream)
+
+        resources.retained_completions.append(completion)
+
+    def _graph_wait_receive(self, layer_name: str) -> None:
+        """Phase 3: wait for the receive to complete before attention."""
+        resources = self._require_active_graph_resources()
+        events = resources.layer_events[layer_name]
+        torch.npu.current_stream().wait_event(events.recv_done)
 
     def _run_prefetch(
         self,
@@ -624,7 +715,9 @@ class KVPPGraphCaptureController:
         self.cache_group_index = cache_group_index
         self._active = False
         self._staged_inputs: KVPPActivePages | None = None
+        self._staged_graph_num_requests: int | None = None
         self._capture_pages: dict[int, KVPPActivePages] = {}
+        self._graph_resources: dict[int, KVPPGraphResources] = {}
 
     def stage(
         self,
@@ -661,12 +754,31 @@ class KVPPGraphCaptureController:
             )
             self._capture_pages[num_requests] = pages
         self._staged_inputs = pages
+        # Create per-capacity graph event resources if not yet allocated.
+        if num_requests not in self._graph_resources:
+            self._graph_resources[num_requests] = (
+                self.scheduler.create_graph_resources()
+            )
+        self._staged_graph_num_requests = num_requests
 
     def begin(self) -> None:
         if self._staged_inputs is None:
             return
         pages = self._staged_inputs
         self._staged_inputs = None
+        graph_num_requests = self._staged_graph_num_requests
+        self._staged_graph_num_requests = None
+        if graph_num_requests is None:
+            raise RuntimeError(
+                "KVPP graph capture began without a staged graph capacity."
+            )
+        resources = self._graph_resources.get(graph_num_requests)
+        if resources is None:
+            raise RuntimeError(
+                "KVPP graph resources were not allocated for batch size "
+                f"{graph_num_requests}."
+            )
+        self.scheduler.set_active_graph_resources(resources)
         self.scheduler._begin_forward(pages)
         self._active = True
 
@@ -679,6 +791,7 @@ class KVPPGraphCaptureController:
             else:
                 self.scheduler.abort_batch()
         finally:
+            self.scheduler.clear_active_graph_resources()
             self._active = False
 
     def prepare_replay(self, graph_num_requests: int) -> None:
@@ -689,6 +802,12 @@ class KVPPGraphCaptureController:
         if graph_pages is None:
             raise RuntimeError(
                 "KVPP graph inputs were not captured for batch size "
+                f"{graph_num_requests}."
+            )
+        resources = self._graph_resources.get(graph_num_requests)
+        if resources is None:
+            raise RuntimeError(
+                "KVPP graph resources were not allocated for batch size "
                 f"{graph_num_requests}."
             )
         runtime_count = runtime_pages.page_ids.numel()
@@ -702,3 +821,4 @@ class KVPPGraphCaptureController:
         graph_pages.valid_mask.zero_()
         graph_pages.valid_mask[:runtime_count].copy_(runtime_pages.valid_mask)
         self.scheduler.abort_batch()
+        self.scheduler.set_active_graph_resources(resources)
