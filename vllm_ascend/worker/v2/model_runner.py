@@ -64,7 +64,6 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import (
-    KVPPGraphCaptureController,
     KVPPScheduler,
     get_kvpp_managed_group_index,
 )
@@ -136,7 +135,6 @@ class NPUModelRunner(GPUModelRunner):
         self.kvpp_scheduler: KVPPScheduler | None = None
         self.kvpp_cache_group_index: int | None = None
         self._kvpp_kv_caches: dict[str, Any] | None = None
-        self.kvpp_graph_controller: KVPPGraphCaptureController | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -307,44 +305,12 @@ class NPUModelRunner(GPUModelRunner):
         kvpp_scheduler.initialize_transport(managed_kv_caches)
         self._kvpp_kv_caches = None
         self.kvpp_scheduler = kvpp_scheduler
-        self.kvpp_graph_controller = KVPPGraphCaptureController(
-            kvpp_scheduler, kvpp_cache_group_index
-        )
-        # FULL graph capture creates dummy attention inputs through model_state
-        # instead of this runner's prepare_dummy_attn method.
-        self.model_state.kvpp_capture_stage = self.stage_kvpp_graph_capture
         for impl in kvpp_impls.values():
             impl.layerwise_kv_cache_hook = kvpp_scheduler
 
     def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
         if self.kvpp_size > 1:
             self._kvpp_kv_caches = kv_caches_dict
-
-    def stage_kvpp_graph_capture(
-        self,
-        block_tables: tuple[torch.Tensor, ...],
-        input_batch: AscendInputBatch,
-    ) -> None:
-        """Stage the dummy inputs consumed by the next capture forward."""
-        if self.kvpp_graph_controller is not None:
-            self.kvpp_graph_controller.stage(
-                block_tables, input_batch.num_reqs
-            )
-
-    def begin_kvpp_graph_capture(self) -> None:
-        """Begin KVPP inside warmup/capture so page ops join the graph."""
-        if self.kvpp_graph_controller is not None:
-            self.kvpp_graph_controller.begin()
-
-    def finish_kvpp_graph_capture(self, success: bool) -> None:
-        """Close the capture-only KVPP lifecycle around model forward."""
-        if self.kvpp_graph_controller is not None:
-            self.kvpp_graph_controller.finish(success)
-
-    def prepare_kvpp_fullgraph_replay(self, graph_num_requests: int) -> None:
-        """Discard the eager lifecycle; captured KVPP ops drive FULL replay."""
-        if self.kvpp_graph_controller is not None:
-            self.kvpp_graph_controller.prepare_replay(graph_num_requests)
 
     def _begin_kvpp_forward(
         self,

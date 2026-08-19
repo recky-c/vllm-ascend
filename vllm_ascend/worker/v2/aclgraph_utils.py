@@ -106,11 +106,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
         self.update_stream.wait_stream(torch.npu.current_stream())
-        # prepare_attn starts the eager KVPP lifecycle before graph dispatch is
-        # known.  A FULL replay executes the captured lifecycle instead.
-        if desc.num_reqs is None:
-            raise RuntimeError("FULL graph replay requires a fixed request capacity.")
-        self.model_runner.prepare_kvpp_fullgraph_replay(desc.num_reqs)
         ret = super().run_fullgraph(desc)
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
@@ -156,7 +151,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
-        model = ModelWithContext(model, model_runner=self.model_runner)
+        model = ModelWithContext(model)
         with communicator_switch():
             return super().capture(
                 model,
@@ -183,13 +178,11 @@ class ModelWithContext(nn.Module):
         original_model,
         is_draft_model=False,
         is_draft_model_prefill=False,
-        model_runner=None,
     ):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
-        self.model_runner = model_runner
 
     def forward(self, *args, **kwargs):
         # In warmup phase, capturing=False by default.
@@ -201,18 +194,7 @@ class ModelWithContext(nn.Module):
         if self.is_draft_model_prefill:
             _EXTRA_CTX.is_draft_model_prefill = True
 
-        if self.model_runner is not None:
-            self.model_runner.begin_kvpp_graph_capture()
-        try:
-            output = self.original_model(*args, **kwargs)
-        except BaseException:
-            if self.model_runner is not None:
-                self.model_runner.finish_kvpp_graph_capture(success=False)
-            raise
-
-        if self.model_runner is not None:
-            self.model_runner.finish_kvpp_graph_capture(success=True)
-        return output
+        return self.original_model(*args, **kwargs)
 
     def get_original_model(self):
         return self.original_model

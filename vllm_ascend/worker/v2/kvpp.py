@@ -210,7 +210,6 @@ class KVPPScheduler:
         self._transfer_future: Future[None] | None = None
         self._pending_layer: str | None = None
         self._device_id: int | None = None
-        self._graph_sync_token: torch.Tensor | None = None
 
     def initialize_transport(self, kv_caches: dict[str, Any]) -> None:
         self._validate_plan_across_ranks()
@@ -218,9 +217,6 @@ class KVPPScheduler:
         if self.group.world_size > 1:
             self._device_id = torch.npu.current_device()
             self._comm_stream = torch.npu.Stream()
-            self._graph_sync_token = torch.zeros(
-                1, dtype=torch.int32, device="npu"
-            )
             # One transfer may be in flight. Serializing jobs also preserves
             # point-to-point notification order when layer ownership changes.
             self._executor = ThreadPoolExecutor(
@@ -357,6 +353,7 @@ class KVPPScheduler:
             raise RuntimeError(
                 f"No pending KVPP prefetch for layer {layer_name}."
             )
+
         if self._transfer_future is not None:
             # This blocks only for the residual transfer time because this
             # layer was prefetched while the preceding layer was executing.
@@ -407,10 +404,6 @@ class KVPPScheduler:
         if self._executor is None or self._comm_stream is None:
             raise RuntimeError("KVPP prefetch worker was not initialized.")
 
-        if torch.npu.is_current_stream_capturing():
-            self._run_graph_prefetch(layer_name, self._selected_pages)
-            return
-
         # All ranks publish a local safe point. Alternating layers use distinct
         # buffers. When a buffer cycles back after two layers, this event is
         # ordered after all earlier attention work on the compute stream, so
@@ -422,37 +415,6 @@ class KVPPScheduler:
         self._transfer_future = self._executor.submit(
             self._run_prefetch, layer_name, pages, scratch_ready
         )
-
-    def _run_graph_prefetch(
-        self,
-        layer_name: str,
-        pages: KVPPActivePages | None,
-    ) -> None:
-        """Capture a host-event-free transfer sequence for FULL graph replay.
-
-        The two device collectives replace eager mode's CPU ready/done
-        protocol.  Keeping all operations on the capture stream is deliberate:
-        it provides correct cross-rank ordering without recording an NPU event
-        that a background Python thread would later synchronize.
-        """
-        if pages is None:
-            raise RuntimeError("KVPP graph capture has no active-page metadata.")
-        if self._graph_sync_token is None or self.group.device_group is None:
-            raise RuntimeError("KVPP graph synchronization was not initialized.")
-
-        stream = torch.npu.current_stream()
-        owner_rank = self.layer_owners[layer_name]
-        local_rank = self.group.rank_in_group
-        dist.all_reduce(self._graph_sync_token, group=self.group.device_group)
-        if local_rank == owner_rank:
-            self.transport.push_active_bundle(
-                self.plan.cache_bundles[layer_name], pages, stream
-            )
-        dist.all_reduce(self._graph_sync_token, group=self.group.device_group)
-        if local_rank != owner_rank:
-            self.transport.receive_active_bundle(
-                self.plan.cache_bundles[layer_name], pages, stream
-            )
 
     def _run_prefetch(
         self,
@@ -547,91 +509,3 @@ class KVPPScheduler:
             self._executor.shutdown(wait=True)
             self._executor = None
         self.transport.close()
-
-
-class KVPPGraphCaptureController:
-    """Own the graph-only page inputs and scheduler lifecycle."""
-
-    def __init__(self, scheduler: KVPPScheduler, cache_group_index: int) -> None:
-        self.scheduler = scheduler
-        self.cache_group_index = cache_group_index
-        self._active = False
-        self._staged_inputs: KVPPActivePages | None = None
-        self._capture_pages: dict[int, KVPPActivePages] = {}
-
-    def stage(
-        self,
-        block_tables: tuple[torch.Tensor, ...],
-        num_requests: int,
-    ) -> None:
-        if self._active:
-            raise RuntimeError("A KVPP graph capture forward is already active.")
-        block_table = block_tables[self.cache_group_index]
-        descriptor_count = block_table.numel()
-        pages = self._capture_pages.get(num_requests)
-        if pages is not None:
-            if pages.page_ids.numel() != descriptor_count:
-                raise RuntimeError(
-                    "KVPP graph capture changed descriptor capacity for batch "
-                    f"size {num_requests}: captured={pages.page_ids.numel()}, "
-                    f"new={descriptor_count}."
-                )
-        else:
-            pages = KVPPActivePages(
-                page_ids=torch.zeros(
-                    descriptor_count,
-                    dtype=torch.int64,
-                    device=block_table.device,
-                ),
-                valid_mask=torch.zeros(
-                    descriptor_count,
-                    dtype=torch.bool,
-                    device=block_table.device,
-                ),
-                count_upper_bound=min(
-                    self.scheduler.num_blocks, descriptor_count
-                ),
-            )
-            self._capture_pages[num_requests] = pages
-        self._staged_inputs = pages
-
-    def begin(self) -> None:
-        if self._staged_inputs is None:
-            return
-        pages = self._staged_inputs
-        self._staged_inputs = None
-        self.scheduler._begin_forward(pages)
-        self._active = True
-
-    def finish(self, success: bool) -> None:
-        if not self._active:
-            return
-        try:
-            if success:
-                self.scheduler.finish_forward()
-            else:
-                self.scheduler.abort_batch()
-        finally:
-            self._active = False
-
-    def prepare_replay(self, graph_num_requests: int) -> None:
-        runtime_pages = self.scheduler.selected_pages
-        if runtime_pages is None:
-            raise RuntimeError("KVPP graph replay has no runtime page metadata.")
-        graph_pages = self._capture_pages.get(graph_num_requests)
-        if graph_pages is None:
-            raise RuntimeError(
-                "KVPP graph inputs were not captured for batch size "
-                f"{graph_num_requests}."
-            )
-        runtime_count = runtime_pages.page_ids.numel()
-        graph_capacity = graph_pages.page_ids.numel()
-        if runtime_count > graph_capacity:
-            raise RuntimeError(
-                "KVPP runtime page descriptors exceed the selected graph "
-                f"capacity: runtime={runtime_count}, graph={graph_capacity}."
-            )
-        graph_pages.page_ids[:runtime_count].copy_(runtime_pages.page_ids)
-        graph_pages.valid_mask.zero_()
-        graph_pages.valid_mask[:runtime_count].copy_(runtime_pages.valid_mask)
-        self.scheduler.abort_batch()

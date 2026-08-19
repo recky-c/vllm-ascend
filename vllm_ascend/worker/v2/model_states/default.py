@@ -43,15 +43,6 @@ class AscendModelState(DefaultModelState):
         for_capture: bool = False,
     ) -> dict[str, Any]:
         """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
-        # Full graph capture prepares attention inputs directly through the
-        # model state, bypassing NPUModelRunner.prepare_dummy_attn.  Give KVPP
-        # a capture-only hook so its layer callbacks see the same batch and
-        # forward lifecycle as eager execution.
-        if for_capture:
-            kvpp_capture_stage = getattr(self, "kvpp_capture_stage", None)
-            if kvpp_capture_stage is not None:
-                kvpp_capture_stage(block_tables, input_batch)
-
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
             num_reqs = input_batch.num_reqs_after_padding

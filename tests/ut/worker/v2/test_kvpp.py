@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -12,12 +12,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
     _MTEDeviceBufferMetadata,
 )
 from vllm_ascend.worker.v2.kvpp import (
-    KVPPGraphCaptureController,
+    KVPPPhase,
     KVPPScheduler,
     _active_pages,
     get_kvpp_managed_group_index,
 )
-from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 
 def test_managed_group_allows_replicated_mtp_groups():
@@ -27,123 +26,6 @@ def test_managed_group_allows_replicated_mtp_groups():
     ]
 
     assert get_kvpp_managed_group_index(groups, {"target.0": 0}) == 0
-
-
-def test_model_runner_bridges_full_graph_capture_lifecycle():
-    runner = NPUModelRunner.__new__(NPUModelRunner)
-    runner.kvpp_graph_controller = MagicMock()
-    block_tables = (
-        torch.zeros((1, 1), dtype=torch.int32),
-        torch.tensor([[3]], dtype=torch.int32),
-    )
-    input_batch = SimpleNamespace(
-        num_reqs=1,
-        seq_lens=torch.tensor([1]),
-        seq_lens_np=torch.tensor([1]),
-    )
-
-    runner.stage_kvpp_graph_capture(block_tables, input_batch)
-
-    runner.kvpp_graph_controller.stage.assert_called_once_with(block_tables, 1)
-    runner.kvpp_graph_controller.begin.assert_not_called()
-    runner.begin_kvpp_graph_capture()
-
-    runner.kvpp_graph_controller.begin.assert_called_once_with()
-
-    runner.finish_kvpp_graph_capture(success=True)
-
-    runner.kvpp_graph_controller.finish.assert_called_once_with(True)
-
-
-def test_graph_replay_updates_persistent_page_inputs():
-    context = KVPPScheduler(
-        group=SimpleNamespace(rank_in_group=0, world_size=1),
-        layer_owners={"layer": 0},
-        num_blocks=10,
-        block_size=4,
-        transport=SimpleNamespace(),
-    )
-    block_table = torch.zeros((4, 3), dtype=torch.int32)
-    controller = KVPPGraphCaptureController(context, 0)
-    controller.stage((block_table,), 4)
-    graph_pages = controller._capture_pages[4]
-    runtime_pages = KVPPActivePages(
-        page_ids=torch.tensor(
-            [2, 7, 10, 3, 8, 11, 4, 9, 12], dtype=torch.int64
-        ),
-        valid_mask=torch.tensor(
-            [True, True, False, True, False, False, True, True, False]
-        ),
-        count_upper_bound=2,
-    )
-    context._selected_pages = runtime_pages
-    graph_pages.valid_mask.fill_(True)
-
-    controller.prepare_replay(4)
-
-    assert torch.equal(
-        graph_pages.page_ids[: runtime_pages.page_ids.numel()],
-        runtime_pages.page_ids,
-    )
-    assert torch.equal(
-        graph_pages.valid_mask[: runtime_pages.valid_mask.numel()],
-        runtime_pages.valid_mask,
-    )
-    assert not graph_pages.valid_mask[runtime_pages.valid_mask.numel() :].any()
-
-
-def test_graph_capture_reuses_persistent_inputs_for_same_batch_size():
-    context = KVPPScheduler(
-        group=SimpleNamespace(rank_in_group=0, world_size=1),
-        layer_owners={"layer": 0},
-        num_blocks=10,
-        block_size=4,
-        transport=SimpleNamespace(),
-    )
-    block_table = torch.zeros((4, 3), dtype=torch.int32)
-    controller = KVPPGraphCaptureController(context, 0)
-    controller.stage((block_table,), 4)
-    first = controller._capture_pages[4]
-    controller.stage((block_table,), 4)
-    second = controller._capture_pages[4]
-
-    assert first is second
-
-
-def test_graph_prefetch_uses_device_barriers_without_host_events():
-    device_group = object()
-    transport = MagicMock()
-    context = KVPPScheduler(
-        group=SimpleNamespace(
-            rank_in_group=0,
-            world_size=2,
-            device_group=device_group,
-        ),
-        layer_owners={"layer": 0},
-        num_blocks=4,
-        block_size=4,
-        transport=transport,
-    )
-    context._graph_sync_token = torch.zeros(1, dtype=torch.int32)
-    pages = _active_page_tensor(1)
-
-    with (
-        patch(
-            "vllm_ascend.worker.v2.kvpp.torch.npu.current_stream",
-            return_value="capture-stream",
-        ),
-        patch("vllm_ascend.worker.v2.kvpp.dist.all_reduce") as all_reduce,
-    ):
-        context._run_graph_prefetch("layer", pages)
-
-    assert all_reduce.call_count == 2
-    all_reduce.assert_called_with(
-        context._graph_sync_token, group=device_group
-    )
-    transport.push_active_bundle.assert_called_once_with(
-        ("layer",), pages, "capture-stream"
-    )
-    transport.receive_active_bundle.assert_not_called()
 
 
 def test_managed_group_rejects_target_layers_across_groups():
