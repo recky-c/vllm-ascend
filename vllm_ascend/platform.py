@@ -34,6 +34,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.kvpp_config import KVPPConfig
 
 # isort: off
 from vllm_ascend.utils import (
@@ -159,6 +160,42 @@ class NPUPlatform(Platform):
         from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
 
         register_ascend_kv_cache_specs()
+
+    @classmethod
+    def get_kv_cache_groups_for_worker(
+        cls,
+        vllm_config: VllmConfig,
+        global_kv_cache_groups,
+        worker_kv_cache_spec,
+        worker_index: int,
+    ):
+        from vllm_ascend.v1.core.kv_cache_placement import get_kv_cache_groups_for_worker
+
+        return get_kv_cache_groups_for_worker(
+            vllm_config,
+            global_kv_cache_groups,
+            worker_kv_cache_spec,
+            worker_index,
+        )
+
+    @classmethod
+    def finalize_kv_cache_config(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_config,
+        global_kv_cache_groups,
+        worker_kv_cache_spec,
+        worker_index: int,
+    ) -> None:
+        from vllm_ascend.v1.core.kv_cache_placement import finalize_kv_cache_config
+
+        finalize_kv_cache_config(
+            vllm_config,
+            kv_cache_config,
+            global_kv_cache_groups,
+            worker_kv_cache_spec,
+            worker_index,
+        )
 
     @classmethod
     def get_pass_manager_cls(cls) -> str:
@@ -1376,6 +1413,10 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
             "Please set --prefill-context-parallel-size to 1. "
             f"Got prefill_context_parallel_size={parallel_config.prefill_context_parallel_size}."
         )
+
+    kvpp_config = KVPPConfig.from_vllm_config(vllm_config)
+    if kvpp_config.size > 1:
+        kvpp_config.validate(vllm_config)
 
     sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
     if sfa_dcp_replicated_indexer:

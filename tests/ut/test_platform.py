@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1265,6 +1266,83 @@ class TestNPUPlatform(TestBase):
         from vllm_ascend import platform
 
         platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_accepts_kvpp_mrv2_mla(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config["kvpp_size"] = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.kv_transfer_config = None
+
+        self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_accepts_kvpp_full_graph(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config["kvpp_size"] = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = False
+        vllm_config.kv_transfer_config = None
+
+        self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_accepts_kvpp_with_fixed_mtp(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config["kvpp_size"] = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens_per_batch_size=None,
+        )
+
+        self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_rejects_kvpp_with_non_mtp_spec(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config["kvpp_size"] = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.speculative_config = SimpleNamespace(
+            method="eagle",
+            num_speculative_tokens_per_batch_size=None,
+        )
+
+        with pytest.raises(ValueError, match="only with method='mtp'"):
+            self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_rejects_kvpp_with_dynamic_mtp(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config["kvpp_size"] = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.speculative_config = SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens_per_batch_size={1: 1, 8: 3},
+        )
+
+        with pytest.raises(ValueError, match="fixed number"):
+            self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_rejects_kvpp_with_dcp(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config["kvpp_size"] = 2
+        vllm_config.parallel_config.decode_context_parallel_size = 2
+
+        with pytest.raises(ValueError, match="KVPP and DCP"):
+            self.platform._validate_parallel_config(vllm_config)
+
+    def test_validate_parallel_config_rejects_kvpp_model_runner_v1(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.additional_config["kvpp_size"] = 2
+
+        with pytest.raises(ValueError, match="Model Runner V2"):
+            self.platform._validate_parallel_config(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)

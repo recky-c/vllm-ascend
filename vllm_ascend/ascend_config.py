@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.kvpp_config import KVPPConfig
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -35,6 +37,7 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+        self.kvpp_config = KVPPConfig.from_vllm_config(vllm_config)
         self._check_mooncake_c8_kv_cache_quant(vllm_config)
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
