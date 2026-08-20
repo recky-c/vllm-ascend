@@ -1287,6 +1287,19 @@ class TestNPUPlatform(TestBase):
 
         self.platform._validate_parallel_config(vllm_config)
 
+    def test_validate_parallel_config_accepts_kvpp_with_pipeline_parallel(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config["kvpp_size"] = 2
+        vllm_config.parallel_config.tensor_parallel_size = 4
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+        vllm_config.model_config.use_mla = True
+        vllm_config.kv_transfer_config = None
+
+        from vllm_ascend import platform
+
+        platform._validate_parallel_config(vllm_config)
+
     def test_validate_parallel_config_accepts_kvpp_with_fixed_mtp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.use_v2_model_runner = True

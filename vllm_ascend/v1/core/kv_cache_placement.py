@@ -62,7 +62,12 @@ def _get_replicated_mtp_layers(
         for layer_name in layer_names
         if mtp_start <= extract_layer_index(layer_name) < mtp_end
     }
-    if not replicated_layers:
+    pipeline_parallel_size = getattr(
+        getattr(vllm_config, "parallel_config", None),
+        "pipeline_parallel_size",
+        1,
+    )
+    if not replicated_layers and pipeline_parallel_size == 1:
         raise ValueError("KVPP could not identify any MTP KV-cache layers to replicate.")
     return replicated_layers
 

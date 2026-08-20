@@ -9,9 +9,14 @@ from vllm_ascend.v1.core.kv_cache_placement import (
 )
 
 
-def _config(*, kvpp_size: int = 2, mtp: bool = False):
+def _config(
+    *, kvpp_size: int = 2, mtp: bool = False, pipeline_parallel_size: int = 1
+):
     return SimpleNamespace(
         additional_config={"kvpp_size": kvpp_size},
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pipeline_parallel_size,
+        ),
         speculative_config=(SimpleNamespace(method="mtp") if mtp else None),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
@@ -42,6 +47,18 @@ def test_owner_plan_keeps_mtp_cache_replicated():
 
     assert [owners[name] for name in target_layers] == [0, 0, 1, 1]
     assert not set(mtp_layers).intersection(owners)
+
+
+def test_owner_plan_allows_non_last_pp_stage_without_mtp_cache():
+    target_layers = [
+        f"model.layers.{index}.self_attn.attn" for index in range(2)
+    ]
+
+    owners = get_kvpp_layer_owners(
+        _config(mtp=True, pipeline_parallel_size=2), target_layers
+    )
+
+    assert owners == {target_layers[0]: 0, target_layers[1]: 1}
 
 
 def test_owner_plan_order_is_stable_for_reordered_cache_names():

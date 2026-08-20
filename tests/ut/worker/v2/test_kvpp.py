@@ -10,6 +10,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
     KVPPMTEPeerMetadata,
     MemFabricMTEKVPPTransport,
     _MTEDeviceBufferMetadata,
+    _store_url_for_kvpp_group,
 )
 from vllm_ascend.worker.v2.kvpp import (
     KVPPPhase,
@@ -39,6 +40,30 @@ def test_managed_group_rejects_target_layers_across_groups():
             groups,
             {"target.0": 0, "target.1": 1},
         )
+
+
+@pytest.mark.parametrize(
+    ("ranks", "expected"),
+    [
+        ([0, 1, 2, 3], "tcp://127.0.0.1:18008"),
+        ([4, 5, 6, 7], "tcp://127.0.0.1:18009"),
+        ([8, 9, 10, 11], "tcp://127.0.0.1:18010"),
+    ],
+)
+def test_memfabric_store_url_isolated_per_kvpp_group(ranks, expected):
+    group = SimpleNamespace(ranks=ranks, world_size=4)
+
+    assert (
+        _store_url_for_kvpp_group("tcp://127.0.0.1:18008", group)
+        == expected
+    )
+
+
+def test_memfabric_store_url_rejects_noncontiguous_group():
+    group = SimpleNamespace(ranks=[0, 2], world_size=2)
+
+    with pytest.raises(ValueError, match="contiguous, aligned"):
+        _store_url_for_kvpp_group("tcp://127.0.0.1:18008", group)
 
 
 def test_active_pages_uses_only_pages_covered_by_sequence_lengths():

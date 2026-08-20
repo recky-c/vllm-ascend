@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,57 @@ _DEFAULT_STAGING_BYTES = 256 << 20
 _DEFAULT_SHM_ID = 31
 _SHM_ID_LIMIT = 64
 _SHM_ALIGNMENT = 2 << 20
+
+
+def _store_url_for_kvpp_group(
+    store_url: str, group: GroupCoordinator
+) -> str:
+    """Give each KVPP process group its own MemFabric config store.
+
+    A PP deployment has one KVPP group per pipeline stage. MemFabric's SHM
+    initializer identifies participants only by ``(store_url, world_size,
+    rank_id)``; reusing one URL would therefore merge stage-local ranks from
+    different PP stages. KVPP groups are contiguous slices of the global rank
+    grid, so their ordinal can safely select a stage-local TCP port.
+    """
+    ranks = tuple(int(rank) for rank in group.ranks)
+    if not ranks:
+        raise ValueError("KVPP process group must contain at least one rank.")
+    if len(ranks) != group.world_size:
+        raise ValueError(
+            "KVPP process-group rank count does not match its world size: "
+            f"ranks={ranks}, world_size={group.world_size}."
+        )
+    first_rank = min(ranks)
+    expected_ranks = tuple(range(first_rank, first_rank + group.world_size))
+    if tuple(sorted(ranks)) != expected_ranks or first_rank % group.world_size:
+        raise ValueError(
+            "KVPP MemFabric store isolation requires contiguous, aligned "
+            f"process groups, got ranks={ranks}."
+        )
+    group_index = first_rank // group.world_size
+    if group_index == 0:
+        return store_url
+
+    parsed = urlsplit(store_url)
+    if parsed.scheme != "tcp" or parsed.hostname is None or parsed.port is None:
+        raise ValueError(
+            "Multiple KVPP groups require MF_CONFIG_STORE_URL to use the "
+            f"tcp://host:port form, got {store_url!r}."
+        )
+    port = parsed.port + group_index
+    if port > 65535:
+        raise ValueError(
+            "KVPP MemFabric derived store port exceeds 65535: "
+            f"base_port={parsed.port}, group_index={group_index}."
+        )
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{port}"
+    return urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 @dataclass(frozen=True)
@@ -223,6 +275,7 @@ class MemFabricMTEKVPPTransport:
                 "KVPP MTE requires MF_CONFIG_STORE_URL (or the deprecated "
                 "ASCEND_MF_STORE_URL compatibility variable)."
             )
+        store_url = _store_url_for_kvpp_group(store_url, self.group)
         staging_bytes = int(os.getenv("ASCEND_KVPP_MTE_STAGING_BYTES", _DEFAULT_STAGING_BYTES))
         if staging_bytes <= 0 or staging_bytes % _SHM_ALIGNMENT:
             raise ValueError(
@@ -322,11 +375,12 @@ class MemFabricMTEKVPPTransport:
             raise RuntimeError("KVPP MTE did not receive every peer GVA.")
         self._peer_metadata = [peer for peer in peers if peer is not None]
         logger.info(
-            "KVPP MemFabric MTE initialized: rank=%d, gva=%#x, staging_bytes=%d, shm_id=%d",
+            "KVPP MemFabric MTE initialized: rank=%d, gva=%#x, staging_bytes=%d, shm_id=%d, store_url=%s",
             self.group.rank_in_group,
             self._local_metadata.staging_addr,
             staging_bytes,
             shm_id,
+            store_url,
         )
 
     def _local_descriptors(
