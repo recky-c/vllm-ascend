@@ -189,9 +189,21 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     vllm_version_is,
 )
+from vllm_ascend.distributed.parallel_state import get_kvpp_group
+from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
+    MemFabricMTEKVPPTransport,
+)
+from vllm_ascend.kvpp_config import KVPPConfig
+from vllm_ascend.v1.core.kv_cache_placement import (
+    get_kvpp_layer_owners,
+)
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
+from vllm_ascend.worker.v2.kvpp import (
+    KVPPScheduler,
+    get_kvpp_managed_group_index,
+)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -344,6 +356,13 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+
+        # KVPP runtime state (V1 adapter). The scheduler, transport, MLA hooks
+        # and KV cache placement are shared with Model Runner V2; only the
+        # lifecycle wiring below is V1-specific.
+        self.kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
+        self.kvpp_scheduler: KVPPScheduler | None = None
+        self.kvpp_cache_group_index: int | None = None
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -2083,54 +2102,67 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
-        if self.dynamic_eplb:
-            self.eplb_updator.forward_before()
+        kvpp_started = False
+        try:
+            if self.kvpp_scheduler is not None:
+                kvpp_started = self._begin_kvpp_forward(num_reqs)
 
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        # vLLM v0.27.1 still supports runtime KV scale calculation. Upstream main
-        # removed this state in vllm-project/vllm#49389.
-        if vllm_version_is("0.27.1") and self.calculate_kv_scales:  # type: ignore[has-type]
-            cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False  # type: ignore[has-type]
-        # Encoder-decoder models can only compile the pure decode steps where no
-        # encoder inputs are present. Use eager for the first pass.
-        num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
-        has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+            if self.dynamic_eplb:
+                self.eplb_updator.forward_before()
 
-        # Run forward pass
-        defer_kv_connector_finalize = self.speculative_config is not None and (
-            get_pp_group().is_last_rank or self.broadcast_pp_output
-        )
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                skip_compiled=has_encoder_input,
-                has_sinks=self._has_sinks,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": defer_kv_connector_finalize}
-                ),
-            ) as kv_connector_output,
-        ):
-            if self.cache_config.mamba_cache_mode == "align":
-                mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            # Set cudagraph mode to none if calc_kv_scales is true.
+            # KV scales calculation involves dynamic operations that are incompatible
+            # with CUDA graph capture.
+            # vLLM v0.27.1 still supports runtime KV scale calculation. Upstream main
+            # removed this state in vllm-project/vllm#49389.
+            if vllm_version_is("0.27.1") and self.calculate_kv_scales:  # type: ignore[has-type]
+                cudagraph_mode = CUDAGraphMode.NONE
+                # Mark KV scales as calculated after the first forward pass
+                self.calculate_kv_scales = False  # type: ignore[has-type]
+            # Encoder-decoder models can only compile the pure decode steps where no
+            # encoder inputs are present. Use eager for the first pass.
+            num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+            has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+
+            # Run forward pass
+            defer_kv_connector_finalize = self.speculative_config is not None and (
+                get_pp_group().is_last_rank or self.broadcast_pp_output
             )
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    skip_compiled=has_encoder_input,
+                    has_sinks=self._has_sinks,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                ),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    **(
+                        {"defer_finalize": defer_kv_connector_finalize}
+                    ),
+                ) as kv_connector_output,
+            ):
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+
+            if kvpp_started:
+                self.kvpp_scheduler.finish_forward()
+        except BaseException:
+            if kvpp_started:
+                self.kvpp_scheduler.abort_batch()
+            raise
+
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -3429,22 +3461,34 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                model_instance=self.model,
-                has_sinks = self._has_sinks,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ):
-                outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
-                )
+            kvpp_started = False
+            try:
+                if self.kvpp_scheduler is not None and attn_metadata is not None:
+                    kvpp_started = self._begin_kvpp_forward(num_reqs)
+
+                with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    in_profile_run=is_profile,
+                    num_actual_tokens=num_tokens_padded,
+                    aclgraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    model_instance=self.model,
+                    has_sinks = self._has_sinks,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                ):
+                    outputs = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                    )
+
+                if kvpp_started:
+                    self.kvpp_scheduler.finish_forward()
+            except BaseException:
+                if kvpp_started:
+                    self.kvpp_scheduler.abort_batch()
+                raise
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -3717,6 +3761,72 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+        if self.kvpp_size > 1:
+            self._initialize_kvpp_scheduler(kv_caches)
+
+    def _initialize_kvpp_scheduler(self, kv_caches: dict[str, Any]) -> None:
+        if self.kvpp_size <= 1:
+            return
+        layer_names = tuple(
+            dict.fromkeys(
+                layer_name
+                for group in self.kv_cache_config.kv_cache_groups
+                for layer_name in group.layer_names
+            )
+        )
+        layer_owners = get_kvpp_layer_owners(self.vllm_config, layer_names)
+        kvpp_group = get_kvpp_group()
+        kvpp_cache_group_index = get_kvpp_managed_group_index(
+            self.kv_cache_config.kv_cache_groups, layer_owners
+        )
+        self.kvpp_cache_group_index = kvpp_cache_group_index
+
+        block_table = self.input_batch.block_table[kvpp_cache_group_index]
+        blocks_per_kv_block = block_table.blocks_per_phys_block
+        num_kernel_blocks = self.kv_cache_config.num_blocks * blocks_per_kv_block
+        block_size = block_table.logical_block_size
+
+        kvpp_impls: dict[str, Any] = {}
+        for layer_name, module in self.compilation_config.static_forward_context.items():
+            if layer_name not in layer_owners:
+                continue
+            impl = getattr(module, "impl", None)
+            if impl is not None and hasattr(impl, "layerwise_kv_cache_hook"):
+                kvpp_impls[layer_name] = impl
+        if not kvpp_impls:
+            raise RuntimeError("KVPP did not find an MLA or SFA attention implementation to drive layer transfers.")
+
+        transport = MemFabricMTEKVPPTransport(
+            kvpp_group, layer_owners, num_kernel_blocks
+        )
+        kvpp_scheduler = KVPPScheduler(
+            group=kvpp_group,
+            layer_owners=layer_owners,
+            num_blocks=num_kernel_blocks,
+            block_size=block_size,
+            transport=transport,
+            execution_layers=tuple(kvpp_impls),
+        )
+        managed_kv_caches = {
+            layer_name: kv_caches[layer_name]
+            for layer_name in layer_owners
+        }
+        kvpp_scheduler.initialize_transport(managed_kv_caches)
+        self.kvpp_scheduler = kvpp_scheduler
+        for impl in kvpp_impls.values():
+            impl.layerwise_kv_cache_hook = kvpp_scheduler
+
+    def _begin_kvpp_forward(self, num_reqs: int) -> bool:
+        if self.kvpp_scheduler is None:
+            return False
+        assert self.kvpp_cache_group_index is not None
+        block_table = self.input_batch.block_table[self.kvpp_cache_group_index]
+        self.kvpp_scheduler.begin_forward(
+            block_table.get_device_tensor(num_reqs),
+            self.optimistic_seq_lens_cpu[:num_reqs],
+        )
+        return True
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()

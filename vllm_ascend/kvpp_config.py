@@ -22,8 +22,6 @@ class KVPPConfig:
 
     def validate(self, vllm_config: "VllmConfig") -> None:
         parallel_config = vllm_config.parallel_config
-        if not vllm_config.use_v2_model_runner:
-            raise ValueError("KVPP is only supported by Ascend Model Runner V2.")
         if parallel_config.pipeline_parallel_size != 1:
             raise ValueError("KVPP does not support pipeline parallelism yet.")
         if parallel_config.prefill_context_parallel_size != 1:
