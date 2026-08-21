@@ -1,26 +1,36 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MLAAttentionSpec
 
 from vllm_ascend.v1.core.kv_cache_placement import (
     _get_allocation_groups,
+    _get_worker_kvpp_rank,
+    get_kv_cache_groups_for_worker,
     get_kvpp_layer_owners,
+    project_kv_cache_groups_to_worker,
 )
 
 
 def _config(
-    *, kvpp_size: int = 2, mtp: bool = False, pipeline_parallel_size: int = 1
+    *,
+    kvpp_size: int = 2,
+    mtp: bool = False,
+    pipeline_parallel_size: int = 1,
+    tensor_parallel_size: int = 8,
+    num_hidden_layers: int = 4,
 ):
     return SimpleNamespace(
         additional_config={"kvpp_size": kvpp_size},
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pipeline_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
         ),
         speculative_config=(SimpleNamespace(method="mtp") if mtp else None),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
-                num_hidden_layers=4,
+                num_hidden_layers=num_hidden_layers,
                 num_nextn_predict_layers=1,
             )
         ),
@@ -96,3 +106,118 @@ def test_allocation_keeps_two_scratch_caches_per_layout():
         layer_names[0]: [layer_names[0], layer_names[2]],
         layer_names[1]: [layer_names[1]],
     }
+
+
+# ---------------------------------------------------------------------------
+# PP-local placement tests (PP projection -> local owners -> local allocation)
+# ---------------------------------------------------------------------------
+
+
+def _pp_placement_fixture(*, mtp: bool):
+    """Target layers 0~7, optional MTP layer 8, PP=2, KVPP=2.
+
+    PP0 worker holds layers 0~3; PP1 worker holds layers 4~7 plus MTP 8.
+    """
+    config = _config(
+        kvpp_size=2,
+        mtp=mtp,
+        pipeline_parallel_size=2,
+        num_hidden_layers=8,
+    )
+    target_names = [f"model.layers.{i}.self_attn.attn" for i in range(8)]
+    mtp_names = ["model.layers.8.mtp_block.self_attn.attn"] if mtp else []
+    spec = _spec()
+
+    global_group = KVCacheGroupSpec(target_names + mtp_names, spec)
+    pp0_spec = dict.fromkeys(target_names[:4], spec)
+    pp1_spec = dict.fromkeys(target_names[4:] + mtp_names, spec)
+    return config, global_group, pp0_spec, pp1_spec
+
+
+def test_pp0_placement_is_local_and_mtp_free():
+    config, global_group, pp0_spec, _ = _pp_placement_fixture(mtp=True)
+
+    groups = get_kv_cache_groups_for_worker(
+        config, [global_group], pp0_spec, worker_index=0
+    )
+    assert groups is not None
+    local_layers = groups[0].layer_names
+
+    # PP0 owns target 0~1 persistent, target 2~3 scratch, no MTP.
+    assert not any("mtp_block" in name for name in local_layers)
+    assert all(name in local_layers for name in list(pp0_spec)[:2])
+
+
+def test_pp1_placement_replicates_mtp_on_every_kvpp_rank():
+    config, global_group, _, pp1_spec = _pp_placement_fixture(mtp=True)
+    mtp_name = "model.layers.8.mtp_block.self_attn.attn"
+
+    for worker_index, kvpp_rank in ((8, 0), (9, 1)):
+        groups = get_kv_cache_groups_for_worker(
+            config, [global_group], pp1_spec, worker_index
+        )
+        assert groups is not None
+        # MTP must be allocated in full on every KVPP rank.
+        assert mtp_name in groups[0].layer_names
+        # Both KVPP ranks still allocate their own target persistent part.
+        target_part = [n for n in groups[0].layer_names if "mtp_block" not in n]
+        assert len(target_part) >= 2
+
+
+def test_mtp_never_enters_owners_or_scratch_aliases():
+    config, global_group, _, pp1_spec = _pp_placement_fixture(mtp=True)
+    mtp_name = "model.layers.8.mtp_block.self_attn.attn"
+    pp_local = project_kv_cache_groups_to_worker([global_group], pp1_spec)
+
+    owners = get_kvpp_layer_owners(config, pp1_spec)
+    _, scratch_aliases = _get_allocation_groups(
+        pp_local, pp1_spec, owners, kvpp_rank=0
+    )
+
+    assert mtp_name not in owners
+    assert mtp_name not in scratch_aliases
+
+
+def test_projection_keeps_group_index_positions():
+    config = _config()
+    target_names = [f"model.layers.{i}.self_attn.attn" for i in range(8)]
+    mtp_name = "model.layers.8.mtp_block.self_attn.attn"
+    spec = _spec()
+    global_groups = [
+        KVCacheGroupSpec(target_names[:4], spec),
+        KVCacheGroupSpec(target_names[4:] + [mtp_name], spec),
+    ]
+    pp0_spec = dict.fromkeys(target_names[:4], spec)
+
+    projected = project_kv_cache_groups_to_worker(global_groups, pp0_spec)
+
+    # Group count and index positions stay global; PP0's second group is empty.
+    assert len(projected) == 2
+    assert projected[0].layer_names == target_names[:4]
+    assert projected[1].layer_names == []
+
+
+def test_allocation_rejects_foreign_layers_after_projection():
+    layer_names = [f"model.layers.{i}.self_attn.attn" for i in range(4)]
+    spec = _spec()
+    foreign_group = KVCacheGroupSpec(layer_names, spec)
+    local_spec = dict.fromkeys(layer_names[:2], spec)
+    owners = {layer_names[0]: 0, layer_names[1]: 1}
+
+    with pytest.raises(ValueError, match="outside the current PP stage"):
+        _get_allocation_groups(
+            [foreign_group], local_spec, owners, kvpp_rank=0
+        )
+
+
+def test_worker_kvpp_rank_is_explicit_tp_then_kvpp_reduction():
+    config = _config(kvpp_size=4, tensor_parallel_size=8)
+
+    # PP1 workers (indices 8..15) map to TP ranks 0..7, KVPP ranks 0..3.
+    ranks = [_get_worker_kvpp_rank(config, index) for index in range(8, 16)]
+    assert ranks == [0, 1, 2, 3, 0, 1, 2, 3]
+
+    with pytest.raises(ValueError, match="divisible"):
+        _get_worker_kvpp_rank(
+            _config(kvpp_size=3, tensor_parallel_size=8), worker_index=0
+        )

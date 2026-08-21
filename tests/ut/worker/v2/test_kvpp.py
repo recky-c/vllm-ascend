@@ -13,11 +13,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
     _store_url_for_kvpp_group,
 )
 from vllm_ascend.worker.v2.kvpp import (
+    KVPPExecutionPlan,
     KVPPPhase,
     KVPPScheduler,
     _active_pages,
     get_kvpp_managed_group_index,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 
 
 def test_managed_group_allows_replicated_mtp_groups():
@@ -690,3 +692,68 @@ def test_sfa_cache_bundle_rejects_mismatched_owners():
             execution_layers=(attn_layer,),
             transport=SimpleNamespace(),
         )
+
+
+# ---------------------------------------------------------------------------
+# PP-local execution plan tests
+# ---------------------------------------------------------------------------
+
+
+def _local_owners(layer_names, kvpp_size=2):
+    """Small helper mirroring placement owner semantics in UTs."""
+    names = sorted(layer_names)
+    return {
+        name: index * kvpp_size // len(names)
+        for index, name in enumerate(names)
+    }
+
+
+def test_pp_execution_plan_contains_only_local_stage_layers():
+    pp0_layers = tuple(f"model.layers.{i}.self_attn.attn" for i in range(30))
+    pp1_layers = tuple(f"model.layers.{i}.self_attn.attn" for i in range(30, 60))
+
+    pp0_plan = KVPPExecutionPlan.build(
+        _local_owners(pp0_layers), pp0_layers
+    )
+    pp1_plan = KVPPExecutionPlan.build(
+        _local_owners(pp1_layers), pp1_layers
+    )
+
+    assert set(pp0_plan.layers) == set(pp0_layers)
+    assert set(pp1_plan.layers) == set(pp1_layers)
+    assert not set(pp0_plan.layers) & set(pp1_plan.layers)
+
+
+def test_pp_execution_plan_rejects_foreign_stage_layer():
+    local_layers = tuple(f"model.layers.{i}.self_attn.attn" for i in range(30))
+    foreign_layer = "model.layers.59.self_attn.attn"
+
+    with pytest.raises(ValueError, match="no KV cache owner"):
+        KVPPExecutionPlan.build(_local_owners(local_layers), (*local_layers, foreign_layer))
+
+
+def test_pp_execution_plan_rejects_mtp_layer():
+    local_layers = tuple(f"model.layers.{i}.self_attn.attn" for i in range(30))
+    mtp_layer = "model.layers.30.mtp_block.self_attn.attn"
+
+    with pytest.raises(ValueError, match="no KV cache owner"):
+        KVPPExecutionPlan.build(_local_owners(local_layers), (*local_layers, mtp_layer))
+
+
+def test_sfa_bundle_uses_global_layer_index_within_pp_stage():
+    # Layer 35 is the 6th local layer of PP1; its bundle must still be keyed
+    # by global index 35, never renumbered to a local ordinal.
+    attn_layer = "model.layers.35.self_attn.attn"
+    indexer_layer = "model.layers.35.self_attn.indexer.k_cache"
+    scheduler = KVPPScheduler(
+        group=SimpleNamespace(rank_in_group=0, world_size=1),
+        layer_owners={attn_layer: 0, indexer_layer: 0},
+        num_blocks=10,
+        block_size=4,
+        execution_layers=(attn_layer,),
+        transport=SimpleNamespace(),
+    )
+
+    assert scheduler.plan.cache_bundles[attn_layer] == (attn_layer, indexer_layer)
+    assert extract_layer_index(attn_layer) == 35
+

@@ -238,6 +238,29 @@ class NPUModelRunner(GPUModelRunner):
 
         self._initialize_kvpp_scheduler()
 
+    def _validate_local_mtp_layers(
+        self,
+        layer_names: tuple[str, ...],
+        layer_owners: dict[str, int],
+        draft_layer_names: set[str],
+    ) -> None:
+        """Fail fast on wrong MTP placement for this PP stage.
+
+        The last PP stage must hold the MTP cache (replicated across KVPP
+        ranks); non-last stages must not hold any MTP cache.
+        """
+        local_mtp_layers = set(draft_layer_names).intersection(layer_names)
+        if self.is_last_pp_rank and not local_mtp_layers:
+            raise RuntimeError(
+                "MTP is enabled on the last pipeline stage, but no MTP KV "
+                "cache layers were found in the local cache groups."
+            )
+        if not self.is_last_pp_rank and local_mtp_layers:
+            raise RuntimeError(
+                "Non-last pipeline stages must not hold MTP KV cache layers, "
+                f"but found {sorted(local_mtp_layers)}."
+            )
+
     def _initialize_kvpp_scheduler(self) -> None:
         if self.kvpp_size <= 1:
             return
@@ -266,6 +289,9 @@ class NPUModelRunner(GPUModelRunner):
                     "but these layers have KVPP owners: "
                     f"{sorted(managed_draft_layers)}."
                 )
+            self._validate_local_mtp_layers(
+                layer_names, layer_owners, draft_layer_names
+            )
 
         blocks_per_kv_block = self.block_tables.blocks_per_kv_block[
             kvpp_cache_group_index

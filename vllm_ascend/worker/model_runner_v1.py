@@ -57,6 +57,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.offloader.base import get_offloader, set_offloader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
@@ -3765,6 +3766,43 @@ class NPUModelRunner(GPUModelRunner):
         if self.kvpp_size > 1:
             self._initialize_kvpp_scheduler(kv_caches)
 
+    def _validate_local_mtp_layers(
+        self,
+        layer_names: tuple[str, ...],
+        layer_owners: dict[str, int],
+    ) -> None:
+        """Fail fast on wrong MTP placement for this PP stage."""
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None or speculative_config.method != "mtp":
+            return
+        hf_config = self.vllm_config.model_config.hf_config
+        mtp_start = getattr(hf_config, "num_hidden_layers", None)
+        num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", None)
+        if mtp_start is None or not num_mtp_layers:
+            return
+        mtp_end = mtp_start + num_mtp_layers
+        local_mtp_layers = {
+            name
+            for name in layer_names
+            if mtp_start <= extract_layer_index(name) < mtp_end
+        }
+        if get_pp_group().is_last_rank and not local_mtp_layers:
+            raise RuntimeError(
+                "MTP is enabled on the last pipeline stage, but no MTP KV "
+                "cache layers were found in the local cache groups."
+            )
+        if not get_pp_group().is_last_rank and local_mtp_layers:
+            raise RuntimeError(
+                "Non-last pipeline stages must not hold MTP KV cache layers, "
+                f"but found {sorted(local_mtp_layers)}."
+            )
+        if local_mtp_layers & set(layer_owners):
+            raise RuntimeError(
+                "MTP attention layers must be replicated outside KVPP, "
+                "but these layers have KVPP owners: "
+                f"{sorted(local_mtp_layers & set(layer_owners))}."
+            )
+
     def _initialize_kvpp_scheduler(self, kv_caches: dict[str, Any]) -> None:
         if self.kvpp_size <= 1:
             return
@@ -3781,6 +3819,8 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_cache_config.kv_cache_groups, layer_owners
         )
         self.kvpp_cache_group_index = kvpp_cache_group_index
+
+        self._validate_local_mtp_layers(layer_names, layer_owners)
 
         block_table = self.input_batch.block_table[kvpp_cache_group_index]
         blocks_per_kv_block = block_table.blocks_per_phys_block
