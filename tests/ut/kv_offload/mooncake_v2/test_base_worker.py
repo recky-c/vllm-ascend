@@ -60,6 +60,7 @@ def test_register_kv_caches_uses_config_order_and_publishes_tensor_metadata(monk
     worker.block_size = 16
     worker.side_channel_host = "10.0.0.1"
     worker.handshake_port = 5000
+    worker.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=1))
     transfer_engine = MagicMock()
     monkeypatch.setattr(
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker.global_te",
@@ -83,6 +84,59 @@ def test_register_kv_caches_uses_config_order_and_publishes_tensor_metadata(monk
     transfer_engine.register_buffer.assert_called_once()
 
 
+def test_register_kv_caches_publishes_only_kvpp_owner_and_replicated_layers(monkeypatch) -> None:
+    spec = make_full_spec()
+    caches = {
+        layer_name: torch.empty((2, 1, 16, 8), dtype=torch.float16)
+        for layer_name in ("layer.0", "layer.1", "layer.2")
+    }
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[
+            KVCacheTensor(size=cache.nbytes, shared_by=[layer_name])
+            for layer_name, cache in caches.items()
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=list(caches), kv_cache_spec=spec)
+        ],
+    )
+    worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
+    worker.kv_cache_config = config
+    worker.vllm_config = object()
+    worker.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=2))
+    worker.tp_rank = 1
+    worker.engine_id = "engine-p"
+    worker.te_rpc_port = 9000
+    worker.block_size = 16
+    worker.side_channel_host = "10.0.0.1"
+    worker.handshake_port = 5000
+
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker.get_kvpp_layer_owners",
+        MagicMock(return_value={"layer.0": 0, "layer.1": 1}),
+    )
+    transfer_engine = MagicMock()
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker.global_te",
+        transfer_engine,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker.validate_register_region_count",
+        MagicMock(),
+    )
+
+    worker.register_kv_caches(caches)
+
+    metadata = worker.xfer_handshake_metadata
+    assert metadata is not None
+    assert metadata.layer_names == ["layer.1", "layer.2"]
+    assert metadata.kv_caches_base_addr == [
+        [caches["layer.1"].data_ptr()],
+        [caches["layer.2"].data_ptr()],
+    ]
+    transfer_engine.register_buffer.assert_called_once()
+
+
 def test_register_kv_caches_rejects_missing_and_unconfigured_layers() -> None:
     spec = make_full_spec()
     config = KVCacheConfig(
@@ -97,6 +151,7 @@ def test_register_kv_caches_rejects_missing_and_unconfigured_layers() -> None:
     worker.block_size = 16
     worker.side_channel_host = "host"
     worker.handshake_port = 5000
+    worker.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=1))
 
     try:
         worker.register_kv_caches({})

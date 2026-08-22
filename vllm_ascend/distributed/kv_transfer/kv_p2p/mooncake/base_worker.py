@@ -46,6 +46,7 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
+from vllm_ascend.v1.core.kv_cache_placement import get_kvpp_layer_owners
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -146,6 +147,30 @@ class MooncakeBaseConnectorWorker:
                 self.layer_name_to_group_index[layer_name] = group_index
                 self.layer_name_to_spec_index[layer_name] = spec_index
 
+    def _get_published_layer_names(self) -> set[str]:
+        """Return layers whose persistent KV is owned by this worker.
+
+        KVPP expands its two scratch tensors to aliases for every foreign
+        layer so model execution can address them by logical layer name.  The
+        aliases are transient and must not be advertised as remotely readable
+        KV: after prefill they contain whichever foreign layer used the
+        scratch slot last.  Publish only this KVPP rank's persistent target
+        layers, while keeping MTP layers (which are absent from ``owners`` and
+        intentionally replicated) visible on every rank.
+        """
+        kvpp_size = self.ascend_config.kvpp_config.size
+        all_layer_names = set(self.layer_name_to_group_index)
+        if kvpp_size <= 1:
+            return all_layer_names
+
+        owners = get_kvpp_layer_owners(self.vllm_config, all_layer_names)
+        kvpp_rank = self.tp_rank % kvpp_size
+        return {
+            layer_name
+            for layer_name in all_layer_names
+            if layer_name not in owners or owners[layer_name] == kvpp_rank
+        }
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
@@ -155,6 +180,7 @@ class MooncakeBaseConnectorWorker:
         logger.info("num_blocks: %s", self.num_blocks)
         self.kv_caches = kv_caches
         self._build_kv_cache_spec_mappings()
+        published_layer_names = self._get_published_layer_names()
         layer_names: list[str] = []
         layer_block_sizes: list[int] = []
         group_indices: list[int] = []
@@ -176,6 +202,10 @@ class MooncakeBaseConnectorWorker:
                 if cache_or_caches is None:
                     raise ValueError(f"No KV cache was registered for configured layer {layer_name!r}.")
 
+                configured_layer_names.add(layer_name)
+                if layer_name not in published_layer_names:
+                    continue
+
                 base_addrs: list[int] = []
                 block_strides: list[int] = []
                 block_lens: list[int] = []
@@ -192,7 +222,6 @@ class MooncakeBaseConnectorWorker:
                     block_shapes.append(block_shape)
                     block_size_scales.append(tensor_num_blocks // self.num_blocks)
 
-                configured_layer_names.add(layer_name)
                 layer_names.append(layer_name)
                 spec_index = self.layer_name_to_spec_index[layer_name]
                 layer_block_sizes.append(self.kv_cache_specs[spec_index].block_size)
