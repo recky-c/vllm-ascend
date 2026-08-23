@@ -97,7 +97,7 @@ find_path(MEMFABRIC_MTE_INCLUDE_DIR
     NAMES smem/device/smem_shm_aicore_base_api.h
     HINTS "$ENV{MEMFABRIC_HYBRID_HOME_PATH}/include"
           ${MEMFABRIC_HYBRID_INCLUDE_CANDIDATES})
-if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950") AND
+if(NOT (SOC_VERSION MATCHES "ascend310p.*") AND
    MEMFABRIC_MTE_INCLUDE_DIR)
     message(STATUS "MemFabric Hybrid MTE: enabled from ${MEMFABRIC_MTE_INCLUDE_DIR}")
     ascendc_library(vllm_ascend_kvpp_mte_kernels SHARED
@@ -106,7 +106,7 @@ if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950") AND
         "${MEMFABRIC_MTE_INCLUDE_DIR}")
     set(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE ON)
 else()
-    message(STATUS "MemFabric Hybrid MTE: disabled (device header not found)")
+    message(STATUS "MemFabric Hybrid MTE: disabled (unsupported SoC or device header not found)")
 endif()
 
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
@@ -216,10 +216,15 @@ set(VLLM_ASCEND_C_COMMON_LIBS
 )
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+  set(VLLM_ASCEND_PLATFORM_LIBS ${VLLM_ASCEND_C_COMMON_LIBS})
+  if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    list(APPEND VLLM_ASCEND_PLATFORM_LIBS
+      vllm_ascend_kvpp_mte_kernels)
+  endif()
   target_link_libraries(
     vllm_ascend_C
     PUBLIC
-    ${VLLM_ASCEND_C_COMMON_LIBS}
+    ${VLLM_ASCEND_PLATFORM_LIBS}
   )
 else()
   set(VLLM_ASCEND_DIRECT_KERNEL_LIBS vllm_ascend_kernels)
@@ -238,7 +243,13 @@ endif()
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
-  install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  set(VLLM_ASCEND_INSTALL_TARGETS vllm_ascend_C)
+  if(VLLM_ASCEND_ENABLE_MEMFABRIC_MTE)
+    list(APPEND VLLM_ASCEND_INSTALL_TARGETS
+      vllm_ascend_kvpp_mte_kernels)
+  endif()
+  install(TARGETS ${VLLM_ASCEND_INSTALL_TARGETS}
+    DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
   set(VLLM_ASCEND_INSTALL_TARGETS vllm_ascend_C)
   if(NOT VLLM_ASCEND_PREBUILT_KERNELS)

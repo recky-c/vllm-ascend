@@ -2017,8 +2017,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor? gk=None) -> Tensor");
     ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
 
-#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
-    // Direct kernel custom ops
 #ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
     ops.def(
         "kvpp_mte_copy(Tensor anchor, Tensor local_offsets, "
@@ -2028,6 +2026,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("kvpp_mte_copy", torch::kPrivateUse1,
              &vllm_ascend::kvpp_mte_copy);
 #endif
+#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+    // Direct kernel custom ops
 
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);
