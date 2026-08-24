@@ -10,7 +10,11 @@ from vllm.v1.attention.selector import AttentionSelectorConfig  # type: ignore
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_profile_run
-from vllm_ascend.platform import NPUPlatform, _validate_eplb_config
+from vllm_ascend.platform import (
+    NPUPlatform,
+    _validate_eplb_config,
+    _validate_parallel_config,
+)
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
     COMPRESSED_TENSORS_METHOD,
@@ -1276,7 +1280,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.model_config.enforce_eager = True
         vllm_config.kv_transfer_config = None
 
-        self.platform._validate_parallel_config(vllm_config)
+        _validate_parallel_config(vllm_config)
 
     def test_validate_parallel_config_accepts_kvpp_full_graph(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -1287,7 +1291,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.model_config.enforce_eager = False
         vllm_config.kv_transfer_config = None
 
-        self.platform._validate_parallel_config(vllm_config)
+        _validate_parallel_config(vllm_config)
 
     def test_validate_parallel_config_accepts_kvpp_with_pipeline_parallel(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -1314,7 +1318,7 @@ class TestNPUPlatform(TestBase):
             num_speculative_tokens_per_batch_size=None,
         )
 
-        self.platform._validate_parallel_config(vllm_config)
+        _validate_parallel_config(vllm_config)
 
     def test_validate_parallel_config_rejects_kvpp_with_non_mtp_spec(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -1329,7 +1333,7 @@ class TestNPUPlatform(TestBase):
         )
 
         with pytest.raises(ValueError, match="only with method='mtp'"):
-            self.platform._validate_parallel_config(vllm_config)
+            _validate_parallel_config(vllm_config)
 
     def test_validate_parallel_config_rejects_kvpp_with_dynamic_mtp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -1344,7 +1348,7 @@ class TestNPUPlatform(TestBase):
         )
 
         with pytest.raises(ValueError, match="fixed number"):
-            self.platform._validate_parallel_config(vllm_config)
+            _validate_parallel_config(vllm_config)
 
     def test_validate_parallel_config_rejects_kvpp_with_dcp(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -1354,7 +1358,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.parallel_config.decode_context_parallel_size = 2
 
         with pytest.raises(ValueError, match="KVPP and DCP"):
-            self.platform._validate_parallel_config(vllm_config)
+            _validate_parallel_config(vllm_config)
 
     def test_validate_parallel_config_accepts_kvpp_model_runner_v1(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -1362,7 +1366,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.parallel_config.tensor_parallel_size = 2
         vllm_config.model_config.use_mla = True
 
-        self.platform._validate_parallel_config(vllm_config)
+        _validate_parallel_config(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)

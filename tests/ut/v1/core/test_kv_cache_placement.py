@@ -30,6 +30,9 @@ def _config(
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
         ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+        ),
         speculative_config=(SimpleNamespace(method="mtp") if mtp else None),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
