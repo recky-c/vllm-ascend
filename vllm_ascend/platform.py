@@ -162,42 +162,6 @@ class NPUPlatform(Platform):
         register_ascend_kv_cache_specs()
 
     @classmethod
-    def get_kv_cache_groups_for_worker(
-        cls,
-        vllm_config: VllmConfig,
-        global_kv_cache_groups,
-        worker_kv_cache_spec,
-        worker_index: int,
-    ):
-        from vllm_ascend.v1.core.kv_cache_placement import get_kv_cache_groups_for_worker
-
-        return get_kv_cache_groups_for_worker(
-            vllm_config,
-            global_kv_cache_groups,
-            worker_kv_cache_spec,
-            worker_index,
-        )
-
-    @classmethod
-    def finalize_kv_cache_config(
-        cls,
-        vllm_config: VllmConfig,
-        kv_cache_config,
-        global_kv_cache_groups,
-        worker_kv_cache_spec,
-        worker_index: int,
-    ) -> None:
-        from vllm_ascend.v1.core.kv_cache_placement import finalize_kv_cache_config
-
-        finalize_kv_cache_config(
-            vllm_config,
-            kv_cache_config,
-            global_kv_cache_groups,
-            worker_kv_cache_spec,
-            worker_index,
-        )
-
-    @classmethod
     def get_pass_manager_cls(cls) -> str:
         """
         Get the pass manager class for this platform.

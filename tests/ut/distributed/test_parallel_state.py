@@ -155,23 +155,23 @@ def test_get_global_rank_defaults_to_current_config():
 # ---------------------------------------------------------------------------
 
 
-def _kvpp_group_partition(world_size, tp_size, pp_size, dp_size, pcp_size, kvpp_size):
+def _kvpp_group_partition(world_size, tp_size, pp_size, dp_size, pcp_size):
     """Recreate the rank layout used by init_ascend_model_parallel."""
     all_ranks = torch.arange(world_size).reshape(
         -1, dp_size, pp_size, pcp_size, tp_size
     )
-    return [ranks.tolist() for ranks in all_ranks.reshape(-1, kvpp_size).unbind(0)]
+    return [ranks.tolist() for ranks in all_ranks.reshape(-1, tp_size).unbind(0)]
 
 
 @pytest.mark.parametrize(
-    "tp_size, pp_size, dp_size, pcp_size, kvpp_size",
+    "tp_size, pp_size, dp_size, pcp_size",
     [
-        (4, 2, 1, 1, 2),
-        (8, 2, 1, 1, 4),
+        (4, 2, 1, 1),
+        (8, 2, 1, 1),
     ],
 )
 def test_kvpp_groups_never_cross_pp_stages(
-    tp_size, pp_size, dp_size, pcp_size, kvpp_size
+    tp_size, pp_size, dp_size, pcp_size
 ):
     world_size = tp_size * pp_size * dp_size * pcp_size
     pp_stage_of_rank = [
@@ -181,10 +181,10 @@ def test_kvpp_groups_never_cross_pp_stages(
     ]
 
     groups = _kvpp_group_partition(
-        world_size, tp_size, pp_size, dp_size, pcp_size, kvpp_size
+        world_size, tp_size, pp_size, dp_size, pcp_size
     )
 
-    assert len(groups) == world_size // kvpp_size
+    assert len(groups) == world_size // tp_size
     for group in groups:
         stages = {pp_stage_of_rank[rank] for rank in group}
         assert len(stages) == 1, (
@@ -192,15 +192,13 @@ def test_kvpp_groups_never_cross_pp_stages(
         )
 
 
-def test_kvpp_groups_match_expected_layout_pp2_tp8_kvpp4():
+def test_kvpp_groups_match_expected_layout_pp2_tp8():
     groups = _kvpp_group_partition(
-        world_size=16, tp_size=8, pp_size=2, dp_size=1, pcp_size=1, kvpp_size=4
+        world_size=16, tp_size=8, pp_size=2, dp_size=1, pcp_size=1
     )
 
     assert groups == [
-        [0, 1, 2, 3],
-        [4, 5, 6, 7],
-        [8, 9, 10, 11],
-        [12, 13, 14, 15],
+        list(range(8)),
+        list(range(8, 16)),
     ]
 

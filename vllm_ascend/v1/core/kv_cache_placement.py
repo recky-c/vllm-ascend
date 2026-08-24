@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -12,6 +14,66 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.kvpp_config import KVPPConfig
+
+
+@dataclass(frozen=True)
+class KVPPPhysicalCachePlan:
+    """Worker-local physical allocation with a complete logical cache view."""
+
+    logical_spec: dict[str, KVCacheSpec]
+    physical_spec: dict[str, KVCacheSpec]
+    scratch_aliases: dict[str, list[str]]
+
+    def apply_to_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Restore logical layer bindings on an upstream physical config."""
+        for tensor in kv_cache_config.kv_cache_tensors:
+            expanded_names: list[str] = []
+            for layer_name in tensor.shared_by:
+                expanded_names.extend(
+                    self.scratch_aliases.get(layer_name, [layer_name])
+                )
+            tensor.shared_by = list(dict.fromkeys(expanded_names))
+
+        logical_groups: list[KVCacheGroupSpec] = []
+        for group in kv_cache_config.kv_cache_groups:
+            expanded_names: list[str] = []
+            for layer_name in group.layer_names:
+                expanded_names.extend(
+                    self.scratch_aliases.get(layer_name, [layer_name])
+                )
+            expanded_names = list(dict.fromkeys(expanded_names))
+
+            group_spec = group.kv_cache_spec
+            if expanded_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
+                group_spec = UniformTypeKVCacheSpecs(
+                    block_size=group_spec.block_size,
+                    kv_cache_specs={
+                        layer_name: self.logical_spec[layer_name]
+                        for layer_name in expanded_names
+                    },
+                )
+            logical_groups.append(
+                KVCacheGroupSpec(
+                    expanded_names,
+                    group_spec,
+                    is_eagle_group=group.is_eagle_group,
+                )
+            )
+
+        restored_names = {
+            layer_name
+            for group in logical_groups
+            for layer_name in group.layer_names
+        }
+        expected_names = set(self.logical_spec)
+        if restored_names != expected_names:
+            missing = sorted(expected_names - restored_names)
+            unexpected = sorted(restored_names - expected_names)
+            raise ValueError(
+                "KVPP failed to restore the worker-local logical cache view: "
+                f"missing={missing}, unexpected={unexpected}."
+            )
+        kv_cache_config.kv_cache_groups = logical_groups
 
 
 def project_kv_cache_groups_to_worker(
@@ -114,27 +176,6 @@ def get_kvpp_layer_owners(
     return owners
 
 
-def _get_worker_kvpp_rank(
-    vllm_config: VllmConfig,
-    worker_index: int,
-) -> int:
-    """Config-only KVPP group local rank for a worker.
-
-    The global worker index is first reduced to the TP rank inside its PP
-    stage, then to the KVPP group local rank. This avoids depending on the
-    distributed KVPP group being initialized during cache placement.
-    """
-    parallel_config = vllm_config.parallel_config
-    tp_size = parallel_config.tensor_parallel_size
-    kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
-    if tp_size % kvpp_size != 0:
-        raise ValueError(
-            f"tensor_parallel_size ({tp_size}) must be divisible by kvpp_size ({kvpp_size})."
-        )
-    tp_rank = worker_index % tp_size
-    return tp_rank % kvpp_size
-
-
 def _get_allocation_groups(
     logical_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
@@ -197,55 +238,48 @@ def _get_allocation_groups(
     )
 
 
-def get_kv_cache_groups_for_worker(
+def build_kvpp_physical_cache_plan(
     vllm_config: VllmConfig,
-    global_groups: list[KVCacheGroupSpec],
     worker_spec: dict[str, KVCacheSpec],
-    worker_index: int,
-) -> list[KVCacheGroupSpec] | None:
-    """Custom KV cache placement for a KVPP worker.
+    kvpp_rank: int,
+) -> KVPPPhysicalCachePlan | None:
+    """Build the physical spec reported by one worker to upstream vLLM.
 
-    The global logical groups are first projected to this worker's PP-local
-    layers, then KVPP owner partitioning and allocation run entirely on the
-    PP-local view. Group indices keep their global positions.
+    The union of owner specs across KVPP ranks still contains every logical
+    layer, so upstream can build the global logical topology normally. Each
+    worker only reports its persistent layers, two scratch layers per cache
+    layout, and replicated MTP layers; upstream therefore computes the desired
+    physical allocation without any KVPP-specific hook.
     """
     kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
     if kvpp_size <= 1:
         return None
-    pp_local_groups = project_kv_cache_groups_to_worker(global_groups, worker_spec)
+    if kvpp_rank < 0 or kvpp_rank >= kvpp_size:
+        raise ValueError(
+            f"KVPP rank must be in [0, {kvpp_size}), got {kvpp_rank}."
+        )
+
+    logical_spec = dict(worker_spec)
+    # get_kv_cache_groups may normalize its input in place, so keep the spec
+    # returned to the engine and the spec retained for logical restoration
+    # independent from its working copy.
+    logical_groups = get_kv_cache_groups(vllm_config, dict(logical_spec))
     owners = get_kvpp_layer_owners(vllm_config, worker_spec)
-    kvpp_rank = _get_worker_kvpp_rank(vllm_config, worker_index)
-    allocation_groups, _ = _get_allocation_groups(
-        pp_local_groups, worker_spec, owners, kvpp_rank
+    allocation_groups, scratch_aliases = _get_allocation_groups(
+        logical_groups, worker_spec, owners, kvpp_rank
     )
-    return allocation_groups
-
-
-def finalize_kv_cache_config(
-    vllm_config: VllmConfig,
-    kv_cache_config: KVCacheConfig,
-    global_groups: list[KVCacheGroupSpec],
-    worker_spec: dict[str, KVCacheSpec],
-    worker_index: int,
-) -> None:
-    """Finalize per-worker KV cache config with the PP-local KVPP view.
-
-    Uses the same PP-local projection as the allocation stage so the finalized
-    logical cache topology and scratch aliases are consistent with what was
-    allocated.
-    """
-    kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
-    if kvpp_size <= 1:
-        return
-    pp_local_groups = project_kv_cache_groups_to_worker(global_groups, worker_spec)
-    owners = get_kvpp_layer_owners(vllm_config, worker_spec)
-    kvpp_rank = _get_worker_kvpp_rank(vllm_config, worker_index)
-    _, scratch_aliases = _get_allocation_groups(
-        pp_local_groups, worker_spec, owners, kvpp_rank
+    physical_names = {
+        layer_name
+        for group in allocation_groups
+        for layer_name in group.layer_names
+    }
+    physical_spec = {
+        layer_name: logical_spec[layer_name]
+        for layer_name in logical_spec
+        if layer_name in physical_names
+    }
+    return KVPPPhysicalCachePlan(
+        logical_spec=logical_spec,
+        physical_spec=physical_spec,
+        scratch_aliases=scratch_aliases,
     )
-    for tensor in kv_cache_config.kv_cache_tensors:
-        expanded_names: list[str] = []
-        for layer_name in tensor.shared_by:
-            expanded_names.extend(scratch_aliases.get(layer_name, [layer_name]))
-        tensor.shared_by = list(dict.fromkeys(expanded_names))
-    kv_cache_config.kv_cache_groups = pp_local_groups

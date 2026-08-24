@@ -2,12 +2,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MLAAttentionSpec,
+)
 
 from vllm_ascend.v1.core.kv_cache_placement import (
     _get_allocation_groups,
-    _get_worker_kvpp_rank,
-    get_kv_cache_groups_for_worker,
+    build_kvpp_physical_cache_plan,
     get_kvpp_layer_owners,
     project_kv_cache_groups_to_worker,
 )
@@ -15,14 +19,13 @@ from vllm_ascend.v1.core.kv_cache_placement import (
 
 def _config(
     *,
-    kvpp_size: int = 2,
     mtp: bool = False,
     pipeline_parallel_size: int = 1,
-    tensor_parallel_size: int = 8,
+    tensor_parallel_size: int = 2,
     num_hidden_layers: int = 4,
 ):
     return SimpleNamespace(
-        additional_config={"kvpp_size": kvpp_size},
+        additional_config={"enable_kvpp": True},
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -119,7 +122,6 @@ def _pp_placement_fixture(*, mtp: bool):
     PP0 worker holds layers 0~3; PP1 worker holds layers 4~7 plus MTP 8.
     """
     config = _config(
-        kvpp_size=2,
         mtp=mtp,
         pipeline_parallel_size=2,
         num_hidden_layers=8,
@@ -135,13 +137,11 @@ def _pp_placement_fixture(*, mtp: bool):
 
 
 def test_pp0_placement_is_local_and_mtp_free():
-    config, global_group, pp0_spec, _ = _pp_placement_fixture(mtp=True)
+    config, _, pp0_spec, _ = _pp_placement_fixture(mtp=True)
 
-    groups = get_kv_cache_groups_for_worker(
-        config, [global_group], pp0_spec, worker_index=0
-    )
-    assert groups is not None
-    local_layers = groups[0].layer_names
+    plan = build_kvpp_physical_cache_plan(config, pp0_spec, kvpp_rank=0)
+    assert plan is not None
+    local_layers = set(plan.physical_spec)
 
     # PP0 owns target 0~1 persistent, target 2~3 scratch, no MTP.
     assert not any("mtp_block" in name for name in local_layers)
@@ -149,18 +149,20 @@ def test_pp0_placement_is_local_and_mtp_free():
 
 
 def test_pp1_placement_replicates_mtp_on_every_kvpp_rank():
-    config, global_group, _, pp1_spec = _pp_placement_fixture(mtp=True)
+    config, _, _, pp1_spec = _pp_placement_fixture(mtp=True)
     mtp_name = "model.layers.8.mtp_block.self_attn.attn"
 
-    for worker_index, kvpp_rank in ((8, 0), (9, 1)):
-        groups = get_kv_cache_groups_for_worker(
-            config, [global_group], pp1_spec, worker_index
+    for kvpp_rank in (0, 1):
+        plan = build_kvpp_physical_cache_plan(
+            config, pp1_spec, kvpp_rank
         )
-        assert groups is not None
+        assert plan is not None
         # MTP must be allocated in full on every KVPP rank.
-        assert mtp_name in groups[0].layer_names
+        assert mtp_name in plan.physical_spec
         # Both KVPP ranks still allocate their own target persistent part.
-        target_part = [n for n in groups[0].layer_names if "mtp_block" not in n]
+        target_part = [
+            name for name in plan.physical_spec if "mtp_block" not in name
+        ]
         assert len(target_part) >= 2
 
 
@@ -210,14 +212,31 @@ def test_allocation_rejects_foreign_layers_after_projection():
         )
 
 
-def test_worker_kvpp_rank_is_explicit_tp_then_kvpp_reduction():
-    config = _config(kvpp_size=4, tensor_parallel_size=8)
+def test_physical_plan_restores_logical_groups_and_scratch_aliases():
+    config = _config()
+    layer_names = [f"model.layers.{i}.self_attn.attn" for i in range(4)]
+    spec = _spec()
+    worker_spec = dict.fromkeys(layer_names, spec)
+    plan = build_kvpp_physical_cache_plan(config, worker_spec, kvpp_rank=0)
+    assert plan is not None
 
-    # PP1 workers (indices 8..15) map to TP ranks 0..7, KVPP ranks 0..3.
-    ranks = [_get_worker_kvpp_rank(config, index) for index in range(8, 16)]
-    assert ranks == [0, 1, 2, 3, 0, 1, 2, 3]
+    physical_names = list(plan.physical_spec)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[
+            KVCacheTensor(size=1024, shared_by=[name])
+            for name in physical_names
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(physical_names, spec)],
+    )
 
-    with pytest.raises(ValueError, match="divisible"):
-        _get_worker_kvpp_rank(
-            _config(kvpp_size=3, tensor_parallel_size=8), worker_index=0
-        )
+    plan.apply_to_config(kv_cache_config)
+
+    assert set(kv_cache_config.kv_cache_groups[0].layer_names) == set(
+        layer_names
+    )
+    assert {
+        layer_name
+        for tensor in kv_cache_config.kv_cache_tensors
+        for layer_name in tensor.shared_by
+    } == set(layer_names)

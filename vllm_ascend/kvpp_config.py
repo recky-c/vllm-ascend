@@ -23,9 +23,20 @@ class KVPPConfig:
     @classmethod
     def from_vllm_config(cls, vllm_config: "VllmConfig") -> "KVPPConfig":
         additional_config = vllm_config.additional_config or {}
-        size = additional_config.get("kvpp_size", 1)
-        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
-            raise ValueError(f"additional_config.kvpp_size must be a positive integer, got {size!r}.")
+        if "kvpp_size" in additional_config:
+            raise ValueError(
+                "additional_config.kvpp_size is no longer supported; "
+                "use additional_config.enable_kvpp=true instead."
+            )
+
+        enabled = additional_config.get("enable_kvpp", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                "additional_config.enable_kvpp must be a boolean, "
+                f"got {enabled!r}."
+            )
+
+        size = vllm_config.parallel_config.tensor_parallel_size if enabled else 1
         return cls(size=size)
 
     def validate(self, vllm_config: "VllmConfig") -> None:

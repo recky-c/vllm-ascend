@@ -134,7 +134,6 @@ class NPUModelRunner(GPUModelRunner):
         self.kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
         self.kvpp_scheduler: KVPPScheduler | None = None
         self.kvpp_cache_group_index: int | None = None
-        self._kvpp_kv_caches: dict[str, Any] | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -321,21 +320,19 @@ class NPUModelRunner(GPUModelRunner):
             transport=transport,
             execution_layers=tuple(kvpp_impls),
         )
-        if self._kvpp_kv_caches is None:
-            raise RuntimeError("KVPP cache tensors were not retained during allocation.")
-        managed_kv_caches = {
-            layer_name: self._kvpp_kv_caches[layer_name]
-            for layer_name in layer_owners
-        }
+        managed_kv_caches: dict[str, Any] = {}
+        for layer_name in layer_owners:
+            module = self.compilation_config.static_forward_context.get(layer_name)
+            if module is None or not hasattr(module, "kv_cache"):
+                raise RuntimeError(
+                    "KVPP could not find the bound cache for logical layer "
+                    f"{layer_name!r}."
+                )
+            managed_kv_caches[layer_name] = module.kv_cache
         kvpp_scheduler.initialize_transport(managed_kv_caches)
-        self._kvpp_kv_caches = None
         self.kvpp_scheduler = kvpp_scheduler
         for impl in kvpp_impls.values():
             impl.layerwise_kv_cache_hook = kvpp_scheduler
-
-    def _on_kv_caches_initialized(self, kv_caches_dict: dict[str, Any]) -> None:
-        if self.kvpp_size > 1:
-            self._kvpp_kv_caches = kv_caches_dict
 
     def _begin_kvpp_forward(
         self,
