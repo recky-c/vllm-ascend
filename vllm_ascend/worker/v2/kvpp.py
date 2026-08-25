@@ -36,6 +36,7 @@ class KVPPExecutionPlan:
         if not layers:
             raise ValueError("KVPP requires at least one executable attention layer.")
 
+        cache_bundles: dict[str, tuple[str, ...]]
         if execution_layers is None:
             cache_bundles = {layer_name: (layer_name,) for layer_name in layers}
         else:
@@ -46,7 +47,7 @@ class KVPPExecutionPlan:
             ):
                 cache_layers_by_index.setdefault(extract_layer_index(cache_layer_name), []).append(cache_layer_name)
 
-            cache_bundles: dict[str, tuple[str, ...]] = {}
+            cache_bundles = {}
             claimed_indices: set[int] = set()
             for layer_name in layers:
                 if layer_name not in layer_owners:

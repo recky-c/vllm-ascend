@@ -27,17 +27,17 @@ class KVPPPhysicalCachePlan:
     def apply_to_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Restore logical layer bindings on an upstream physical config."""
         for tensor in kv_cache_config.kv_cache_tensors:
-            expanded_names: list[str] = []
+            tensor_names: list[str] = []
             for layer_name in tensor.shared_by:
-                expanded_names.extend(self.scratch_aliases.get(layer_name, [layer_name]))
-            tensor.shared_by = list(dict.fromkeys(expanded_names))
+                tensor_names.extend(self.scratch_aliases.get(layer_name, [layer_name]))
+            tensor.shared_by = list(dict.fromkeys(tensor_names))
 
         logical_groups: list[KVCacheGroupSpec] = []
         for group in kv_cache_config.kv_cache_groups:
-            expanded_names: list[str] = []
+            group_names: list[str] = []
             for layer_name in group.layer_names:
-                expanded_names.extend(self.scratch_aliases.get(layer_name, [layer_name]))
-            expanded_names = list(dict.fromkeys(expanded_names))
+                group_names.extend(self.scratch_aliases.get(layer_name, [layer_name]))
+            expanded_names = list(dict.fromkeys(group_names))
 
             group_spec = group.kv_cache_spec
             if expanded_names and isinstance(group_spec, UniformTypeKVCacheSpecs):

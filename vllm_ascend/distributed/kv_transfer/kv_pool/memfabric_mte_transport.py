@@ -515,6 +515,7 @@ class MemFabricMTEKVPPTransport:
             self._memory.destroy()
             self._memory = None
         if self._global_initialized:
+            assert self._shm_module is not None
             self._shm_module.uninitialize()
             assert self._memfabric_module is not None
             self._memfabric_module.uninitialize()
