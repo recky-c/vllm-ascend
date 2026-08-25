@@ -249,6 +249,66 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     }
 }
 
+#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
+void kvpp_mte_copy(const torch::Tensor& anchor,
+                   const torch::Tensor& local_offsets,
+                   const torch::Tensor& staging_offsets,
+                   const torch::Tensor& lengths,
+                   int64_t staging_base,
+                   int64_t source_rank,
+                   int64_t destination_rank,
+                   int64_t shm_id)
+{
+    TORCH_CHECK(anchor.is_privateuseone(), "anchor must be an NPU tensor");
+    TORCH_CHECK(local_offsets.is_privateuseone(),
+                "local_offsets must be an NPU tensor");
+    TORCH_CHECK(staging_offsets.is_privateuseone(),
+                "staging_offsets must be an NPU tensor");
+    TORCH_CHECK(lengths.is_privateuseone(),
+                "lengths must be an NPU tensor");
+    TORCH_CHECK(local_offsets.device() == anchor.device() &&
+                    staging_offsets.device() == anchor.device() &&
+                    lengths.device() == anchor.device(),
+                "KVPP MTE descriptors and anchor must share one NPU device");
+    TORCH_CHECK(local_offsets.dtype() == torch::kInt64,
+                "local_offsets must be int64");
+    TORCH_CHECK(staging_offsets.dtype() == torch::kInt64,
+                "staging_offsets must be int64");
+    TORCH_CHECK(lengths.dtype() == torch::kInt64, "lengths must be int64");
+    TORCH_CHECK(local_offsets.dim() == 1 && staging_offsets.dim() == 1 &&
+                    lengths.dim() == 1,
+                "KVPP MTE descriptors must be one-dimensional");
+    const int64_t count = local_offsets.numel();
+    TORCH_CHECK(staging_offsets.numel() == count && lengths.numel() == count,
+                "KVPP MTE descriptor lengths must match");
+    TORCH_CHECK(local_offsets.is_contiguous() &&
+                    staging_offsets.is_contiguous() &&
+                    lengths.is_contiguous(),
+                "KVPP MTE descriptors must be contiguous");
+    TORCH_CHECK(source_rank >= -1 && destination_rank >= -1,
+                "KVPP MTE ranks must be -1 or non-negative");
+    TORCH_CHECK((source_rank >= 0) != (destination_rank >= 0),
+                "exactly one KVPP MTE endpoint must be SHM staging");
+    TORCH_CHECK(staging_base > 0, "staging_base must be positive");
+    TORCH_CHECK(shm_id >= 0 && shm_id < 64,
+                "KVPP MTE shm_id must be in [0, 64)");
+
+    const c10_npu::OptionalNPUGuard npu_guard(anchor.device());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    if (count != 0) {
+        kvpp_mte_batch_copy_pages_impl(
+            stream, anchor.data_ptr(),
+            local_offsets.data_ptr<int64_t>(),
+            staging_offsets.data_ptr<int64_t>(),
+            lengths.data_ptr<int64_t>(), static_cast<uint64_t>(count),
+            reinterpret_cast<void*>(staging_base),
+            static_cast<int32_t>(source_rank),
+            static_cast<int32_t>(destination_rank),
+            static_cast<uint32_t>(shm_id));
+    }
+}
+#endif
+
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
 // 310P and A5 builds.
@@ -1966,8 +2026,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor? gk=None) -> Tensor");
     ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
 
+#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
+    ops.def(
+        "kvpp_mte_copy(Tensor anchor, Tensor local_offsets, "
+        "Tensor staging_offsets, Tensor lengths, int staging_base, "
+        "int source_rank, "
+        "int destination_rank, int shm_id) -> ()");
+    ops.impl("kvpp_mte_copy", torch::kPrivateUse1,
+             &vllm_ascend::kvpp_mte_copy);
+#endif
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
+
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);
 
