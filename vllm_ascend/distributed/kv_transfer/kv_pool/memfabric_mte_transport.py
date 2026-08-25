@@ -12,8 +12,9 @@ cache before attention. No full layer cache is copied or staged.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import torch
@@ -27,9 +28,7 @@ _SHM_ID_LIMIT = 64
 _SHM_ALIGNMENT = 2 << 20
 
 
-def _store_url_for_kvpp_group(
-    store_url: str, group: GroupCoordinator
-) -> str:
+def _store_url_for_kvpp_group(store_url: str, group: GroupCoordinator) -> str:
     """Give each KVPP process group its own MemFabric config store.
 
     A PP deployment has one KVPP group per pipeline stage. MemFabric's SHM
@@ -50,8 +49,7 @@ def _store_url_for_kvpp_group(
     expected_ranks = tuple(range(first_rank, first_rank + group.world_size))
     if tuple(sorted(ranks)) != expected_ranks or first_rank % group.world_size:
         raise ValueError(
-            "KVPP MemFabric store isolation requires contiguous, aligned "
-            f"process groups, got ranks={ranks}."
+            f"KVPP MemFabric store isolation requires contiguous, aligned process groups, got ranks={ranks}."
         )
     group_index = first_rank // group.world_size
     if group_index == 0:
@@ -60,22 +58,18 @@ def _store_url_for_kvpp_group(
     parsed = urlsplit(store_url)
     if parsed.scheme != "tcp" or parsed.hostname is None or parsed.port is None:
         raise ValueError(
-            "Multiple KVPP groups require MF_CONFIG_STORE_URL to use the "
-            f"tcp://host:port form, got {store_url!r}."
+            f"Multiple KVPP groups require MF_CONFIG_STORE_URL to use the tcp://host:port form, got {store_url!r}."
         )
     port = parsed.port + group_index
     if port > 65535:
         raise ValueError(
-            "KVPP MemFabric derived store port exceeds 65535: "
-            f"base_port={parsed.port}, group_index={group_index}."
+            f"KVPP MemFabric derived store port exceeds 65535: base_port={parsed.port}, group_index={group_index}."
         )
     host = parsed.hostname
     if ":" in host:
         host = f"[{host}]"
     netloc = f"{host}:{port}"
-    return urlunsplit(
-        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
-    )
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 @dataclass(frozen=True)
@@ -125,9 +119,7 @@ def flatten_kvpp_cache(cache: Any) -> tuple[torch.Tensor, ...]:
     raise TypeError(f"Unsupported KVPP cache type: {type(cache)!r}.")
 
 
-def build_kvpp_layer_metadata(
-    kv_caches: dict[str, Any], num_blocks: int
-) -> dict[str, tuple[KVPPBufferMetadata, ...]]:
+def build_kvpp_layer_metadata(kv_caches: dict[str, Any], num_blocks: int) -> dict[str, tuple[KVPPBufferMetadata, ...]]:
     """Describe logical pages once for the MTE data plane."""
     layers: dict[str, tuple[KVPPBufferMetadata, ...]] = {}
     for layer_name, cache in kv_caches.items():
@@ -180,9 +172,7 @@ class MemFabricMTECompletion:
     resources: tuple[Any, ...] = ()
 
     @classmethod
-    def record(
-        cls, stream: Any, resources: tuple[Any, ...] = ()
-    ) -> "MemFabricMTECompletion":
+    def record(cls, stream: Any, resources: tuple[Any, ...] = ()) -> MemFabricMTECompletion:
         event = torch.npu.Event()
         event.record(stream)
         return cls(event, resources)
@@ -272,8 +262,7 @@ class MemFabricMTEKVPPTransport:
         store_url = os.getenv("MF_CONFIG_STORE_URL") or os.getenv("ASCEND_MF_STORE_URL")
         if not store_url:
             raise RuntimeError(
-                "KVPP MTE requires MF_CONFIG_STORE_URL (or the deprecated "
-                "ASCEND_MF_STORE_URL compatibility variable)."
+                "KVPP MTE requires MF_CONFIG_STORE_URL (or the deprecated ASCEND_MF_STORE_URL compatibility variable)."
             )
         store_url = _store_url_for_kvpp_group(store_url, self.group)
         staging_bytes = int(os.getenv("ASCEND_KVPP_MTE_STAGING_BYTES", _DEFAULT_STAGING_BYTES))
@@ -284,9 +273,7 @@ class MemFabricMTEKVPPTransport:
             )
         shm_id = int(os.getenv("ASCEND_KVPP_MTE_SHM_ID", _DEFAULT_SHM_ID))
         if not 0 <= shm_id < _SHM_ID_LIMIT:
-            raise ValueError(
-                f"ASCEND_KVPP_MTE_SHM_ID must be in [0, {_SHM_ID_LIMIT}), got {shm_id}."
-            )
+            raise ValueError(f"ASCEND_KVPP_MTE_SHM_ID must be in [0, {_SHM_ID_LIMIT}), got {shm_id}.")
         self._shm_id = shm_id
 
         config = self._shm_module.ShmConfig()
@@ -321,19 +308,14 @@ class MemFabricMTEKVPPTransport:
             raise RuntimeError("KVPP MemFabric SHM creation returned no memory.")
         operation = int(self._memory.query_support_data_operation())
         if operation != int(self._shm_module.ShmDataOpType.MTE.value):
-            raise RuntimeError(
-                f"KVPP MemFabric SHM does not support MTE: reported operation={operation}."
-            )
+            raise RuntimeError(f"KVPP MemFabric SHM does not support MTE: reported operation={operation}.")
         # ``create`` publishes the symmetric address before every rank's
         # device-side mapping is necessarily ready. The SHM barrier completes
         # that setup; a process-group barrier is not an equivalent substitute.
         self._memory.barrier()
 
         self._layers = build_kvpp_layer_metadata(kv_caches, self.num_blocks)
-        self._anchors = {
-            layer_name: flatten_kvpp_cache(cache)[0]
-            for layer_name, cache in kv_caches.items()
-        }
+        self._anchors = {layer_name: flatten_kvpp_cache(cache)[0] for layer_name, cache in kv_caches.items()}
         self._device_layers = {}
         for layer_name, buffers in self._layers.items():
             device = self._anchors[layer_name].device
@@ -354,9 +336,7 @@ class MemFabricMTEKVPPTransport:
                     dtype=torch.int64,
                     device=device,
                 ),
-                staging_bytes_per_slot=sum(
-                    buffer.block_bytes for buffer in buffers
-                ),
+                staging_bytes_per_slot=sum(buffer.block_bytes for buffer in buffers),
             )
         # ``gva`` is the common symmetric base. MemFabric may align each
         # rank's segment to an internal symmetric size larger than the local
@@ -368,9 +348,7 @@ class MemFabricMTEKVPPTransport:
             rank=self.group.rank_in_group,
         )
         peers: list[KVPPMTEPeerMetadata | None] = [None] * self.group.world_size
-        dist.all_gather_object(
-            peers, self._local_metadata, group=self.group.cpu_group
-        )
+        dist.all_gather_object(peers, self._local_metadata, group=self.group.cpu_group)
         if any(peer is None for peer in peers):
             raise RuntimeError("KVPP MTE did not receive every peer GVA.")
         self._peer_metadata = [peer for peer in peers if peer is not None]
@@ -383,15 +361,10 @@ class MemFabricMTEKVPPTransport:
             store_url,
         )
 
-    def _local_descriptors(
-        self, layer_name: str, pages: KVPPActivePages
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _local_descriptors(self, layer_name: str, pages: KVPPActivePages) -> tuple[torch.Tensor, torch.Tensor]:
         metadata = self._device_layers[layer_name]
         page_ids = pages.page_ids.to(dtype=torch.int64)
-        offsets = (
-            metadata.local_base_offsets[:, None]
-            + page_ids[None, :] * metadata.block_strides[:, None]
-        )
+        offsets = metadata.local_base_offsets[:, None] + page_ids[None, :] * metadata.block_strides[:, None]
         lengths = torch.where(
             pages.valid_mask[None, :],
             metadata.block_bytes[:, None],
@@ -415,10 +388,7 @@ class MemFabricMTEKVPPTransport:
         if not layer_names:
             raise ValueError("KVPP MTE cache bundle cannot be empty.")
 
-        bytes_per_slot = sum(
-            self._device_layers[layer_name].staging_bytes_per_slot
-            for layer_name in layer_names
-        )
+        bytes_per_slot = sum(self._device_layers[layer_name].staging_bytes_per_slot for layer_name in layer_names)
         max_active_pages = staging_bytes // bytes_per_slot
         if max_active_pages == 0:
             raise RuntimeError(
@@ -433,9 +403,7 @@ class MemFabricMTEKVPPTransport:
                 "Increase ASCEND_KVPP_MTE_STAGING_BYTES."
             )
 
-        active_ordinals = torch.cumsum(
-            pages.valid_mask.to(dtype=torch.int64), dim=0
-        ) - 1
+        active_ordinals = torch.cumsum(pages.valid_mask.to(dtype=torch.int64), dim=0) - 1
         result: dict[str, torch.Tensor] = {}
         bundle_base: int | torch.Tensor = 0
         for layer_name in layer_names:
@@ -445,8 +413,7 @@ class MemFabricMTEKVPPTransport:
             buffer_offsets = buffer_offsets - per_buffer_capacity
             buffer_offsets = buffer_offsets + bundle_base
             result[layer_name] = (
-                buffer_offsets[:, None]
-                + active_ordinals[None, :] * metadata.block_bytes[:, None]
+                buffer_offsets[:, None] + active_ordinals[None, :] * metadata.block_bytes[:, None]
             ).flatten()
             bundle_base += per_buffer_capacity.sum()
         return result
@@ -495,9 +462,7 @@ class MemFabricMTEKVPPTransport:
                 peer.staging_bytes,
             )
             for layer_name in layer_names:
-                local_offsets, lengths = self._local_descriptors(
-                    layer_name, pages
-                )
+                local_offsets, lengths = self._local_descriptors(layer_name, pages)
                 staging_offsets = bundle_offsets[layer_name]
                 descriptors = _MTEDeviceDescriptors(
                     local_offsets,
@@ -505,9 +470,7 @@ class MemFabricMTEKVPPTransport:
                     lengths,
                     peer.staging_addr,
                 )
-                self._launch(
-                    layer_name, descriptors, destination_rank=peer.rank
-                )
+                self._launch(layer_name, descriptors, destination_rank=peer.rank)
                 retained.extend(descriptors.tensors())
         return MemFabricMTECompletion.record(stream, tuple(retained))
 

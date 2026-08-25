@@ -210,22 +210,14 @@ class NPUModelRunner(GPUModelRunner):
             is_last_pp_rank=self.is_last_pp_rank,
         )
 
-    def prepare_attn(
-        self, input_batch: AscendInputBatch
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    def prepare_attn(self, input_batch: AscendInputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         block_tables, slot_mappings = super().prepare_attn(input_batch)
-        self.kvpp.begin_forward(
-            block_tables, input_batch.seq_lens_np[: input_batch.num_reqs]
-        )
+        self.kvpp.begin_forward(block_tables, input_batch.seq_lens_np[: input_batch.num_reqs])
         return block_tables, slot_mappings
 
-    def prepare_dummy_attn(
-        self, input_batch: AscendInputBatch
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    def prepare_dummy_attn(self, input_batch: AscendInputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         block_tables, slot_mappings = super().prepare_dummy_attn(input_batch)
-        self.kvpp.begin_forward(
-            block_tables, input_batch.seq_lens_np[: input_batch.num_reqs]
-        )
+        self.kvpp.begin_forward(block_tables, input_batch.seq_lens_np[: input_batch.num_reqs])
         return block_tables, slot_mappings
 
     @torch.inference_mode()
@@ -263,9 +255,7 @@ class NPUModelRunner(GPUModelRunner):
                 context_len=context_len,
             )
 
-        self.kvpp.finish_forward(
-            dummy_skip_attn=dummy_run and skip_attn_for_dummy_run
-        )
+        self.kvpp.finish_forward(dummy_skip_attn=dummy_run and skip_attn_for_dummy_run)
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,

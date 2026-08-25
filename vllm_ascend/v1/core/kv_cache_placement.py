@@ -29,28 +29,21 @@ class KVPPPhysicalCachePlan:
         for tensor in kv_cache_config.kv_cache_tensors:
             expanded_names: list[str] = []
             for layer_name in tensor.shared_by:
-                expanded_names.extend(
-                    self.scratch_aliases.get(layer_name, [layer_name])
-                )
+                expanded_names.extend(self.scratch_aliases.get(layer_name, [layer_name]))
             tensor.shared_by = list(dict.fromkeys(expanded_names))
 
         logical_groups: list[KVCacheGroupSpec] = []
         for group in kv_cache_config.kv_cache_groups:
             expanded_names: list[str] = []
             for layer_name in group.layer_names:
-                expanded_names.extend(
-                    self.scratch_aliases.get(layer_name, [layer_name])
-                )
+                expanded_names.extend(self.scratch_aliases.get(layer_name, [layer_name]))
             expanded_names = list(dict.fromkeys(expanded_names))
 
             group_spec = group.kv_cache_spec
             if expanded_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
                 group_spec = UniformTypeKVCacheSpecs(
                     block_size=group_spec.block_size,
-                    kv_cache_specs={
-                        layer_name: self.logical_spec[layer_name]
-                        for layer_name in expanded_names
-                    },
+                    kv_cache_specs={layer_name: self.logical_spec[layer_name] for layer_name in expanded_names},
                 )
             logical_groups.append(
                 KVCacheGroupSpec(
@@ -60,11 +53,7 @@ class KVPPPhysicalCachePlan:
                 )
             )
 
-        restored_names = {
-            layer_name
-            for group in logical_groups
-            for layer_name in group.layer_names
-        }
+        restored_names = {layer_name for group in logical_groups for layer_name in group.layer_names}
         expected_names = set(self.logical_spec)
         if restored_names != expected_names:
             missing = sorted(expected_names - restored_names)
@@ -88,17 +77,12 @@ def project_kv_cache_groups_to_worker(
     """
     projected_groups: list[KVCacheGroupSpec] = []
     for group in global_groups:
-        worker_layer_names = [
-            layer_name for layer_name in group.layer_names if layer_name in worker_spec
-        ]
+        worker_layer_names = [layer_name for layer_name in group.layer_names if layer_name in worker_spec]
         group_spec = group.kv_cache_spec
         if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
             group_spec = UniformTypeKVCacheSpecs(
                 block_size=group_spec.block_size,
-                kv_cache_specs={
-                    layer_name: group_spec.kv_cache_specs[layer_name]
-                    for layer_name in worker_layer_names
-                },
+                kv_cache_specs={layer_name: group_spec.kv_cache_specs[layer_name] for layer_name in worker_layer_names},
             )
         projected_groups.append(
             KVCacheGroupSpec(
@@ -110,9 +94,7 @@ def project_kv_cache_groups_to_worker(
     return projected_groups
 
 
-def _get_replicated_mtp_layers(
-    vllm_config: VllmConfig, local_layer_names: Iterable[str]
-) -> set[str]:
+def _get_replicated_mtp_layers(vllm_config: VllmConfig, local_layer_names: Iterable[str]) -> set[str]:
     """Find MTP KV-cache layers within the current PP stage's local layers.
 
     This helper only selects MTP names from ``local_layer_names``; it does not
@@ -131,16 +113,10 @@ def _get_replicated_mtp_layers(
             "KVPP with MTP requires num_hidden_layers and a positive num_nextn_predict_layers in the model config."
         )
     mtp_end = mtp_start + num_mtp_layers
-    return {
-        layer_name
-        for layer_name in local_layer_names
-        if mtp_start <= extract_layer_index(layer_name) < mtp_end
-    }
+    return {layer_name for layer_name in local_layer_names if mtp_start <= extract_layer_index(layer_name) < mtp_end}
 
 
-def get_kvpp_layer_owners(
-    vllm_config: VllmConfig, local_layer_names: Iterable[str]
-) -> dict[str, int]:
+def get_kvpp_layer_owners(vllm_config: VllmConfig, local_layer_names: Iterable[str]) -> dict[str, int]:
     """Partition PP-local Target KV layers across KVPP ranks.
 
     ``local_layer_names`` must already be PP-local (typically the keys of the
@@ -151,9 +127,7 @@ def get_kvpp_layer_owners(
     # Workers are separate Python processes and may receive layer names from
     # sets or differently ordered dictionaries. Keep both owner insertion
     # order and per-layer cache-bundle order identical on every rank.
-    local_layer_names = tuple(
-        sorted(local_layer_names, key=lambda name: (extract_layer_index(name), name))
-    )
+    local_layer_names = tuple(sorted(local_layer_names, key=lambda name: (extract_layer_index(name), name)))
     replicated_layers = _get_replicated_mtp_layers(vllm_config, local_layer_names)
     layers_by_index: dict[int, list[str]] = defaultdict(list)
     for layer_name in local_layer_names:
@@ -162,7 +136,9 @@ def get_kvpp_layer_owners(
 
     layer_indices = sorted(layers_by_index)
     if len(layer_indices) < kvpp_size:
-        raise ValueError(f"KVPP size ({kvpp_size}) exceeds the number of KV cache layer bundles ({len(layer_indices)}).")
+        raise ValueError(
+            f"KVPP size ({kvpp_size}) exceeds the number of KV cache layer bundles ({len(layer_indices)})."
+        )
 
     base, remainder = divmod(len(layer_indices), kvpp_size)
     owners: dict[str, int] = {}
@@ -188,12 +164,7 @@ def _get_allocation_groups(
     onto two alternating scratch caches per layout. Layers absent from
     ``owners`` (replicated MTP) are allocated in full on every KVPP rank.
     """
-    foreign_names = [
-        name
-        for group in logical_groups
-        for name in group.layer_names
-        if name not in worker_spec
-    ]
+    foreign_names = [name for group in logical_groups for name in group.layer_names if name not in worker_spec]
     if foreign_names:
         raise ValueError(
             "KVPP placement received cache layers outside the current PP "
@@ -207,11 +178,7 @@ def _get_allocation_groups(
     for group in logical_groups:
         local_names = list(group.layer_names)
         managed_names = [name for name in local_names if name in owners]
-        allocation_names = [
-            name
-            for name in local_names
-            if name not in owners or owners[name] == kvpp_rank
-        ]
+        allocation_names = [name for name in local_names if name not in owners or owners[name] == kvpp_rank]
         scratch_layout_groups: list[list[str]] = []
         for name in managed_names:
             if owners[name] == kvpp_rank:
@@ -226,9 +193,7 @@ def _get_allocation_groups(
             scratch_names = layout_names[:2]
             allocation_names.extend(scratch_names)
             for scratch_index, scratch_name in enumerate(scratch_names):
-                scratch_aliases[scratch_name] = layout_names[
-                    scratch_index :: len(scratch_names)
-                ]
+                scratch_aliases[scratch_name] = layout_names[scratch_index :: len(scratch_names)]
         for layer_name in allocation_names:
             allocation_spec[layer_name] = worker_spec[layer_name]
 
@@ -255,9 +220,7 @@ def build_kvpp_physical_cache_plan(
     if kvpp_size <= 1:
         return None
     if kvpp_rank < 0 or kvpp_rank >= kvpp_size:
-        raise ValueError(
-            f"KVPP rank must be in [0, {kvpp_size}), got {kvpp_rank}."
-        )
+        raise ValueError(f"KVPP rank must be in [0, {kvpp_size}), got {kvpp_rank}.")
 
     logical_spec = dict(worker_spec)
     # get_kv_cache_groups may normalize its input in place, so keep the spec
@@ -265,18 +228,10 @@ def build_kvpp_physical_cache_plan(
     # independent from its working copy.
     logical_groups = get_kv_cache_groups(vllm_config, dict(logical_spec))
     owners = get_kvpp_layer_owners(vllm_config, worker_spec)
-    allocation_groups, scratch_aliases = _get_allocation_groups(
-        logical_groups, worker_spec, owners, kvpp_rank
-    )
-    physical_names = {
-        layer_name
-        for group in allocation_groups
-        for layer_name in group.layer_names
-    }
+    allocation_groups, scratch_aliases = _get_allocation_groups(logical_groups, worker_spec, owners, kvpp_rank)
+    physical_names = {layer_name for group in allocation_groups for layer_name in group.layer_names}
     physical_spec = {
-        layer_name: logical_spec[layer_name]
-        for layer_name in logical_spec
-        if layer_name in physical_names
+        layer_name: logical_spec[layer_name] for layer_name in logical_spec if layer_name in physical_names
     }
     return KVPPPhysicalCachePlan(
         logical_spec=logical_spec,

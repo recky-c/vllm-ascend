@@ -56,9 +56,7 @@ def test_kvpp_06_execution_plan_bundles_sparse_main_and_indexer():
 
 
 def test_kvpp_07_active_pages_are_fixed_shape_deduplicated_and_masked():
-    table = torch.tensor(
-        [[7, 2, -1, 0], [2, 8, 12, 0]], dtype=torch.int32
-    )
+    table = torch.tensor([[7, 2, -1, 0], [2, 8, 12, 0]], dtype=torch.int32)
     original = table.clone()
 
     pages = _active_pages(table, [5, 9], block_size=4, num_blocks=10)

@@ -59,9 +59,7 @@ def test_mte_02_bundle_staging_offsets_are_disjoint_and_use_active_ordinal():
     transport = _transport(0)
     _install_layers(transport)
 
-    offsets = transport._bundle_staging_offsets(
-        ("main", "indexer"), _pages(), staging_bytes=320
-    )
+    offsets = transport._bundle_staging_offsets(("main", "indexer"), _pages(), staging_bytes=320)
 
     # Ten active-page slots: main's two buffers occupy [0, 240), while the
     # indexer occupies [240, 320). Masked descriptors retain the preceding
@@ -110,7 +108,5 @@ def test_mte_03_owner_pushes_to_peer_and_consumer_receives_locally(monkeypatch):
     _install_layers(consumer)
     consumer._local_metadata = KVPPMTEPeerMetadata(9000, 320, 1)
 
-    consumer.receive_active_bundle(
-        ("main", "indexer"), _pages(), SimpleNamespace()
-    )
+    consumer.receive_active_bundle(("main", "indexer"), _pages(), SimpleNamespace())
     assert calls == [(1, -1, 9000), (1, -1, 9000)]

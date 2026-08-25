@@ -25,16 +25,12 @@ class KVPPConfig:
         additional_config = vllm_config.additional_config or {}
         if "kvpp_size" in additional_config:
             raise ValueError(
-                "additional_config.kvpp_size is no longer supported; "
-                "use additional_config.enable_kvpp=true instead."
+                "additional_config.kvpp_size is no longer supported; use additional_config.enable_kvpp=true instead."
             )
 
         enabled = additional_config.get("enable_kvpp", False)
         if not isinstance(enabled, bool):
-            raise ValueError(
-                "additional_config.enable_kvpp must be a boolean, "
-                f"got {enabled!r}."
-            )
+            raise ValueError(f"additional_config.enable_kvpp must be a boolean, got {enabled!r}.")
 
         size = vllm_config.parallel_config.tensor_parallel_size if enabled else 1
         return cls(size=size)
@@ -62,16 +58,12 @@ class KVPPConfig:
 
         model_config = vllm_config.model_config
         if not getattr(model_config, "enforce_eager", False):
-            raise ValueError(
-                "KVPP currently supports eager execution only; set --enforce-eager."
-            )
+            raise ValueError("KVPP currently supports eager execution only; set --enforce-eager.")
         if not model_config.use_mla or model_config.is_hybrid:
             raise ValueError("KVPP currently supports only non-hybrid MLA models.")
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None:
             if speculative_config.method != "mtp":
                 raise ValueError("KVPP currently supports speculative decoding only with method='mtp'.")
-            if getattr(
-                speculative_config, "num_speculative_tokens_per_batch_size", None
-            ):
+            if getattr(speculative_config, "num_speculative_tokens_per_batch_size", None):
                 raise ValueError("KVPP currently supports only a fixed number of MTP speculative tokens.")

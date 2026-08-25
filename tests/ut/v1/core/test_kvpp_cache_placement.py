@@ -75,10 +75,7 @@ def test_kvpp_03_mtp_is_not_owned_and_is_physically_replicated():
     config = _config(mtp=True)
 
     owners = get_kvpp_layer_owners(config, worker_spec)
-    plans = [
-        build_kvpp_physical_cache_plan(config, worker_spec, rank)
-        for rank in range(2)
-    ]
+    plans = [build_kvpp_physical_cache_plan(config, worker_spec, rank) for rank in range(2)]
 
     assert mtp not in owners
     assert all(plan is not None and mtp in plan.physical_spec for plan in plans)
@@ -91,9 +88,7 @@ def test_kvpp_04_persistent_and_two_scratch_allocations_alias_round_robin():
     group = KVCacheGroupSpec(names, spec)
     owners = get_kvpp_layer_owners(_config(), names)
 
-    groups, aliases = _get_allocation_groups(
-        [group], worker_spec, owners, kvpp_rank=1
-    )
+    groups, aliases = _get_allocation_groups([group], worker_spec, owners, kvpp_rank=1)
 
     # Rank 1 owns two persistent layers; three foreign layers share exactly
     # two alternating scratch tensors.
@@ -114,16 +109,12 @@ def test_kvpp_05_apply_physical_plan_restores_logical_cache_view():
     physical_names = list(plan.physical_spec)
     config = KVCacheConfig(
         num_blocks=8,
-        kv_cache_tensors=[
-            KVCacheTensor(size=1024, shared_by=[name]) for name in physical_names
-        ],
+        kv_cache_tensors=[KVCacheTensor(size=1024, shared_by=[name]) for name in physical_names],
         kv_cache_groups=[KVCacheGroupSpec(physical_names, _spec())],
     )
 
     plan.apply_to_config(config)
 
-    logical_tensor_names = {
-        name for tensor in config.kv_cache_tensors for name in tensor.shared_by
-    }
+    logical_tensor_names = {name for tensor in config.kv_cache_tensors for name in tensor.shared_by}
     assert logical_tensor_names == set(names)
     assert set(config.kv_cache_groups[0].layer_names) == set(names)
