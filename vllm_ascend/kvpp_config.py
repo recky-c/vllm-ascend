@@ -6,6 +6,14 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+_KVPP_COMPATIBLE_CONNECTORS = frozenset(
+    {
+        "MooncakeConnectorV2",
+        "MooncakePullConnector",
+    }
+)
+
+
 @dataclass(frozen=True)
 class KVPPConfig:
     """Ascend-owned configuration for KV layer parallelism."""
@@ -42,6 +50,15 @@ class KVPPConfig:
                 "tensor_parallel_size must be divisible by kvpp_size, got "
                 f"TP={parallel_config.tensor_parallel_size}, KVPP={self.size}."
             )
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if kv_transfer_config is not None:
+            connector = kv_transfer_config.kv_connector
+            role = kv_transfer_config.kv_role
+            if connector not in _KVPP_COMPATIBLE_CONNECTORS or role != "kv_producer":
+                raise ValueError(
+                    "KVPP supports KV transfer only with MooncakeConnectorV2 "
+                    f"on a kv_producer, got connector={connector!r}, role={role!r}."
+                )
 
         model_config = vllm_config.model_config
         if not getattr(model_config, "enforce_eager", False):
