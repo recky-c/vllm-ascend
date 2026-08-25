@@ -65,6 +65,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
@@ -84,6 +85,7 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.kvpp = KVPPRuntime()
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -199,6 +201,33 @@ class NPUModelRunner(GPUModelRunner):
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
+        self.kvpp = KVPPRuntime.try_build(
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            block_tables=self.block_tables,
+            static_forward_context=self.compilation_config.static_forward_context,
+            speculator=self.speculator,
+            is_last_pp_rank=self.is_last_pp_rank,
+        )
+
+    def prepare_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_attn(input_batch)
+        self.kvpp.begin_forward(
+            block_tables, input_batch.seq_lens_np[: input_batch.num_reqs]
+        )
+        return block_tables, slot_mappings
+
+    def prepare_dummy_attn(
+        self, input_batch: AscendInputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_dummy_attn(input_batch)
+        self.kvpp.begin_forward(
+            block_tables, input_batch.seq_lens_np[: input_batch.num_reqs]
+        )
+        return block_tables, slot_mappings
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -233,6 +262,10 @@ class NPUModelRunner(GPUModelRunner):
                 is_profile=is_profile,
                 context_len=context_len,
             )
+
+        self.kvpp.finish_forward(
+            dummy_skip_attn=dummy_run and skip_attn_for_dummy_run
+        )
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
@@ -751,6 +784,10 @@ class NPUModelRunner(GPUModelRunner):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
             self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
+
+    def shutdown(self) -> None:
+        self.kvpp.close()
+        super().shutdown()
 
     def _pad_query_start_loc_for_fia(
         self,

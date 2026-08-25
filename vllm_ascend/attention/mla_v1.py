@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import numpy as np
 import torch
@@ -708,6 +708,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         **kwargs,
     ):
         self.vllm_config = get_current_vllm_config()
+        self.layerwise_kv_cache_hook: Any = None
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1652,6 +1653,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_preprocess_res = None
         if has_prefill:
             wait_for_kv_layer_from_connector(layer_name)
+        if self.layerwise_kv_cache_hook is not None and (has_decode or has_prefill):
+            # Q/KV projections above run on the compute stream while the
+            # active historical pages are pushed on KVPP's communication
+            # stream. Cache writes wait only at the first point that consumes
+            # the cache.
+            self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
         # Preprocess for decode tokens
         if has_decode:
             decode_preprocess_res = self.mla_preprocess_decode(q_c, kv_no_split, kv_cache, attn_metadata)
@@ -1709,6 +1716,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
         num_decode_tokens = attn_metadata.num_decode_tokens
+        if self.layerwise_kv_cache_hook is not None and (
+            attn_metadata.num_decodes > 0 or attn_metadata.num_prefills > 0
+        ):
+            self.layerwise_kv_cache_hook.enter_layer(layer_name)
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
@@ -1718,6 +1729,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         if (self.fa_quant_layer or self.enable_mlapo) and (
             attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS and attn_metadata.num_prefills == 0
         ):
+            if self.layerwise_kv_cache_hook is not None:
+                self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
             decode_preprocess_res, prefill_preprocess_res = DeviceOperator.mla_preprocess_only_decode(
                 self, hidden_states, kv_cache, attn_metadata
             )
@@ -1754,6 +1767,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
+        if self.layerwise_kv_cache_hook is not None:
+            # The next layer's transfer was submitted before this attention
+            # and uses the other scratch buffer. This marks the point after
+            # which a later layer may eventually cycle back to this buffer.
+            self.layerwise_kv_cache_hook.leave_layer(layer_name)
         # O proj
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 
