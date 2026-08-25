@@ -166,9 +166,7 @@ class MooncakeBaseConnectorWorker:
         owners = get_kvpp_layer_owners(self.vllm_config, all_layer_names)
         kvpp_rank = self.tp_rank % kvpp_size
         return {
-            layer_name
-            for layer_name in all_layer_names
-            if layer_name not in owners or owners[layer_name] == kvpp_rank
+            layer_name for layer_name in all_layer_names if layer_name not in owners or owners[layer_name] == kvpp_rank
         }
 
     def register_kv_caches(
