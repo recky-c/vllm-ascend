@@ -319,7 +319,7 @@ model. DCP and PCP remain mutually exclusive with KVPP.
 
 vLLM Ascend:
 
-- Configuration: `vllm_ascend/kvpp_config.py`
+- Configuration: `KVPPConfig` in `vllm_ascend/ascend_config.py`
 - KVPP process group: `vllm_ascend/distributed/parallel_state.py`
 - Placement policy: `vllm_ascend/core/kv_cache_placement.py`
 - Worker integration: `vllm_ascend/worker/worker.py`

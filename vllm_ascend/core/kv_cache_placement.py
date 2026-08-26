@@ -13,7 +13,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.kvpp_config import KVPPConfig
+from vllm_ascend.ascend_config import KVPPConfig
 
 
 @dataclass(frozen=True)
