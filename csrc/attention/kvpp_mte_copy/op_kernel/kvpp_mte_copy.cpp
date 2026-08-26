@@ -9,14 +9,6 @@
 namespace {
 constexpr uint32_t TILE_BYTES = 64 * 1024;
 constexpr int32_t EVENT_ID = 0;
-
-struct KvppMteCopyTilingData {
-    uint64_t descriptorCount;
-    uint64_t stagingBase;
-    int64_t sourceRank;
-    int64_t destinationRank;
-    int64_t shmId;
-};
 }  // namespace
 
 extern "C" __global__ __aicore__ void kvpp_mte_copy(
