@@ -46,7 +46,7 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
-from vllm_ascend.v1.core.kv_cache_placement import get_kvpp_layer_owners
+from vllm_ascend.core.kv_cache_placement import get_kvpp_layer_owners
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig

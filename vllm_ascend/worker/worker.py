@@ -86,7 +86,7 @@ from vllm_ascend.utils import (
     register_ascend_customop,
     setup_ascend_local_comm_res,
 )
-from vllm_ascend.v1.core.kv_cache_placement import (
+from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
     build_kvpp_physical_cache_plan,
 )

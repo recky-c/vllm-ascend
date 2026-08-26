@@ -8,7 +8,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
-from vllm_ascend.v1.core.kv_cache_placement import (
+from vllm_ascend.core.kv_cache_placement import (
     _get_allocation_groups,
     build_kvpp_physical_cache_plan,
     get_kvpp_layer_owners,

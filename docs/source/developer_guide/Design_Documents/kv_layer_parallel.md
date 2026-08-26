@@ -191,7 +191,7 @@ segment; consumers then unpack those pages into the original physical IDs of
 their current scratch buffer.
 
 KVPP-specific placement algorithms are isolated in
-`vllm_ascend/v1/core/kv_cache_placement.py` and invoked by the common Ascend
+`vllm_ascend/core/kv_cache_placement.py` and invoked by the common Ascend
 worker. Transport and runtime lifecycle code never enter vLLM core.
 
 Before vLLM starts, make the installed MemFabric Hybrid package available and
@@ -320,7 +320,7 @@ vLLM Ascend:
 
 - Configuration: `vllm_ascend/kvpp_config.py`
 - KVPP process group: `vllm_ascend/distributed/parallel_state.py`
-- Placement policy: `vllm_ascend/v1/core/kv_cache_placement.py`
+- Placement policy: `vllm_ascend/core/kv_cache_placement.py`
 - Worker integration: `vllm_ascend/worker/worker.py`
 - Feature validation: `vllm_ascend/platform.py`
 - Model Runner V1 integration: `vllm_ascend/worker/model_runner_v1.py`

@@ -187,7 +187,7 @@ class KVPPRuntime:
         kv_cache_config: Any,
     ) -> tuple[tuple[str, ...], dict[str, int], int] | None:
         from vllm_ascend.kvpp_config import KVPPConfig
-        from vllm_ascend.v1.core.kv_cache_placement import get_kvpp_layer_owners
+        from vllm_ascend.core.kv_cache_placement import get_kvpp_layer_owners
 
         if KVPPConfig.from_vllm_config(vllm_config).size <= 1:
             return None
