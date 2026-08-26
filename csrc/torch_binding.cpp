@@ -249,8 +249,7 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
     }
 }
 
-#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
-void kvpp_mte_copy(const torch::Tensor& anchor,
+void kvpp_mte_copy(torch::Tensor& anchor,
                    const torch::Tensor& local_offsets,
                    const torch::Tensor& staging_offsets,
                    const torch::Tensor& lengths,
@@ -293,21 +292,12 @@ void kvpp_mte_copy(const torch::Tensor& anchor,
     TORCH_CHECK(shm_id >= 0 && shm_id < 64,
                 "KVPP MTE shm_id must be in [0, 64)");
 
-    const c10_npu::OptionalNPUGuard npu_guard(anchor.device());
-    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     if (count != 0) {
-        kvpp_mte_batch_copy_pages_impl(
-            stream, anchor.data_ptr(),
-            local_offsets.data_ptr<int64_t>(),
-            staging_offsets.data_ptr<int64_t>(),
-            lengths.data_ptr<int64_t>(), static_cast<uint64_t>(count),
-            reinterpret_cast<void*>(staging_base),
-            static_cast<int32_t>(source_rank),
-            static_cast<int32_t>(destination_rank),
-            static_cast<uint32_t>(shm_id));
+        EXEC_NPU_CMD(aclnnKvppMteCopy, anchor, local_offsets,
+                     staging_offsets, lengths, staging_base, source_rank,
+                     destination_rank, shm_id);
     }
 }
-#endif
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
@@ -2026,15 +2016,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor? gk=None) -> Tensor");
     ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
 
-#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
     ops.def(
-        "kvpp_mte_copy(Tensor anchor, Tensor local_offsets, "
+        "kvpp_mte_copy(Tensor(a!) anchor, Tensor local_offsets, "
         "Tensor staging_offsets, Tensor lengths, int staging_base, "
         "int source_rank, "
         "int destination_rank, int shm_id) -> ()");
     ops.impl("kvpp_mte_copy", torch::kPrivateUse1,
              &vllm_ascend::kvpp_mte_copy);
-#endif
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
 

@@ -32,6 +32,35 @@ setup_catlass_dependency() {
     log "catlass include=${absolute_catlass_path}"
 }
 
+enable_kvpp_mte_op_if_available() {
+    local include_dir
+    local candidate
+
+    if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
+        return
+    fi
+
+    for candidate in \
+        "${MEMFABRIC_HYBRID_HOME_PATH:-}/include" \
+        /usr/local/memfabric_hybrid/include \
+        /usr/local/memfabric_hybrid/*/include \
+        /usr/local/python*/lib/python*/site-packages/memfabric_hybrid/include \
+        /usr/local/lib/python*/site-packages/memfabric_hybrid/include; do
+        if [[ -f "${candidate}/smem/device/smem_shm_aicore_base_api.h" ]]; then
+            include_dir=$candidate
+            break
+        fi
+    done
+    if [[ -z "${include_dir:-}" ]]; then
+        log "MemFabric Hybrid headers not found; skip optional kvpp_mte_copy op"
+        return
+    fi
+
+    export CPATH="${include_dir}${CPATH:+:${CPATH}}"
+    CUSTOM_OPS_ARRAY+=("kvpp_mte_copy")
+    log "enabled kvpp_mte_copy op with MemFabric include=${include_dir}"
+}
+
 resolve_op_dir() {
     local op_name=$1
     local candidate_dir
@@ -219,6 +248,8 @@ else
     exit 0
 fi
 
+enable_kvpp_mte_op_if_available
+CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
 log_selected_ops
 
 

@@ -24,20 +24,6 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
-#ifdef VLLM_ASCEND_ENABLE_MEMFABRIC_MTE
-    extern void kvpp_mte_batch_copy_pages_impl(
-        void* stream,
-        void* local_base,
-        void* local_offsets,
-        void* staging_offsets,
-        void* lengths,
-        uint64_t descriptor_count,
-        void* staging_base,
-        int32_t source_rank,
-        int32_t destination_rank,
-        uint32_t shm_id);
-#endif
-
   extern void bgmv_shrink_impl(
         AscendType type,
         void *stream,
