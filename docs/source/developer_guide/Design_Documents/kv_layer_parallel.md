@@ -48,8 +48,9 @@ sequence dimensions by independent paths.
 
 KVPP's contiguous layer assignment resembles Pipeline Parallelism (PP), but
 it partitions cache ownership only within the layers local to each PP stage.
-KVPP does not change activation pipelining. MTP caches on the last PP stage are
-replicated because speculative decoding needs them on every KVPP rank.
+KVPP does not change activation pipelining. MTP caches that appear in a
+worker's local layer list are replicated across KVPP ranks on that stage;
+KVPP does not assume those layers live only on the last PP rank.
 
 ## Configuration and process groups
 
@@ -178,8 +179,8 @@ The implementation has four one-way layers:
 4. `MemFabricMTEKVPPTransport` owns registration, cache metadata, staging,
    MTE copies, unpack, and transport completion.
 
-Attention implementations use three layerwise operations: `enter_layer`,
-`wait_for_layer`, and `leave_layer`. They do not
+Attention implementations use one layerwise operation: `wait_for_layer`.
+They do not
 import or understand KVPP, MemFabric, ownership, scratch buffers, or MTE. This
 is the stable extension boundary for future layerwise cache services.
 
@@ -228,7 +229,7 @@ sequenceDiagram
     Compute->>Attention: Execute attention
 ```
 
-The first layer starts its transfer when the forward enters attention. Once a
+The first layer starts its transfer in `begin_forward`. Once a
 layer's transfer is remotely visible, KVPP immediately starts the next layer's
 transfer into the alternate scratch buffer. Current-token KV writes and
 attention wait only for the residual part of the current transfer.
@@ -324,6 +325,7 @@ vLLM Ascend:
 - Worker integration: `vllm_ascend/worker/worker.py`
 - Feature validation: `vllm_ascend/platform.py`
 - Model Runner V1 integration: `vllm_ascend/worker/model_runner_v1.py`
+- Model Runner V1 KVPP adapter: `vllm_ascend/worker/kvpp_v1.py`
 - Model Runner V2 integration: `vllm_ascend/worker/v2/model_runner.py`
 - KVPP execution plan, batch lifecycle, and scheduler:
   `vllm_ascend/worker/v2/kvpp.py`

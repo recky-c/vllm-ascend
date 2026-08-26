@@ -95,11 +95,11 @@ def project_kv_cache_groups_to_worker(
 
 
 def _get_replicated_mtp_layers(vllm_config: VllmConfig, local_layer_names: Iterable[str]) -> set[str]:
-    """Find MTP KV-cache layers within the current PP stage's local layers.
+    """Find MTP KV-cache layers among this worker's local cache names.
 
-    This helper only selects MTP names from ``local_layer_names``; it does not
-    decide whether the current worker should own MTP (non-last PP stages
-    legitimately have no MTP cache).
+    Only names present in ``local_layer_names`` are returned. A PP stage
+    without MTP caches yields an empty set; KVPP does not assume MTP lives
+    on the last pipeline rank.
     """
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or speculative_config.method != "mtp":

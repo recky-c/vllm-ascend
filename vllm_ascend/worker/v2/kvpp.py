@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Any
 
 import torch
@@ -76,29 +75,6 @@ class KVPPExecutionPlan:
         return cls(cache_bundles=cache_bundles)
 
 
-def validate_local_mtp_layers(
-    layer_names: tuple[str, ...],
-    draft_layer_names: set[str],
-    *,
-    is_last_pp_rank: bool,
-) -> None:
-    """Fail fast on wrong MTP placement for this PP stage.
-
-    The last PP stage must hold the MTP cache (replicated across KVPP
-    ranks); non-last stages must not hold any MTP cache.
-    """
-    local_mtp_layers = set(draft_layer_names).intersection(layer_names)
-    if is_last_pp_rank and not local_mtp_layers:
-        raise RuntimeError(
-            "MTP is enabled on the last pipeline stage, but no MTP KV "
-            "cache layers were found in the local cache groups."
-        )
-    if not is_last_pp_rank and local_mtp_layers:
-        raise RuntimeError(
-            f"Non-last pipeline stages must not hold MTP KV cache layers, but found {sorted(local_mtp_layers)}."
-        )
-
-
 def _collect_kvpp_attention_impls(
     static_forward_context: dict[str, Any],
     layer_owners: dict[str, int],
@@ -126,41 +102,6 @@ def _bound_kv_caches(
             raise RuntimeError(f"KVPP could not find the bound cache for logical layer {layer_name!r}.")
         managed_kv_caches[layer_name] = module.kv_cache
     return managed_kv_caches
-
-
-def validate_v1_mtp_layers(
-    layer_names: tuple[str, ...],
-    layer_owners: dict[str, int],
-    *,
-    speculative_config: Any,
-    hf_config: Any,
-    is_last_pp_rank: bool,
-) -> None:
-    """Fail fast on wrong MTP placement for a V1 pipeline stage."""
-    if speculative_config is None or speculative_config.method != "mtp":
-        return
-    mtp_start = getattr(hf_config, "num_hidden_layers", None)
-    num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", None)
-    if mtp_start is None or not num_mtp_layers:
-        return
-    mtp_end = mtp_start + num_mtp_layers
-    local_mtp_layers = {name for name in layer_names if mtp_start <= extract_layer_index(name) < mtp_end}
-    if is_last_pp_rank and not local_mtp_layers:
-        raise RuntimeError(
-            "MTP is enabled on the last pipeline stage, but no MTP KV "
-            "cache layers were found in the local cache groups."
-        )
-    if not is_last_pp_rank and local_mtp_layers:
-        raise RuntimeError(
-            f"Non-last pipeline stages must not hold MTP KV cache layers, but found {sorted(local_mtp_layers)}."
-        )
-    owned_mtp_layers = local_mtp_layers & set(layer_owners)
-    if owned_mtp_layers:
-        raise RuntimeError(
-            "MTP attention layers must be replicated outside KVPP, "
-            "but these layers have KVPP owners: "
-            f"{sorted(owned_mtp_layers)}."
-        )
 
 
 def _kvpp_layer_names(kv_cache_config: Any) -> tuple[str, ...]:
@@ -233,12 +174,11 @@ class KVPPRuntime:
         block_tables: Any,
         static_forward_context: dict[str, Any],
         speculator: Any | None,
-        is_last_pp_rank: bool,
     ) -> KVPPRuntime:
         placement = cls._placement(vllm_config, kv_cache_config)
         if placement is None:
             return cls()
-        layer_names, layer_owners, cache_group_index = placement
+        _, layer_owners, cache_group_index = placement
 
         if speculator is not None:
             draft_layer_names = speculator.draft_attn_layer_names or set()
@@ -249,11 +189,6 @@ class KVPPRuntime:
                     "but these layers have KVPP owners: "
                     f"{sorted(managed_draft_layers)}."
                 )
-            validate_local_mtp_layers(
-                layer_names,
-                draft_layer_names,
-                is_last_pp_rank=is_last_pp_rank,
-            )
 
         blocks_per_kv_block = block_tables.blocks_per_kv_block[cache_group_index]
         return cls._assemble(
@@ -265,38 +200,6 @@ class KVPPRuntime:
             block_size=block_tables.kernel_block_sizes[cache_group_index],
         )
 
-    @classmethod
-    def try_build_v1(
-        cls,
-        *,
-        vllm_config: Any,
-        kv_cache_config: Any,
-        static_forward_context: dict[str, Any],
-        kv_caches: dict[str, Any],
-        block_tables: Any,
-        is_last_pp_rank: bool,
-    ) -> KVPPRuntime:
-        placement = cls._placement(vllm_config, kv_cache_config)
-        if placement is None:
-            return cls()
-        layer_names, layer_owners, cache_group_index = placement
-        validate_v1_mtp_layers(
-            layer_names,
-            layer_owners,
-            speculative_config=vllm_config.speculative_config,
-            hf_config=vllm_config.model_config.hf_config,
-            is_last_pp_rank=is_last_pp_rank,
-        )
-        block_table = block_tables[cache_group_index]
-        return cls._assemble(
-            layer_owners=layer_owners,
-            cache_group_index=cache_group_index,
-            static_forward_context=static_forward_context,
-            kv_caches={name: kv_caches[name] for name in layer_owners},
-            num_kernel_blocks=(kv_cache_config.num_blocks * block_table.blocks_per_phys_block),
-            block_size=block_table.logical_block_size,
-        )
-
     def begin_forward(
         self,
         block_tables: tuple[torch.Tensor, ...],
@@ -306,21 +209,6 @@ class KVPPRuntime:
             return
         assert self.cache_group_index is not None
         self.scheduler.begin_forward(block_tables[self.cache_group_index], seq_lens)
-
-    def begin_v1_forward(
-        self,
-        input_batch: Any,
-        num_reqs: int,
-        seq_lens: Any,
-    ) -> None:
-        if self.scheduler is None:
-            return
-        assert self.cache_group_index is not None
-        block_table = input_batch.block_table[self.cache_group_index]
-        self.scheduler.begin_forward(
-            block_table.get_device_tensor(num_reqs),
-            seq_lens,
-        )
 
     def finish_forward(self, *, dummy_skip_attn: bool = False) -> None:
         if self.scheduler is None:
@@ -402,13 +290,6 @@ def _active_pages(
     )
 
 
-class KVPPPhase(Enum):
-    IDLE = auto()
-    FORWARD_ACTIVE = auto()
-    LAYER_ENTERED = auto()
-    LAYER_WAITED = auto()
-
-
 class KVPPScheduler:
     """Schedule stream-ordered layer prefetch over an injected transport.
 
@@ -434,11 +315,9 @@ class KVPPScheduler:
         self.block_size = block_size
         self.transport = transport
         self.plan = KVPPExecutionPlan.build(self.layer_owners, execution_layers)
-        self._phase = KVPPPhase.IDLE
         self._next_layer_index = 0
         self._selected_pages: KVPPActivePages | None = None
         self._comm_stream: Any | None = None
-        self._current_layer: str | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._transfer_future: Future[None] | None = None
         self._pending_layer: str | None = None
@@ -489,30 +368,21 @@ class KVPPScheduler:
         block_table: torch.Tensor,
         seq_lens: Any,
     ) -> None:
-        active_pages = _active_pages(block_table, seq_lens, self.block_size, self.num_blocks)
-        self._begin_forward(active_pages)
-
-    def _begin_forward(self, active_pages: KVPPActivePages) -> None:
-        if self._phase is not KVPPPhase.IDLE:
-            raise RuntimeError(f"KVPP cannot begin a forward while phase is {self._phase.name}.")
-        if self._current_layer is not None or self._pending_layer is not None:
-            raise RuntimeError("KVPP cannot start with layer work pending.")
-        self._selected_pages = active_pages
+        if self._selected_pages is not None:
+            raise RuntimeError("KVPP cannot begin a forward while one is active.")
+        self._selected_pages = _active_pages(block_table, seq_lens, self.block_size, self.num_blocks)
         self._next_layer_index = 0
-        self._phase = KVPPPhase.FORWARD_ACTIVE
+        self._start_prefetch(self.plan.layers[0])
 
     def finish_forward(self) -> None:
-        if self._phase is KVPPPhase.IDLE:
+        if self._selected_pages is None:
             return
-        if self._current_layer is not None:
-            raise RuntimeError(f"KVPP forward ended while layer {self._current_layer} was active.")
         if self._pending_layer is not None:
             raise RuntimeError(f"KVPP forward ended with transfer for {self._pending_layer} pending.")
         if self._next_layer_index != len(self.plan.layers):
             raise RuntimeError(f"KVPP forward executed {self._next_layer_index}/{len(self.plan.layers)} layers.")
         self._selected_pages = None
         self._next_layer_index = 0
-        self._phase = KVPPPhase.IDLE
 
     def reset_forward(self) -> None:
         """Drop an unfinished forward (dummy skip-attn) or drain before close."""
@@ -520,70 +390,28 @@ class KVPPScheduler:
             self._transfer_future.result()
         self._transfer_future = None
         self._pending_layer = None
-        self._current_layer = None
         self._next_layer_index = 0
         self._selected_pages = None
-        self._phase = KVPPPhase.IDLE
-
-    def enter_layer(self, layer_name: str) -> None:
-        """Start owner page pushes while Q/KV projection runs on compute."""
-        if self._selected_pages is None:
-            raise RuntimeError("KVPP batch metadata was not prepared before forward.")
-        if self._phase is not KVPPPhase.FORWARD_ACTIVE:
-            raise RuntimeError("KVPP forward was not started before entering a layer.")
-        if self._current_layer is not None:
-            raise RuntimeError(f"KVPP layer {self._current_layer} was not completed before {layer_name}.")
-        if self._next_layer_index >= len(self.plan.layers):
-            raise RuntimeError(f"KVPP forward entered unexpected extra layer {layer_name}.")
-        expected_layer = self.plan.layers[self._next_layer_index]
-        if layer_name != expected_layer:
-            raise RuntimeError(f"KVPP forward expected {expected_layer}, but entered {layer_name}.")
-        self._next_layer_index += 1
-
-        self._current_layer = layer_name
-        self._phase = KVPPPhase.LAYER_ENTERED
-        if self._pending_layer is None:
-            self._start_prefetch(layer_name)
-        elif self._pending_layer != layer_name:
-            raise RuntimeError(f"KVPP prefetched {self._pending_layer}, but forward entered {layer_name}.")
 
     def wait_for_layer(self, layer_name: str) -> None:
         """Order cache use, then prefetch the next layer before attention."""
-        if self._phase is not KVPPPhase.LAYER_ENTERED or self._current_layer != layer_name:
-            raise RuntimeError(f"No pending KVPP transfer for layer {layer_name}.")
-        if self._pending_layer != layer_name:
-            raise RuntimeError(f"No pending KVPP prefetch for layer {layer_name}.")
+        assert self._selected_pages is not None, "KVPP batch metadata was not prepared before forward."
+        assert self._next_layer_index < len(self.plan.layers), f"KVPP forward waited on extra layer {layer_name}."
+        expected_layer = self.plan.layers[self._next_layer_index]
+        assert layer_name == expected_layer, f"KVPP forward expected {expected_layer}, but waited on {layer_name}."
+        assert self._pending_layer == layer_name, f"No pending KVPP prefetch for layer {layer_name}."
 
         if self._transfer_future is not None:
             # Eager path: this blocks only for the residual transfer time
-            # because this layer was prefetched while the preceding layer
-            # was executing.
+            # because this layer was prefetched while earlier work executed.
             layer_index = extract_layer_index(layer_name)
             with torch.profiler.record_function(f"kvpp.wait.previous_layer.layer_{layer_index}"):
                 self._transfer_future.result()
-        self._phase = KVPPPhase.LAYER_WAITED
-        # The current transfer is remotely visible now. Its buffer is read by
-        # the attention about to be submitted, while the other scratch buffer
-        # receives the next layer immediately.
         self._pending_layer = None
         self._transfer_future = None
+        self._next_layer_index += 1
         if self._next_layer_index < len(self.plan.layers):
             self._start_prefetch(self.plan.layers[self._next_layer_index])
-
-    def leave_layer(self, layer_name: str) -> None:
-        """Mark the current layer's attention submission complete.
-
-        The call site is after all attention kernels that consume historical
-        KV have been submitted, but before o_proj and the layer MLP/MoE. With
-        dual scratch buffers the next transfer was already submitted just
-        before this attention. Compute-stream ordering protects reuse when the
-        buffer cycles back two layers later.
-        """
-        if self._phase is not KVPPPhase.LAYER_WAITED or self._current_layer != layer_name:
-            raise RuntimeError(f"KVPP attention for layer {layer_name} finished before its transfer was consumed.")
-
-        self._current_layer = None
-        self._phase = KVPPPhase.FORWARD_ACTIVE
 
     def _start_prefetch(self, layer_name: str) -> None:
         if self._pending_layer is not None:

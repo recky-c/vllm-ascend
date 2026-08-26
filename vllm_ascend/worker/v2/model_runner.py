@@ -207,7 +207,6 @@ class NPUModelRunner(GPUModelRunner):
             block_tables=self.block_tables,
             static_forward_context=self.compilation_config.static_forward_context,
             speculator=self.speculator,
-            is_last_pp_rank=self.is_last_pp_rank,
         )
 
     def prepare_attn(self, input_batch: AscendInputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:

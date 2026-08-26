@@ -193,9 +193,9 @@ from vllm_ascend.utils import (
     weak_ref_tensors,
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
+from vllm_ascend.worker.kvpp_v1 import KVPPV1Runtime
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
-from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -349,7 +349,7 @@ class NPUModelRunner(GPUModelRunner):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
 
-        self.kvpp = KVPPRuntime()
+        self.kvpp = KVPPV1Runtime()
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -2088,7 +2088,7 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
-        self.kvpp.begin_v1_forward(
+        self.kvpp.begin_forward(
             self.input_batch,
             num_reqs,
             self.optimistic_seq_lens_cpu[:num_reqs],
@@ -3416,7 +3416,7 @@ class NPUModelRunner(GPUModelRunner):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
             if attn_metadata is not None:
-                self.kvpp.begin_v1_forward(
+                self.kvpp.begin_forward(
                     self.input_batch,
                     num_reqs,
                     self.optimistic_seq_lens_cpu[:num_reqs],
@@ -3734,13 +3734,12 @@ class NPUModelRunner(GPUModelRunner):
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
-        self.kvpp = KVPPRuntime.try_build_v1(
+        self.kvpp = KVPPV1Runtime.try_build(
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
             static_forward_context=self.compilation_config.static_forward_context,
             kv_caches=kv_caches,
             block_tables=self.input_batch.block_table,
-            is_last_pp_rank=get_pp_group().is_last_rank,
         )
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:

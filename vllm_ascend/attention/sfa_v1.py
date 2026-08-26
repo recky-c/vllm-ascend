@@ -1465,8 +1465,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
-        if self.layerwise_kv_cache_hook is not None:
-            self.layerwise_kv_cache_hook.enter_layer(layer_name)
         composed_kv_cache = self._compose_sfa_kv_cache(kv_cache)
         assert composed_kv_cache is not None
         kv_cache = composed_kv_cache
@@ -1675,11 +1673,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
-        if self.layerwise_kv_cache_hook is not None:
-            # The sparse attention kernel has consumed historical SFA and LI
-            # pages. The next transformer layer already uses the other scratch
-            # bundle and can continue transferring through v_up/o_proj/MoE.
-            self.layerwise_kv_cache_hook.leave_layer(layer_name)
 
         attn_output = self._v_up_proj(attn_output)
 

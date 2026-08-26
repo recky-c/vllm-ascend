@@ -269,6 +269,24 @@
     - tests/ut/kv_offload
     - tests/e2e/pull_request/one_card/test_cpu_offloading.py
 
+# KV layer parallelism (eager + MemFabric MTE)
+- name: kvpp
+  optional: false
+  source_file_dependencies:
+    - vllm_ascend/kvpp_config.py
+    - vllm_ascend/core/kv_cache_placement.py
+    - vllm_ascend/worker/v2/kvpp.py
+    - vllm_ascend/worker/kvpp_v1.py
+    - vllm_ascend/distributed/kv_transfer/kv_pool/memfabric_mte_transport.py
+    - vllm_ascend/distributed/parallel_state.py
+  tests:
+    - tests/ut/core/test_kvpp_cache_placement.py
+    - tests/ut/worker/test_kvpp_runtime.py
+    - tests/ut/worker/test_kvpp_v1.py
+    - tests/ut/distributed/kv_transfer/test_kvpp_mte_transport.py
+    - tests/ut/attention/test_kvpp_attention_lifecycle.py
+    - tests/e2e/pull_request/two_card/test_kvpp.py
+
 # Lora
 - name: lora
   optional: false
@@ -862,6 +880,7 @@ estimated_times:
   tests/e2e/pull_request/two_card/test_qwen3_vl_30b_a3b_instruct.py: 290
   tests/e2e/pull_request/two_card/test_shared_expert_dp.py: 1060
   tests/e2e/pull_request/two_card/test_hccl_weight_transfer.py: 130
+  tests/e2e/pull_request/two_card/test_kvpp.py: 1100
   tests/e2e/pull_request/two_card/test_xlite.py: 740
   tests/e2e/pull_request/four_card/_310p/test_dense_model_310p.py: 500
   tests/e2e/pull_request/four_card/_310p/test_moe_model_310p.py: 800

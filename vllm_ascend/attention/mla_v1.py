@@ -1716,10 +1716,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         )
 
         num_decode_tokens = attn_metadata.num_decode_tokens
-        if self.layerwise_kv_cache_hook is not None and (
-            attn_metadata.num_decodes > 0 or attn_metadata.num_prefills > 0
-        ):
-            self.layerwise_kv_cache_hook.enter_layer(layer_name)
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
         o_proj_input_shape = (_EXTRA_CTX.num_tokens, self.num_heads * self.v_head_dim)
@@ -1767,11 +1763,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
 
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
-        if self.layerwise_kv_cache_hook is not None:
-            # The next layer's transfer was submitted before this attention
-            # and uses the other scratch buffer. This marks the point after
-            # which a later layer may eventually cycle back to this buffer.
-            self.layerwise_kv_cache_hook.leave_layer(layer_name)
         # O proj
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 

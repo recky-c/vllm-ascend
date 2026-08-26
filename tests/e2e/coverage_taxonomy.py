@@ -73,6 +73,7 @@ ALLOWED_VALUES: dict[str, set[str]] = {
         "dynamic_eplb",
         "multistream_moe",
         "mo_routing_replay",
+        "kvpp",
     },
     "parallel": {
         "TP",
