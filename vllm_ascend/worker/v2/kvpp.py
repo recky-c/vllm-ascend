@@ -14,6 +14,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
     MemFabricMTEKVPPTransport,
 )
 
+# Dedicated kvpp CPU group: one in-flight prefetch, so tags only distinguish
+# the ready/done handshake, not the transformer layer.
+_KVPP_READY_TAG = 0
+_KVPP_DONE_TAG = 1
+
 
 @dataclass(frozen=True)
 class KVPPExecutionPlan:
@@ -449,8 +454,6 @@ class KVPPScheduler:
         local_rank = self.group.rank_in_group
         owner_global_rank = self.group.ranks[owner_rank]
         layer_index = extract_layer_index(layer_name)
-        ready_tag = 0x4B560000 + layer_index * 2
-        done_tag = ready_tag + 1
         token = torch.ones(1, dtype=torch.uint8, device="cpu")
 
         with torch.profiler.record_function(f"kvpp.comm_total.layer_{layer_index}"):
@@ -461,13 +464,13 @@ class KVPPScheduler:
                     token,
                     dst=owner_global_rank,
                     group=self.group.cpu_group,
-                    tag=ready_tag,
+                    tag=_KVPP_READY_TAG,
                 )
                 dist.recv(
                     token,
                     src=owner_global_rank,
                     group=self.group.cpu_group,
-                    tag=done_tag,
+                    tag=_KVPP_DONE_TAG,
                 )
                 with torch.profiler.record_function(f"kvpp.transport_receive.layer_{layer_index}"):
                     with torch.npu.stream(self._comm_stream):
@@ -486,7 +489,7 @@ class KVPPScheduler:
                     token,
                     src=peer_global_rank,
                     group=self.group.cpu_group,
-                    tag=ready_tag,
+                    tag=_KVPP_READY_TAG,
                 )
 
             with torch.profiler.record_function(f"kvpp.transport_push.layer_{layer_index}"):
@@ -508,7 +511,7 @@ class KVPPScheduler:
                     token,
                     dst=peer_global_rank,
                     group=self.group.cpu_group,
-                    tag=done_tag,
+                    tag=_KVPP_DONE_TAG,
                 )
 
     def close(self) -> None:
