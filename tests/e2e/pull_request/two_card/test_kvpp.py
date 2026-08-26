@@ -37,8 +37,7 @@ MODEL = ModelName.DEEPSEEK
 # Shared prefix is long enough that 128 batched tokens cannot cover it in one
 # prefill chunk. Four suffixes share the prefix so later requests can hit cache.
 _SHARED_PREFIX = (
-    "You are a helpful assistant that answers briefly. "
-    "Read the following context and continue the sentence. "
+    "You are a helpful assistant that answers briefly. Read the following context and continue the sentence. "
 ) * 16
 PROMPTS = [
     _SHARED_PREFIX + "Hello, my name is",

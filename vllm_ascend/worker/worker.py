@@ -59,6 +59,10 @@ from vllm.v1.worker.workspace import init_workspace_manager
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
+from vllm_ascend.core.kv_cache_placement import (
+    KVPPPhysicalCachePlan,
+    build_kvpp_physical_cache_plan,
+)
 from vllm_ascend.core.profiling_chunk_predictor import (
     _attach_profiling_chunk_execution_time,
 )
@@ -85,10 +89,6 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     register_ascend_customop,
     setup_ascend_local_comm_res,
-)
-from vllm_ascend.core.kv_cache_placement import (
-    KVPPPhysicalCachePlan,
-    build_kvpp_physical_cache_plan,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
