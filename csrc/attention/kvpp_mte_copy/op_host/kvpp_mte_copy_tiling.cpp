@@ -79,7 +79,7 @@ ge::graphStatus KvppMteCopyTiling(gert::TilingContext* context)
     workspaceSize[0] = 0;
     context->SetBlockDim(static_cast<uint32_t>(
         std::min<int64_t>(descriptorCount, MAX_CORE_COUNT)));
-    context->SetTilingKey(1);
+    context->SetTilingKey(0);
     tilingData.SaveToBuffer(
         context->GetRawTilingData()->GetData(),
         context->GetRawTilingData()->GetCapacity());

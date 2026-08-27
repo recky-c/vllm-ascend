@@ -1,6 +1,10 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * ACLNN/OPC entry kept for compressor-style packaging. Runtime KVPP MTE
+ * launches csrc/kernels/kvpp_mte_copy.cpp because OPC binaries cannot
+ * perform MemFabric GVA remote writes on CANN 9.1 / MemFabric 1.2.
  */
 
 #include "kernel_operator.h"
