@@ -537,22 +537,10 @@ class NPUWorker(WorkerBase):
         )
         return int(budget.final_planner_bytes)
 
-    def _apply_ipc_kv_memory_budget(self, available_bytes: int, *, explicit: bool = False) -> int:
-        kvpp_config = KVPPConfig.from_vllm_config(self.vllm_config)
-        if kvpp_config.transport not in ("ipc_pull", "ipc_broadcast"):
-            return available_bytes
-        from vllm_ascend.kvpp_memory import ipc_cache_payload_budget
-
+    def _apply_kvpp_memory_budget(self, available_bytes: int) -> int:
+        self.available_kv_cache_memory_bytes = available_bytes
         plan = self._kvpp_cache_allocation_plan
-        if plan is None:
-            raise RuntimeError("IPC KV memory budgeting requires the physical cache allocation plan")
-        bounded = ipc_cache_payload_budget(available_bytes, kvpp_config.ipc_pool_budget_bytes,
-                                           len(plan.physical_cache_spec))
-        if explicit and bounded < available_bytes:
-            raise ValueError("Explicit KV cache memory exceeds the IPC pool budget after alignment reserve")
-        logger.info("KVPP IPC cache payload budget: %d bytes; pool bound including alignment: %d bytes",
-                    bounded, kvpp_config.ipc_pool_budget_bytes)
-        return bounded
+        return plan.get_planner_memory_bytes(available_bytes) if plan is not None else available_bytes
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -581,8 +569,9 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            return self._apply_ipc_kv_memory_budget(
-                self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes), explicit=True)
+            return self._apply_kvpp_memory_budget(
+                self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+            )
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -648,9 +637,7 @@ class NPUWorker(WorkerBase):
         self.available_kv_cache_memory_bytes = self._apply_kv_offload_decode_memory_constraints(
             self.available_kv_cache_memory_bytes
         )
-        self.available_kv_cache_memory_bytes = self._apply_ipc_kv_memory_budget(self.available_kv_cache_memory_bytes)
-
-        return int(self.available_kv_cache_memory_bytes)
+        return self._apply_kvpp_memory_budget(self.available_kv_cache_memory_bytes)
 
     def log_memory_stats(self) -> None:
         """Profiles the torch reserved memory, torch allocated memory in execute_model()."""
@@ -1019,7 +1006,6 @@ class NPUWorker(WorkerBase):
                 kv_cache_spec,
                 kvpp_rank,
             )
-            kv_cache_spec = self._kvpp_cache_allocation_plan.physical_cache_spec
         if get_ascend_config().sparse_kv_offload_config.enabled:
             # reserve kv_cache_spec for sparse kv offload memory profile usage.
             self.kv_cache_spec = kv_cache_spec
@@ -1041,8 +1027,12 @@ class NPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         if self._kvpp_cache_allocation_plan is not None:
-            kv_cache_config = copy.deepcopy(kv_cache_config)
-            self._kvpp_cache_allocation_plan.restore_logical_cache_view(kv_cache_config)
+            required_bytes = self._kvpp_cache_allocation_plan.get_physical_memory_bytes(kv_cache_config.num_blocks)
+            if required_bytes > self.available_kv_cache_memory_bytes:
+                raise ValueError(
+                    f"KVPP requires {required_bytes} cache bytes, but only "
+                    f"{self.available_kv_cache_memory_bytes} are available."
+                )
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()

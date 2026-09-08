@@ -192,6 +192,7 @@ from vllm_ascend.utils import (
     weak_ref_tensors,
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
+from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
 from vllm_ascend.worker.kvpp_v1 import KVPPV1Runtime
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
@@ -350,12 +351,6 @@ class NPUModelRunner(GPUModelRunner):
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         self.kvpp = KVPPV1Runtime()
-        self._kvpp_ipc_pool = None
-        if self.ascend_config.kvpp_config.transport in ("ipc_pull", "ipc_broadcast"):
-            from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_allocation import IpcAllocationPool
-
-            self._kvpp_ipc_pool = IpcAllocationPool(
-                self.device, budget_bytes=self.ascend_config.kvpp_config.ipc_pool_budget_bytes)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -2339,62 +2334,60 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
-        self.kvpp.prepare_forward(
-            self.input_batch,
-            num_reqs,
-            self.num_computed_tokens[:num_reqs],
-        )
+        try:
+            self.kvpp.prepare_forward(bool(np.any(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)))
 
-        if self.dynamic_eplb:
-            self.eplb_updator.forward_before()
+            if self.dynamic_eplb:
+                self.eplb_updator.forward_before()
 
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        # vLLM v0.27.1 still supports runtime KV scale calculation. Upstream main
-        # removed this state in vllm-project/vllm#49389.
-        if vllm_version_is("0.27.1") and self.calculate_kv_scales:  # type: ignore[has-type]
-            cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False  # type: ignore[has-type]
-        # Encoder-decoder models can only compile the pure decode steps where no
-        # encoder inputs are present. Use eager for the first pass.
-        num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
-        has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+            # Set cudagraph mode to none if calc_kv_scales is true.
+            # KV scales calculation involves dynamic operations that are incompatible
+            # with CUDA graph capture.
+            # vLLM v0.27.1 still supports runtime KV scale calculation. Upstream main
+            # removed this state in vllm-project/vllm#49389.
+            if vllm_version_is("0.27.1") and self.calculate_kv_scales:  # type: ignore[has-type]
+                cudagraph_mode = CUDAGraphMode.NONE
+                # Mark KV scales as calculated after the first forward pass
+                self.calculate_kv_scales = False  # type: ignore[has-type]
+            # Encoder-decoder models can only compile the pure decode steps where no
+            # encoder inputs are present. Use eager for the first pass.
+            num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+            has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
-        # Run forward pass
-        defer_kv_connector_finalize = self.speculative_config is not None and (
-            get_pp_group().is_last_rank or self.broadcast_pp_output
-        )
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                skip_compiled=has_encoder_input,
-                has_sinks=self._has_sinks,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": defer_kv_connector_finalize}
-                ),
-            ) as kv_connector_output,
-        ):
-            if self.cache_config.mamba_cache_mode == "align":
-                mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            # Run forward pass
+            defer_kv_connector_finalize = self.speculative_config is not None and (
+                get_pp_group().is_last_rank or self.broadcast_pp_output
             )
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    skip_compiled=has_encoder_input,
+                    has_sinks=self._has_sinks,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                ),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    **(
+                        {"defer_finalize": defer_kv_connector_finalize}
+                    ),
+                ) as kv_connector_output,
+            ):
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
 
-        self.kvpp.complete_forward()
+        finally:
+            self.kvpp.complete_forward()
 
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -3664,31 +3657,28 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            if attn_metadata is not None:
-                self.kvpp.prepare_forward(
-                    self.input_batch,
-                    num_reqs,
-                    self.num_computed_tokens[:num_reqs],
-                )
+            try:
+                self.kvpp.prepare_forward(False)
 
-            with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                model_instance=self.model,
-                has_sinks = self._has_sinks,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ):
-                outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
-                )
+                with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    in_profile_run=is_profile,
+                    num_actual_tokens=num_tokens_padded,
+                    aclgraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    model_instance=self.model,
+                    has_sinks = self._has_sinks,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                ):
+                    outputs = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                    )
 
-            self.kvpp.complete_forward()
+            finally:
+                self.kvpp.complete_forward()
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -4008,17 +3998,15 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config=self.kv_cache_config,
             static_forward_context=self.compilation_config.static_forward_context,
             kv_caches=kv_caches,
-            block_tables=self.input_batch.block_table,
-            ipc_allocation_pool=self._kvpp_ipc_pool,
         )
 
     def shutdown(self) -> None:
-        parent_shutdown = getattr(super(), "shutdown", None)
-        if callable(parent_shutdown):
-            parent_shutdown()
-        self.kvpp.close()
-        if self._kvpp_ipc_pool is not None:
-            self._kvpp_ipc_pool.close()
+        try:
+            self.kvpp.close()
+        finally:
+            parent_shutdown = getattr(super(), "shutdown", None)
+            if callable(parent_shutdown):
+                parent_shutdown()
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
@@ -4132,8 +4120,6 @@ class NPUModelRunner(GPUModelRunner):
         if numel <= 0:
             raise ValueError(f"Invalid cache tensor size: {numel}")
 
-        if self._kvpp_ipc_pool is not None:
-            return self._kvpp_ipc_pool.allocate(numel)
 
         if self.vllm_config.kv_transfer_config is None:
             return torch.zeros(numel, dtype=torch.int8, device=self.device)
@@ -4216,6 +4202,9 @@ class NPUModelRunner(GPUModelRunner):
             dict[str, tuple(torch.Tensor, torch.Tensor)] A map between layer names
             to their corresponding memory buffer for K cache and V cache.
         """
+        if self.ascend_config.kvpp_config.size > 1:
+            self.hybrid_with_attn_and_mamba = False
+            return allocate_kvpp_cache(self.vllm_config, kv_cache_config, self.device)
         # init kv cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M

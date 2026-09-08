@@ -17,8 +17,8 @@
 #
 """Eager KV layer parallelism on two NPUs with DeepSeek-V2-Lite-W8A8.
 
-KVPP size equals TP, so this needs at least two cards. MemFabric MTE must be
-installed on the runner; otherwise the test is skipped.
+KVPP size equals TP, so this needs at least two cards. Cache transfer uses
+the existing HCCL group without an additional copy operator.
 
 Chunked prefill and prefix caching are both on. Prompts share a long prefix so
 the second+ requests can hit the prefix cache; ``max_num_batched_tokens`` is
@@ -47,12 +47,6 @@ PROMPTS = [
 ]
 
 
-def _require_memfabric_mte() -> None:
-    memfabric_hybrid = pytest.importorskip("memfabric_hybrid")
-    if not hasattr(memfabric_hybrid, "shm"):
-        pytest.skip("KVPP MTE requires memfabric_hybrid.shm")
-
-
 @pytest.mark.e2e_model(MODEL)
 @pytest.mark.e2e_coverage(
     arch="moe",
@@ -70,12 +64,11 @@ def _require_memfabric_mte() -> None:
 )
 @wait_until_npu_memory_free(0.7)
 def test_deepseek_v2_lite_kvpp_tp2(use_v2_runner: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-    _require_memfabric_mte()
     monkeypatch.delenv("HCCL_OP_EXPANSION_MODE", raising=False)
     if use_v2_runner:
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     else:
-        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
 
     # `additional_config` is excluded from the eager baseline by
     # compare_logprobs, so the baseline runs without KVPP.
@@ -87,6 +80,7 @@ def test_deepseek_v2_lite_kvpp_tp2(use_v2_runner: bool, monkeypatch: pytest.Monk
             "enforce_eager": True,
             "tensor_parallel_size": 2,
             "enable_expert_parallel": True,
+            "async_scheduling": True,
             "enable_chunked_prefill": True,
             "enable_prefix_caching": True,
             "quantization": "ascend",

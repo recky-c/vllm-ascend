@@ -1,110 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from vllm.distributed.parallel_state import GroupCoordinator
-from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import KVPPConfig
-from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
-from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
-    KVPPActivePages,
-    MemFabricMTEKVPPTransport,
-)
+from vllm_ascend.core.kv_cache_placement import build_kvpp_layer_layout, create_kvpp_cache_allocation_plan
+from vllm_ascend.distributed.kv_transfer.kv_pool.broadcast_transport import BroadcastKVPPTransport
 from vllm_ascend.distributed.parallel_state import get_kvpp_group
-
-# Dedicated kvpp CPU group: one in-flight prefetch, so tags only distinguish
-# the staging-ready/data-ready handshake, not the transformer layer.
-_KVPP_READY_TAG = 0
-_KVPP_DONE_TAG = 1
-
-
-def build_layer_cache_bundles(
-    layer_owner_ranks: dict[str, int],
-    attention_layer_names: tuple[str, ...] | None,
-) -> dict[str, tuple[str, ...]]:
-    """Group the KV caches consumed by each executable attention layer.
-
-    For example, if layer 0 has a Target KV cache and an indexer cache, both
-    are transferred when its attention implementation runs::
-
-        {
-            "model.layers.0.self_attn.attn": (
-                "model.layers.0.self_attn.attn",
-                "model.layers.0.self_attn.indexer.k_cache",
-            )
-        }
-    """
-    layers = tuple(attention_layer_names or layer_owner_ranks)
-    if attention_layer_names is None:
-        return {layer_name: (layer_name,) for layer_name in layers}
-
-    cache_layers_by_index: dict[int, list[str]] = {}
-    for cache_layer_name in sorted(
-        layer_owner_ranks,
-        key=lambda name: (extract_layer_index(name), name),
-    ):
-        cache_layers_by_index.setdefault(extract_layer_index(cache_layer_name), []).append(cache_layer_name)
-
-    return {
-        layer_name: tuple(cache_layers_by_index[extract_layer_index(layer_name)])
-        for layer_name in attention_layer_names
-    }
+from vllm_ascend.worker.kvpp_cache import get_kvpp_cache_specs
 
 
 @dataclass(frozen=True)
 class KVPPCacheLayout:
-    """Model-runner cache objects and their physical block layout."""
-
     layer_caches: dict[str, Any]
-    physical_blocks_per_kv_block: Sequence[int]
-    tokens_per_block: Sequence[int]
-    ipc_allocation_pool: Any | None = None
 
 
 class KVPPRuntime:
-    """Model-runner facing KVPP placement and scheduling glue."""
+    """Bind contiguous cache storage to the shared layer prefetch scheduler."""
 
-    def __init__(
-        self,
-        scheduler: KVPPScheduler | None = None,
-        managed_cache_group_index: int = 0,
-    ) -> None:
+    def __init__(self, scheduler: KVPPScheduler | None = None) -> None:
         self.scheduler = scheduler
-        self.managed_cache_group_index = managed_cache_group_index
 
     @classmethod
     def create_from_kv_cache(
-        cls,
-        *,
-        vllm_config: Any,
-        kv_cache_config: Any,
-        block_tables: Any,
-        static_forward_context: dict[str, Any],
+        cls, *, vllm_config: Any, kv_cache_config: Any, static_forward_context: dict[str, Any]
     ) -> KVPPRuntime:
         if KVPPConfig.from_vllm_config(vllm_config).size <= 1:
             return cls()
-
-        layer_caches: dict[str, Any] = {}
-        for cache_group in kv_cache_config.kv_cache_groups:
-            for layer_name in cache_group.layer_names:
-                module = static_forward_context.get(layer_name)
-                if module is not None and hasattr(module, "kv_cache"):
-                    layer_caches[layer_name] = module.kv_cache
+        caches = {
+            name: static_forward_context[name].kv_cache
+            for group in kv_cache_config.kv_cache_groups
+            for name in group.layer_names
+        }
         return cls.create_from_cache_layout(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             static_forward_context=static_forward_context,
-            cache_layout=KVPPCacheLayout(
-                layer_caches=layer_caches,
-                physical_blocks_per_kv_block=block_tables.blocks_per_kv_block,
-                tokens_per_block=block_tables.kernel_block_sizes,
-            ),
+            cache_layout=KVPPCacheLayout(caches),
         )
 
     @classmethod
@@ -116,397 +53,125 @@ class KVPPRuntime:
         static_forward_context: dict[str, Any],
         cache_layout: KVPPCacheLayout,
     ) -> KVPPRuntime:
-        """Create the runtime after a model runner has normalized its cache layout."""
-        layer_names = tuple(
-            dict.fromkeys(
-                layer_name for cache_group in kv_cache_config.kv_cache_groups for layer_name in cache_group.layer_names
+        config = KVPPConfig.from_vllm_config(vllm_config)
+        if config.size <= 1:
+            return cls()
+        group = get_kvpp_group()
+        plan = create_kvpp_cache_allocation_plan(
+            vllm_config, get_kvpp_cache_specs(kv_cache_config), group.rank_in_group
+        )
+        if not plan.layer_owner_ranks:
+            return cls()
+        buffers = {}
+        impls = {}
+        signature = []
+        for name, bundle in plan.layer_bundles.items():
+            if name not in plan.layer_owner_ranks:
+                continue
+            layout, size = build_kvpp_layer_layout(bundle, plan.tensor_specs, kv_cache_config.num_blocks)
+            first = cache_layout.layer_caches[name][0]
+            storage = first.untyped_storage()
+            base = first.storage_offset() * first.element_size()
+            if base + size > storage.nbytes():
+                raise ValueError(f"KVPP layer span exceeds its storage: {name}.")
+            parts = []
+            for cache_name, offsets in layout.items():
+                tensors = cache_layout.layer_caches[cache_name]
+                if len(tensors) != len(offsets):
+                    raise ValueError(f"KVPP cache component count differs for {cache_name}.")
+                for tensor, (offset, length) in zip(tensors, offsets):
+                    if (
+                        tensor.untyped_storage().data_ptr() != storage.data_ptr()
+                        or tensor.storage_offset() * tensor.element_size() != base + offset
+                        or tensor.numel() * tensor.element_size() != length
+                    ):
+                        raise ValueError(f"KVPP cache is not a contiguous layer bundle: {cache_name}.")
+                    parts.append((offset, length))
+            raw = torch.empty(0, dtype=torch.int8, device=first.device).set_(storage, base, (size,), (1,))
+            buffers[name] = (
+                (raw,)
+                if config.broadcast_granularity == "layer"
+                else tuple(raw.narrow(0, offset, length) for offset, length in parts)
             )
-        )
-        layer_owner_ranks = map_kvpp_layers_to_owners(vllm_config, layer_names)
-
-        managed_layer_names = set(layer_owner_ranks)
-        managed_cache_group_indices = {
-            group_index
-            for group_index, cache_group in enumerate(kv_cache_config.kv_cache_groups)
-            if managed_layer_names.intersection(cache_group.layer_names)
-        }
-        if len(managed_cache_group_indices) != 1:
-            raise ValueError(
-                f"KVPP managed layers must belong to one cache group, got {sorted(managed_cache_group_indices)}."
-            )
-        managed_cache_group_index = managed_cache_group_indices.pop()
-
-        attention_impls: dict[str, Any] = {}
-        managed_kv_caches: dict[str, Any] = {}
-        for layer_name in layer_owner_ranks:
-            if layer_name not in cache_layout.layer_caches:
-                raise RuntimeError(f"KVPP could not find the cache bound to layer {layer_name!r}.")
-            managed_kv_caches[layer_name] = cache_layout.layer_caches[layer_name]
-            module = static_forward_context.get(layer_name)
-            impl = getattr(module, "impl", None)
-            if impl is not None and hasattr(impl, "layerwise_kv_cache_hook"):
-                attention_impls[layer_name] = impl
-        if not attention_impls:
-            raise RuntimeError("KVPP requires an MLA or SFA attention implementation with a layer cache hook.")
-
-        num_physical_blocks = (
-            kv_cache_config.num_blocks * cache_layout.physical_blocks_per_kv_block[managed_cache_group_index]
-        )
-        tokens_per_block = cache_layout.tokens_per_block[managed_cache_group_index]
-        max_blocks_per_request = (vllm_config.model_config.max_model_len + tokens_per_block - 1) // tokens_per_block
-        max_active_pages = min(
-            num_physical_blocks,
-            vllm_config.scheduler_config.max_num_seqs * max_blocks_per_request,
-        )
-        kvpp_group = get_kvpp_group()
-        kvpp_config = KVPPConfig.from_vllm_config(vllm_config)
-        if getattr(kvpp_config, "transport", "memfabric") in ("ipc_pull", "ipc_broadcast"):
-            from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_pull_transport import IpcPullKVPPTransport
-
-            if cache_layout.ipc_allocation_pool is None:
-                raise RuntimeError("IPC pull requires allocation from the V1 IPC pool; this runner is unsupported")
-            transport_class = IpcPullKVPPTransport
-            if kvpp_config.transport == "ipc_broadcast":
-                from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_broadcast_transport import IpcBroadcastKVPPTransport
-                transport_class = IpcBroadcastKVPPTransport
-                if kvpp_config.broadcast_full_pages:
-                    from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_fullpage_broadcast_transport import (
-                        IpcFullPageBroadcastKVPPTransport,
-                    )
-                    transport_class = IpcFullPageBroadcastKVPPTransport
-            if kvpp_config.remote_read:
-                from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_remote_read_transport import IpcRemoteReadKVPPTransport
-                transport_class = IpcRemoteReadKVPPTransport
-            transport = transport_class(kvpp_group, num_physical_blocks, cache_layout.ipc_allocation_pool,
-                                            layer_owner_ranks, kvpp_config.ipc_kernel_library, kvpp_config.ipc_cores)
-        else:
-            transport = MemFabricMTEKVPPTransport(kvpp_group, num_physical_blocks)
-        scheduler = KVPPScheduler(
-            kvpp_group=kvpp_group,
-            layer_owner_ranks=layer_owner_ranks,
-            kv_caches=managed_kv_caches,
-            tokens_per_block=tokens_per_block,
-            num_physical_blocks=num_physical_blocks,
-            max_active_pages=max_active_pages,
-            transport=transport,
-            attention_layer_names=tuple(attention_impls),
-        )
-        for impl in attention_impls.values():
+            impl = static_forward_context[name].impl
+            if not hasattr(impl, "layerwise_kv_cache_hook"):
+                raise TypeError(f"KVPP requires an attention cache hook: {name}.")
+            impls[name] = impl
+            signature.append((name, plan.layer_owner_ranks[name], kv_cache_config.num_blocks, layout, size))
+        signatures = [None] * group.world_size
+        dist.all_gather_object(signatures, signature, group=group.cpu_group)
+        if any(value != signature for value in signatures):
+            raise ValueError("KVPP ranks have different layer layouts or block counts.")
+        scheduler = KVPPScheduler(BroadcastKVPPTransport(group, plan.layer_owner_ranks, buffers), tuple(buffers))
+        for impl in impls.values():
             impl.layerwise_kv_cache_hook = scheduler
-        return cls(
-            scheduler=scheduler,
-            managed_cache_group_index=managed_cache_group_index,
-        )
+        return cls(scheduler)
 
-    def prepare_forward(
-        self,
-        block_tables: tuple[torch.Tensor, ...],
-        num_computed_tokens: Any,
-    ) -> None:
-        if self.scheduler is None:
-            return
-        self.scheduler.schedule_forward(
-            block_tables[self.managed_cache_group_index],
-            num_computed_tokens,
-        )
+    def prepare_forward(self, has_history: bool) -> None:
+        if self.scheduler is not None:
+            self.scheduler.schedule_forward(has_history)
 
     def complete_forward(self) -> None:
-        if self.scheduler is None:
-            return
-        self.scheduler.complete_forward()
+        if self.scheduler is not None:
+            self.scheduler.complete_forward()
 
     def close(self) -> None:
         if self.scheduler is not None:
             self.scheduler.close()
 
 
-def select_active_pages(
-    block_table: torch.Tensor,
-    num_computed_tokens: Any,
-    tokens_per_block: int,
-    num_physical_blocks: int,
-) -> KVPPActivePages:
-    """Return fixed-shape device pages containing computed KV cache.
-
-    The original block table is read only. Invalid columns and duplicate page
-    IDs become masked slots instead of being compacted through the host.
-    """
-    computed_token_counts = torch.as_tensor(
-        num_computed_tokens,
-        dtype=torch.int64,
-        device=block_table.device,
-    ).flatten()
-    active_block_table = block_table[: computed_token_counts.shape[0]].to(dtype=torch.int64)
-    block_columns = torch.arange(
-        active_block_table.shape[1],
-        dtype=torch.int64,
-        device=block_table.device,
-    )
-    pages_per_request = torch.div(
-        computed_token_counts + tokens_per_block - 1,
-        tokens_per_block,
-        rounding_mode="floor",
-    )
-    covered_slots = block_columns.unsqueeze(0) < pages_per_request.unsqueeze(1)
-    valid_slots = covered_slots & (active_block_table >= 0) & (active_block_table < num_physical_blocks)
-    invalid_page_id = torch.full_like(active_block_table, num_physical_blocks)
-    physical_page_ids = torch.sort(torch.where(valid_slots, active_block_table, invalid_page_id).flatten()).values
-    first_occurrence_mask = torch.ones_like(physical_page_ids, dtype=torch.bool)
-    if physical_page_ids.numel() > 1:
-        first_occurrence_mask[1:] = physical_page_ids[1:] != physical_page_ids[:-1]
-    valid_page_mask = first_occurrence_mask & (physical_page_ids < num_physical_blocks)
-    staging_page_indices = torch.cumsum(valid_page_mask.to(dtype=torch.int64), dim=0) - 1
-    return KVPPActivePages(
-        physical_page_ids=physical_page_ids,
-        valid_page_mask=valid_page_mask,
-        staging_page_indices=staging_page_indices,
-    )
-
-
 class KVPPScheduler:
-    """Schedule stream-ordered layer prefetch over an injected transport.
+    """Prefetch one layer ahead; Target execution ordinal selects scratch."""
 
-    Owned layers use persistent KV caches. Non-owned layers are already bound
-    by vLLM's planner to one of two alternating full-size scratch caches.
-    Active pages are pushed into the same physical block IDs, preserving the
-    original block table and slot mapping. The dual buffers let layer N+1 be
-    filled while layer N attention still reads its own scratch cache.
-    """
-
-    def __init__(
-        self,
-        kvpp_group: GroupCoordinator,
-        layer_owner_ranks: dict[str, int],
-        kv_caches: dict[str, Any],
-        num_physical_blocks: int,
-        tokens_per_block: int,
-        max_active_pages: int,
-        transport: Any,
-        attention_layer_names: tuple[str, ...] | None = None,
-    ) -> None:
-        self.kvpp_group = kvpp_group
-        self.layer_owner_ranks = layer_owner_ranks
-        self.num_physical_blocks = num_physical_blocks
-        self.tokens_per_block = tokens_per_block
+    def __init__(self, transport: BroadcastKVPPTransport, attention_layer_names: tuple[str, ...]) -> None:
         self.transport = transport
-        self.layer_cache_bundles = build_layer_cache_bundles(
-            self.layer_owner_ranks,
-            attention_layer_names,
-        )
-        self.attention_layer_names = tuple(self.layer_cache_bundles)
+        self.attention_layer_names = attention_layer_names
+        self._has_history = False
         self._next_attention_layer_index = 0
-        self._active_pages: KVPPActivePages | None = None
-        self._forward_ready: Any | None = None
-        self._kv_transfer_stream: Any | None = None
-        self._prefetch_executor: ThreadPoolExecutor | None = None
-        self._prefetch_future: Future[Any] | None = None
-        self._active_transfer_ticket: Any | None = None
-        self._npu_device_id: int | None = None
-        self.transport.initialize_transport(
-            kv_caches,
-            tuple(self.layer_cache_bundles.values()),
-            max_active_pages,
-        )
-        if self.kvpp_group.world_size > 1:
-            self._npu_device_id = torch.npu.current_device()
-            self._kv_transfer_stream = torch.npu.Stream()
-            # One transfer may be in flight. Serializing jobs also preserves
-            # point-to-point notification order when layer ownership changes.
-            self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvpp-prefetch")
+        self._prefetch_future: Future[None] | None = None
+        self._npu_device_id = torch.npu.current_device()
+        self._kv_transfer_stream = torch.npu.Stream()
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvpp-prefetch")
 
-    def schedule_forward(
-        self,
-        block_table: torch.Tensor,
-        num_computed_tokens: Any,
-    ) -> None:
-        if self._active_pages is not None:
-            raise RuntimeError("KVPP cannot schedule a new forward while the previous forward is active.")
-        self._active_pages = select_active_pages(
-            block_table,
-            num_computed_tokens,
-            self.tokens_per_block,
-            self.num_physical_blocks,
-        )
-        if self.kvpp_group.world_size > 1:
-            # Covers this forward's metadata and earlier persistent KV writes
-            # on the compute stream, independently of per-layer scratch reuse.
-            self._forward_ready = torch.npu.Event()
-            self._forward_ready.record(torch.npu.current_stream())
+    def schedule_forward(self, has_history: bool) -> None:
+        if self._prefetch_future is not None:
+            raise RuntimeError("KVPP previous prefetch must complete before the next forward.")
+        self._has_history = has_history
         self._next_attention_layer_index = 0
-        if not getattr(type(self.transport), "uses_remote_read", False):
+        if has_history:
             self.start_layer_prefetch(self.attention_layer_names[0])
 
-    def complete_forward(self) -> None:
-        if self._active_pages is None:
-            return
-        if getattr(type(self.transport), "uses_direct_pull", False):
-            # Also handles an early return: finish the outstanding read lease
-            # before any forward metadata or cache allocation can be recycled.
-            self._release_direct_cache_use()
-            if self._prefetch_future is not None:
-                ticket = self._prefetch_future.result()
-                self.transport.release_after_last_cache_use(ticket, torch.npu.current_stream())
-                self._prefetch_future = None
-            self.transport.drain()
-        self._active_pages = None
-        self._forward_ready = None
-        self._next_attention_layer_index = 0
+    def start_layer_prefetch(self, layer_name: str) -> None:
+        cache_ready = torch.npu.Event()
+        cache_ready.record(torch.npu.current_stream())
+        self._prefetch_future = self._prefetch_executor.submit(self.run_layer_prefetch, layer_name, cache_ready)
+
+    def run_layer_prefetch(self, layer_name: str, cache_ready: Any) -> None:
+        torch.npu.set_device(self._npu_device_id)
+        self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)
 
     def wait_for_layer(self, layer_name: str) -> None:
-        """Order cache use, then prefetch the next layer before attention."""
-        if self._active_pages is None:
-            raise RuntimeError("KVPP batch metadata was not prepared before attention.")
-        if self._next_attention_layer_index >= len(self.attention_layer_names):
-            raise RuntimeError(f"KVPP received an extra attention layer {layer_name!r}.")
-        expected_layer = self.attention_layer_names[self._next_attention_layer_index]
-        if layer_name != expected_layer:
-            raise RuntimeError(f"KVPP expected attention layer {expected_layer!r}, got {layer_name!r}.")
-        if getattr(type(self.transport), "uses_remote_read", False):
-            self.transport.finish_remote_reads()
-            self._next_attention_layer_index += 1
+        if not self._has_history:
             return
-        # This point is after every previously submitted cache reader, including
-        # indexer/cache-load work on the compute stream, not merely attention.
-        self._release_direct_cache_use()
-        if self._prefetch_future is not None:
-            # Eager path: this blocks only for the residual transfer time
-            # because this layer was prefetched while earlier work executed.
-            layer_index = extract_layer_index(layer_name)
-            with torch.profiler.record_function(f"kvpp.wait.previous_layer.layer_{layer_index}"):
-                ticket = self._prefetch_future.result()
-                if getattr(type(self.transport), "uses_direct_pull", False):
-                    ticket.wait_local_cache_ready(torch.npu.current_stream())
-                    ticket.wait_owner_source_reusable()
-                    self._active_transfer_ticket = ticket
+        if self._prefetch_future is None:
+            raise RuntimeError("KVPP has no pending layer prefetch.")
+        self._prefetch_future.result()
         self._prefetch_future = None
         self._next_attention_layer_index += 1
         if self._next_attention_layer_index < len(self.attention_layer_names):
             self.start_layer_prefetch(self.attention_layer_names[self._next_attention_layer_index])
 
-    def remote_read_cache(self, layer_name: str, caches: tuple) -> tuple:
-        if not getattr(type(self.transport), "uses_remote_read", False):
-            return caches
-        return self.transport.remote_read_cache(layer_name, caches)
-
-    def _release_direct_cache_use(self) -> None:
-        if getattr(type(self.transport), "uses_remote_read", False):
-            self.transport.finish_remote_reads()
-        if self._active_transfer_ticket is not None:
-            self.transport.release_after_last_cache_use(self._active_transfer_ticket, torch.npu.current_stream())
-            self._active_transfer_ticket = None
+    def complete_forward(self) -> None:
+        try:
+            if self._prefetch_future is not None:
+                self._prefetch_future.result()
+        finally:
+            self._prefetch_future = None
+            self._has_history = False
+            self._next_attention_layer_index = 0
 
     def close(self) -> None:
-        self.complete_forward()
-        if self._prefetch_executor is not None:
+        try:
+            self.complete_forward()
+        finally:
             self._prefetch_executor.shutdown(wait=True)
-        if getattr(type(self.transport), "uses_direct_pull", False):
-            self.transport.close()
-
-    def start_layer_prefetch(self, layer_name: str, scratch_ready: Any | None = None) -> None:
-        """Launch at the caller's chosen point, without advancing in the worker.
-
-        A supplied scratch event must already be recorded after the target
-        buffer's last use. Otherwise use the current compute-stream safe point.
-        """
-        if self.kvpp_group.world_size <= 1:
-            return
-        if self._prefetch_future is not None:
-            raise RuntimeError("KVPP previous prefetch must be consumed before starting another layer.")
-        if self._prefetch_executor is None or self._kv_transfer_stream is None:
-            raise RuntimeError("KVPP prefetch resources were not initialized.")
-        forward_ready = self._forward_ready
-        if forward_ready is None:
-            raise RuntimeError("KVPP forward readiness was not prepared before prefetch.")
-        pages = self._active_pages
-        if pages is None:
-            raise RuntimeError("KVPP active pages were not prepared before prefetch.")
-        if scratch_ready is None:
-            scratch_ready = torch.npu.Event()
-            scratch_ready.record(torch.npu.current_stream())
-        self._prefetch_future = self._prefetch_executor.submit(
-            self.run_layer_prefetch,
-            layer_name,
-            pages,
-            forward_ready,
-            scratch_ready,
-        )
-
-    def run_layer_prefetch(
-        self,
-        layer_name: str,
-        active_pages: KVPPActivePages,
-        forward_ready: Any,
-        scratch_ready: Any,
-    ) -> Any:
-        """Run both phases in order on the existing communication worker."""
-        if self._kv_transfer_stream is None:
-            raise RuntimeError("KVPP communication stream was not initialized.")
-        if self._npu_device_id is not None:
-            torch.npu.set_device(self._npu_device_id)
-
-        if getattr(type(self.transport), "uses_direct_pull", False):
-            return self.transport.prefetch(
-                layer_name, self.layer_cache_bundles[layer_name], active_pages,
-                forward_ready, scratch_ready, self._kv_transfer_stream,
-            )
-
-        layer_index = extract_layer_index(layer_name)
-        with torch.profiler.record_function(f"kvpp.comm_total.layer_{layer_index}"):
-            self.run_layer_send(layer_name, active_pages, forward_ready)
-            self.run_layer_receive(layer_name, active_pages, forward_ready, scratch_ready)
-
-    def run_layer_send(self, layer_name: str, active_pages: KVPPActivePages, forward_ready: Any) -> None:
-        """Publish free staging, or push as its owner; never wait for scratch.
-
-        Called on the communication worker after the previous prefetch has
-        completed, so no preceding unpack still reads the local staging slot.
-        """
-        owner_kvpp_rank = self.layer_owner_ranks[layer_name]
-        owner_global_rank = self.kvpp_group.ranks[owner_kvpp_rank]
-        token = torch.ones(1, dtype=torch.uint8, device="cpu")
-        if self.kvpp_group.rank_in_group != owner_kvpp_rank:
-            dist.send(token, dst=owner_global_rank, group=self.kvpp_group.cpu_group, tag=_KVPP_READY_TAG)
-            return
-
-        for peer_kvpp_rank, peer_global_rank in enumerate(self.kvpp_group.ranks):
-            if peer_kvpp_rank != owner_kvpp_rank:
-                dist.recv(token, src=peer_global_rank, group=self.kvpp_group.cpu_group, tag=_KVPP_READY_TAG)
-
-        layer_index = extract_layer_index(layer_name)
-        with torch.profiler.record_function(f"kvpp.transport_push.layer_{layer_index}"):
-            with torch.npu.stream(self._kv_transfer_stream):
-                self._kv_transfer_stream.wait_event(forward_ready)
-                completion = self.transport.copy_active_pages_to_staging(
-                    self.layer_cache_bundles[layer_name], active_pages, self._kv_transfer_stream
-                )
-            completion.synchronize()
-
-        for peer_kvpp_rank, peer_global_rank in enumerate(self.kvpp_group.ranks):
-            if peer_kvpp_rank != owner_kvpp_rank:
-                dist.send(token, dst=peer_global_rank, group=self.kvpp_group.cpu_group, tag=_KVPP_DONE_TAG)
-
-    def run_layer_receive(
-        self,
-        layer_name: str,
-        active_pages: KVPPActivePages,
-        forward_ready: Any,
-        scratch_ready: Any,
-    ) -> None:
-        """Unpack on the communication worker after DONE and scratch readiness."""
-        owner_kvpp_rank = self.layer_owner_ranks[layer_name]
-        if self.kvpp_group.rank_in_group == owner_kvpp_rank:
-            return
-
-        owner_global_rank = self.kvpp_group.ranks[owner_kvpp_rank]
-        token = torch.ones(1, dtype=torch.uint8, device="cpu")
-        dist.recv(token, src=owner_global_rank, group=self.kvpp_group.cpu_group, tag=_KVPP_DONE_TAG)
-        layer_index = extract_layer_index(layer_name)
-        with torch.profiler.record_function(f"kvpp.transport_receive.layer_{layer_index}"):
-            with torch.npu.stream(self._kv_transfer_stream):
-                self._kv_transfer_stream.wait_event(forward_ready)
-                self._kv_transfer_stream.wait_event(scratch_ready)
-                completion = self.transport.copy_active_pages_from_staging(
-                    self.layer_cache_bundles[layer_name], active_pages, self._kv_transfer_stream
-                )
-            completion.synchronize()
-

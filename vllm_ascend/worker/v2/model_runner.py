@@ -227,7 +227,6 @@ class NPUModelRunner(GPUModelRunner):
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
-            block_tables=self.block_tables,
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
@@ -249,31 +248,45 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output,
         )
 
-        if vllm_version_is("0.27.1"):
-            output = super().execute_model(
-                scheduler_output,
-                intermediate_tensors=intermediate_tensors,
-                dummy_run=dummy_run,
-                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                is_profile=is_profile,
-            )
-        else:
-            output = super().execute_model(
-                scheduler_output,
-                intermediate_tensors=intermediate_tensors,
-                dummy_run=dummy_run,
-                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-                is_profile=is_profile,
-                context_len=context_len,
-            )
+        self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
+        try:
+            if vllm_version_is("0.27.1"):
+                output = super().execute_model(
+                    scheduler_output,
+                    intermediate_tensors=intermediate_tensors,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    is_profile=is_profile,
+                )
+            else:
+                output = super().execute_model(
+                    scheduler_output,
+                    intermediate_tensors=intermediate_tensors,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    is_profile=is_profile,
+                    context_len=context_len,
+                )
 
-        self.kvpp.complete_forward()
+        finally:
+            try:
+                self.kvpp.complete_forward()
+            finally:
+                self.model_state.kvpp_is_dummy_run = False
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
             execution_start_time,
         )
         return output
+
+    def shutdown(self) -> None:
+        try:
+            self.kvpp.close()
+        finally:
+            parent_shutdown = getattr(super(), "shutdown", None)
+            if callable(parent_shutdown):
+                parent_shutdown()
 
     @torch.inference_mode()
     def profile_run(self) -> None:

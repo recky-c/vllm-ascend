@@ -1662,9 +1662,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata,
             )
 
-        if self.layerwise_kv_cache_hook is not None:
-            kv_cache = self.layerwise_kv_cache_hook.remote_read_cache(layer_name, kv_cache)
-
         # Notify for every layer that wrote the cache, not just indexer layers:
         # by this point all of the layer's KV (main + indexer) has been
         # scattered, so the connector can dispatch the PD pull immediately.

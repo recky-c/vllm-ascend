@@ -3,86 +3,144 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from vllm.config import VllmConfig
+import torch
+from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    KVCacheGroupSpec,
+    FullAttentionSpec,
     KVCacheSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.quantization.utils import enable_fa_quant
+from vllm_ascend.utils import calc_split_factor, enable_sfa
+
+
+@dataclass(frozen=True)
+class KVPPBufferSpec:
+    size_per_block: int
+    dtype: torch.dtype
+    alignment: int
 
 
 @dataclass(frozen=True)
 class KVPPPhysicalCachePlan:
-    """Worker-local physical allocation with a complete logical cache view."""
+    """Complete logical topology and worker-local physical memory cost."""
 
     logical_cache_spec: dict[str, KVCacheSpec]
-    physical_cache_spec: dict[str, KVCacheSpec]
-    scratch_layer_aliases: dict[str, list[str]]
+    layer_owner_ranks: dict[str, int]
+    layer_bundles: dict[str, tuple[str, ...]]
+    tensor_specs: dict[str, tuple[KVPPBufferSpec, ...]]
+    kvpp_rank: int
 
-    def restore_logical_cache_view(self, kv_cache_config: KVCacheConfig) -> None:
-        """Restore logical layer bindings on an upstream physical config."""
-        for tensor in kv_cache_config.kv_cache_tensors:
-            tensor_names: list[str] = []
-            for layer_name in tensor.shared_by:
-                tensor_names.extend(self.scratch_layer_aliases.get(layer_name, [layer_name]))
-            tensor.shared_by = list(dict.fromkeys(tensor_names))
+    def get_physical_memory_bytes(self, num_blocks: int) -> int:
+        persistent_bytes = 0
+        scratch_bytes = 0
+        for name, bundle in self.layer_bundles.items():
+            _, size = build_kvpp_layer_layout(bundle, self.tensor_specs, num_blocks)
+            owner = self.layer_owner_ranks.get(name)
+            if owner is None or owner == self.kvpp_rank:
+                persistent_bytes += size
+            if owner is not None:
+                scratch_bytes = max(scratch_bytes, size)
+        return persistent_bytes + 2 * scratch_bytes
 
-        logical_groups: list[KVCacheGroupSpec] = []
-        for group in kv_cache_config.kv_cache_groups:
-            group_names: list[str] = []
-            for layer_name in group.layer_names:
-                group_names.extend(self.scratch_layer_aliases.get(layer_name, [layer_name]))
-            expanded_names = list(dict.fromkeys(group_names))
+    def get_num_blocks(self, available_bytes: int) -> int:
+        persistent = 0
+        scratch = 0
+        for name, bundle in self.layer_bundles.items():
+            size = sum(part.size_per_block for cache in bundle for part in self.tensor_specs[cache])
+            owner = self.layer_owner_ranks.get(name)
+            if owner is None or owner == self.kvpp_rank:
+                persistent += size
+            if owner is not None:
+                scratch = max(scratch, size)
+        per_block = persistent + 2 * scratch
+        if not per_block:
+            return 0
+        low, high = 0, max(available_bytes, 0) // per_block
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self.get_physical_memory_bytes(middle) <= available_bytes:
+                low = middle
+            else:
+                high = middle - 1
+        return low
 
-            group_spec = group.kv_cache_spec
-            if expanded_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
-                group_spec = UniformTypeKVCacheSpecs(
-                    block_size=group_spec.block_size,
-                    kv_cache_specs={layer_name: self.logical_cache_spec[layer_name] for layer_name in expanded_names},
-                )
-            logical_groups.append(
-                KVCacheGroupSpec(
-                    expanded_names,
-                    group_spec,
-                    is_eagle_group=group.is_eagle_group,
-                )
-            )
-
-        kv_cache_config.kv_cache_groups = logical_groups
-
-
-def project_kv_cache_groups_to_worker(
-    global_groups: list[KVCacheGroupSpec],
-    worker_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
-    """Project global logical groups onto one worker's PP-local layers.
-
-    The projected list keeps one entry per global group so logical group
-    indices stay aligned with the global topology; groups without local
-    layers become empty entries instead of being compacted away.
-    """
-    projected_groups: list[KVCacheGroupSpec] = []
-    for group in global_groups:
-        worker_layer_names = [layer_name for layer_name in group.layer_names if layer_name in worker_spec]
-        group_spec = group.kv_cache_spec
-        if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
-            group_spec = UniformTypeKVCacheSpecs(
-                block_size=group_spec.block_size,
-                kv_cache_specs={layer_name: group_spec.kv_cache_specs[layer_name] for layer_name in worker_layer_names},
-            )
-        projected_groups.append(
-            KVCacheGroupSpec(
-                worker_layer_names,
-                group_spec,
-                is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
-            )
+    def get_planner_memory_bytes(self, available_bytes: int) -> int:
+        return self.get_num_blocks(available_bytes) * sum(
+            spec.page_size_bytes for spec in self.logical_cache_spec.values()
         )
-    return projected_groups
+
+
+def build_layer_cache_bundles(cache_spec: dict[str, KVCacheSpec]) -> dict[str, tuple[str, ...]]:
+    by_index: dict[int, list[str]] = defaultdict(list)
+    for name in sorted(
+        cache_spec,
+        key=lambda name: (extract_layer_index(name), isinstance(cache_spec[name], AscendSFAIndexerCacheSpec), name),
+    ):
+        by_index[extract_layer_index(name)].append(name)
+    return {names[0]: tuple(names) for names in by_index.values()}
+
+
+def get_kvpp_attention_kv_dims(vllm_config: VllmConfig, layer_name: str, spec: KVCacheSpec) -> tuple[int, int]:
+    if isinstance(spec, AscendMLAAttentionSpec):
+        layer = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])[layer_name]
+        if isinstance(layer, MLAAttention):
+            return layer.kv_lora_rank, layer.qk_rope_head_dim
+        if isinstance(layer, CacheOnlyAttentionLayer):
+            return spec.head_size, spec.head_size
+        raise TypeError(f"Unsupported KVPP attention layer: {layer_name} ({type(layer).__name__}).")
+    return spec.head_size, getattr(spec, "head_size_v", spec.head_size)
+
+
+def build_kvpp_buffer_specs(
+    vllm_config: VllmConfig, logical_spec: dict[str, KVCacheSpec]
+) -> dict[str, tuple[KVPPBufferSpec, ...]]:
+    result = {}
+    for name, spec in logical_spec.items():
+        parts = []
+        if isinstance(spec, AscendSFAIndexerCacheSpec):
+            elements = spec.sfa_dcp_replicated_indexer_size * spec.block_size * spec.num_kv_heads
+            parts.append((elements * spec.head_size * get_dtype_size(spec.dtype), spec.dtype))
+            if spec.scale_dim:
+                parts.append((elements * spec.scale_dim * get_dtype_size(spec.scale_dtype), spec.scale_dtype))
+        elif getattr(spec, "cache_sparse_sfa_c8", False):
+            parts.append((spec.page_size_bytes, spec.dtype))
+        else:
+            dims = list(get_kvpp_attention_kv_dims(vllm_config, name, spec))
+            if not enable_sfa(vllm_config) and enable_fa_quant(vllm_config):
+                factors = vllm_config.quant_config.get_kv_quant_split_factor(name, dims)
+            else:
+                factors = calc_split_factor(dims)
+            parts.extend((int(spec.page_size_bytes // factor), spec.dtype) for factor in factors)
+        if sum(size for size, _ in parts) != spec.page_size_bytes:
+            raise ValueError(f"KVPP buffer sizes do not cover the cache page for {name}.")
+        result[name] = tuple(KVPPBufferSpec(size, dtype, max(32, get_dtype_size(dtype))) for size, dtype in parts)
+    return result
+
+
+def build_kvpp_layer_layout(
+    cache_names: tuple[str, ...], tensor_specs: dict[str, tuple[KVPPBufferSpec, ...]], num_blocks: int
+) -> tuple[dict[str, tuple[tuple[int, int], ...]], int]:
+    cursor = 0
+    layout = {}
+    for name in cache_names:
+        parts = []
+        for spec in tensor_specs[name]:
+            cursor = round_up(cursor, spec.alignment)
+            size = num_blocks * spec.size_per_block
+            parts.append((cursor, size))
+            cursor += size
+        layout[name] = tuple(parts)
+    return layout, cursor
 
 
 def find_mtp_layers(
@@ -128,10 +186,6 @@ def map_kvpp_layers_to_owners(vllm_config: VllmConfig, local_layer_names: Iterab
             layers_by_index[extract_layer_index(layer_name)].append(layer_name)
 
     layer_indices = sorted(layers_by_index)
-    if len(layer_indices) < kvpp_size:
-        raise ValueError(
-            f"KVPP size ({kvpp_size}) exceeds the number of KV cache layer bundles ({len(layer_indices)})."
-        )
     base, remainder = divmod(len(layer_indices), kvpp_size)
     layer_owner_ranks: dict[str, int] = {}
     offset = 0
@@ -144,88 +198,28 @@ def map_kvpp_layers_to_owners(vllm_config: VllmConfig, local_layer_names: Iterab
     return layer_owner_ranks
 
 
-def build_cache_allocation_groups(
-    logical_groups: list[KVCacheGroupSpec],
-    worker_spec: dict[str, KVCacheSpec],
-    layer_owner_ranks: dict[str, int],
-    kvpp_rank: int,
-) -> tuple[list[KVCacheGroupSpec], dict[str, list[str]]]:
-    """Per-KVPP-rank allocation view over PP-local logical groups.
-
-    Target layers owned by this rank stay persistent; other owners' layers map
-    onto two alternating scratch caches per layout. MTP layers remain
-    unpartitioned by KVPP and are allocated in full on every KVPP rank.
-    """
-    allocation_spec: dict[str, KVCacheSpec] = {}
-    scratch_layer_aliases: dict[str, list[str]] = {}
-
-    for group in logical_groups:
-        local_names = list(group.layer_names)
-        managed_names = [name for name in local_names if name in layer_owner_ranks]
-        allocation_names = [
-            name for name in local_names if name not in layer_owner_ranks or layer_owner_ranks[name] == kvpp_rank
-        ]
-        scratch_layout_groups: list[list[str]] = []
-        for name in managed_names:
-            if layer_owner_ranks[name] == kvpp_rank:
-                continue
-            for layout_names in scratch_layout_groups:
-                if worker_spec[name] == worker_spec[layout_names[0]]:
-                    layout_names.append(name)
-                    break
-            else:
-                scratch_layout_groups.append([name])
-        for layout_names in scratch_layout_groups:
-            scratch_names = layout_names[:2]
-            allocation_names.extend(scratch_names)
-            for scratch_index, scratch_name in enumerate(scratch_names):
-                scratch_layer_aliases[scratch_name] = layout_names[scratch_index :: len(scratch_names)]
-        for layer_name in allocation_names:
-            allocation_spec[layer_name] = worker_spec[layer_name]
-
-    return (
-        project_kv_cache_groups_to_worker(logical_groups, allocation_spec),
-        scratch_layer_aliases,
-    )
-
-
 def create_kvpp_cache_allocation_plan(
     vllm_config: VllmConfig,
     worker_spec: dict[str, KVCacheSpec],
     kvpp_rank: int,
 ) -> KVPPPhysicalCachePlan:
-    """Create the KV cache allocation plan reported by one worker.
-
-    The union of owner specs across KVPP ranks still contains every logical
-    layer, so upstream can build the global logical topology normally. Each
-    worker only reports its persistent layers, two scratch layers per cache
-    layout, and a full MTP cache on each rank; upstream therefore computes
-    the desired physical allocation without any KVPP-specific hook.
-    """
+    """Keep upstream's logical group while budgeting actual allocations."""
     kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
     if not 0 <= kvpp_rank < kvpp_size:
         raise ValueError(f"KVPP rank must be in [0, {kvpp_size}), got {kvpp_rank}.")
-
-    logical_cache_spec = dict(worker_spec)
-    # get_kv_cache_groups may normalize its input in place, so keep the spec
-    # returned to the engine and the spec retained for logical restoration
-    # independent from its working copy.
-    logical_cache_groups = get_kv_cache_groups(vllm_config, dict(logical_cache_spec))
-    layer_owner_ranks = map_kvpp_layers_to_owners(vllm_config, worker_spec)
-    physical_cache_groups, scratch_layer_aliases = build_cache_allocation_groups(
-        logical_cache_groups,
-        worker_spec,
-        layer_owner_ranks,
-        kvpp_rank,
-    )
-    physical_layer_names = {layer_name for group in physical_cache_groups for layer_name in group.layer_names}
-    physical_cache_spec = {
-        layer_name: logical_cache_spec[layer_name]
-        for layer_name in logical_cache_spec
-        if layer_name in physical_layer_names
-    }
+    logical_spec = dict(worker_spec)
+    if (
+        any(not isinstance(spec, FullAttentionSpec) for spec in logical_spec.values())
+        or len({spec.block_size for spec in logical_spec.values()}) > 1
+    ):
+        raise ValueError("KVPP requires one full-attention cache group with a common block size.")
+    groups = get_kv_cache_groups(vllm_config, dict(logical_spec))
+    if len([group for group in groups if group.layer_names]) > 1:
+        raise ValueError("KVPP requires one nonempty logical cache group.")
     return KVPPPhysicalCachePlan(
-        logical_cache_spec=logical_cache_spec,
-        physical_cache_spec=physical_cache_spec,
-        scratch_layer_aliases=scratch_layer_aliases,
+        logical_cache_spec=logical_spec,
+        layer_owner_ranks=map_kvpp_layers_to_owners(vllm_config, logical_spec),
+        layer_bundles=build_layer_cache_bundles(logical_spec),
+        tensor_specs=build_kvpp_buffer_specs(vllm_config, logical_spec),
+        kvpp_rank=kvpp_rank,
     )
