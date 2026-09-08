@@ -22,6 +22,7 @@ class KVPPV1Runtime:
         static_forward_context: dict[str, Any],
         kv_caches: dict[str, Any],
         block_tables: Any,
+        ipc_allocation_pool: Any | None = None,
     ) -> KVPPV1Runtime:
         if KVPPConfig.from_vllm_config(vllm_config).size <= 1:
             return cls()
@@ -34,6 +35,7 @@ class KVPPV1Runtime:
                 static_forward_context=static_forward_context,
                 cache_layout=KVPPCacheLayout(
                     layer_caches=kv_caches,
+                    ipc_allocation_pool=ipc_allocation_pool,
                     physical_blocks_per_kv_block=tuple(
                         block_tables[index].blocks_per_phys_block for index in range(cache_group_count)
                     ),
@@ -61,3 +63,6 @@ class KVPPV1Runtime:
 
     def complete_forward(self) -> None:
         self._kvpp_runtime.complete_forward()
+
+    def close(self) -> None:
+        self._kvpp_runtime.close()

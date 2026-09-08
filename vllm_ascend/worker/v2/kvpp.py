@@ -64,6 +64,7 @@ class KVPPCacheLayout:
     layer_caches: dict[str, Any]
     physical_blocks_per_kv_block: Sequence[int]
     tokens_per_block: Sequence[int]
+    ipc_allocation_pool: Any | None = None
 
 
 class KVPPRuntime:
@@ -158,6 +159,20 @@ class KVPPRuntime:
             vllm_config.scheduler_config.max_num_seqs * max_blocks_per_request,
         )
         kvpp_group = get_kvpp_group()
+        kvpp_config = KVPPConfig.from_vllm_config(vllm_config)
+        if getattr(kvpp_config, "transport", "memfabric") in ("ipc_pull", "ipc_broadcast"):
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_pull_transport import IpcPullKVPPTransport
+
+            if cache_layout.ipc_allocation_pool is None:
+                raise RuntimeError("IPC pull requires allocation from the V1 IPC pool; this runner is unsupported")
+            transport_class = IpcPullKVPPTransport
+            if kvpp_config.transport == "ipc_broadcast":
+                from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_broadcast_transport import IpcBroadcastKVPPTransport
+                transport_class = IpcBroadcastKVPPTransport
+            transport = transport_class(kvpp_group, num_physical_blocks, cache_layout.ipc_allocation_pool,
+                                            layer_owner_ranks, kvpp_config.ipc_kernel_library, kvpp_config.ipc_cores)
+        else:
+            transport = MemFabricMTEKVPPTransport(kvpp_group, num_physical_blocks)
         scheduler = KVPPScheduler(
             kvpp_group=kvpp_group,
             layer_owner_ranks=layer_owner_ranks,
@@ -165,10 +180,7 @@ class KVPPRuntime:
             tokens_per_block=tokens_per_block,
             num_physical_blocks=num_physical_blocks,
             max_active_pages=max_active_pages,
-            transport=MemFabricMTEKVPPTransport(
-                kvpp_group,
-                num_physical_blocks,
-            ),
+            transport=transport,
             attention_layer_names=tuple(attention_impls),
         )
         for impl in attention_impls.values():
@@ -194,6 +206,10 @@ class KVPPRuntime:
         if self.scheduler is None:
             return
         self.scheduler.complete_forward()
+
+    def close(self) -> None:
+        if self.scheduler is not None:
+            self.scheduler.close()
 
 
 def select_active_pages(
@@ -257,7 +273,7 @@ class KVPPScheduler:
         num_physical_blocks: int,
         tokens_per_block: int,
         max_active_pages: int,
-        transport: MemFabricMTEKVPPTransport,
+        transport: Any,
         attention_layer_names: tuple[str, ...] | None = None,
     ) -> None:
         self.kvpp_group = kvpp_group
@@ -275,7 +291,8 @@ class KVPPScheduler:
         self._forward_ready: Any | None = None
         self._kv_transfer_stream: Any | None = None
         self._prefetch_executor: ThreadPoolExecutor | None = None
-        self._prefetch_future: Future[None] | None = None
+        self._prefetch_future: Future[Any] | None = None
+        self._active_transfer_ticket: Any | None = None
         self._npu_device_id: int | None = None
         self.transport.initialize_transport(
             kv_caches,
@@ -313,6 +330,15 @@ class KVPPScheduler:
     def complete_forward(self) -> None:
         if self._active_pages is None:
             return
+        if getattr(type(self.transport), "uses_direct_pull", False):
+            # Also handles an early return: finish the outstanding read lease
+            # before any forward metadata or cache allocation can be recycled.
+            self._release_direct_cache_use()
+            if self._prefetch_future is not None:
+                ticket = self._prefetch_future.result()
+                self.transport.release_after_last_cache_use(ticket, torch.npu.current_stream())
+                self._prefetch_future = None
+            self.transport.drain()
         self._active_pages = None
         self._forward_ready = None
         self._next_attention_layer_index = 0
@@ -326,16 +352,35 @@ class KVPPScheduler:
         expected_layer = self.attention_layer_names[self._next_attention_layer_index]
         if layer_name != expected_layer:
             raise RuntimeError(f"KVPP expected attention layer {expected_layer!r}, got {layer_name!r}.")
+        # This point is after every previously submitted cache reader, including
+        # indexer/cache-load work on the compute stream, not merely attention.
+        self._release_direct_cache_use()
         if self._prefetch_future is not None:
             # Eager path: this blocks only for the residual transfer time
             # because this layer was prefetched while earlier work executed.
             layer_index = extract_layer_index(layer_name)
             with torch.profiler.record_function(f"kvpp.wait.previous_layer.layer_{layer_index}"):
-                self._prefetch_future.result()
+                ticket = self._prefetch_future.result()
+                if getattr(type(self.transport), "uses_direct_pull", False):
+                    ticket.wait_local_cache_ready(torch.npu.current_stream())
+                    ticket.wait_owner_source_reusable()
+                    self._active_transfer_ticket = ticket
         self._prefetch_future = None
         self._next_attention_layer_index += 1
         if self._next_attention_layer_index < len(self.attention_layer_names):
             self.start_layer_prefetch(self.attention_layer_names[self._next_attention_layer_index])
+
+    def _release_direct_cache_use(self) -> None:
+        if self._active_transfer_ticket is not None:
+            self.transport.release_after_last_cache_use(self._active_transfer_ticket, torch.npu.current_stream())
+            self._active_transfer_ticket = None
+
+    def close(self) -> None:
+        self.complete_forward()
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=True)
+        if getattr(type(self.transport), "uses_direct_pull", False):
+            self.transport.close()
 
     def start_layer_prefetch(self, layer_name: str, scratch_ready: Any | None = None) -> None:
         """Launch at the caller's chosen point, without advancing in the worker.
@@ -372,12 +417,18 @@ class KVPPScheduler:
         active_pages: KVPPActivePages,
         forward_ready: Any,
         scratch_ready: Any,
-    ) -> None:
+    ) -> Any:
         """Run both phases in order on the existing communication worker."""
         if self._kv_transfer_stream is None:
             raise RuntimeError("KVPP communication stream was not initialized.")
         if self._npu_device_id is not None:
             torch.npu.set_device(self._npu_device_id)
+
+        if getattr(type(self.transport), "uses_direct_pull", False):
+            return self.transport.prefetch(
+                layer_name, self.layer_cache_bundles[layer_name], active_pages,
+                forward_ready, scratch_ready, self._kv_transfer_stream,
+            )
 
         layer_index = extract_layer_index(layer_name)
         with torch.profiler.record_function(f"kvpp.comm_total.layer_{layer_index}"):

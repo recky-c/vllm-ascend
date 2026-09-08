@@ -26,6 +26,10 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
+from vllm_ascend.kvpp_memory import (
+    DEFAULT_IPC_POOL_BUDGET_BYTES,
+    VERIFIED_IPC_POOL_LIMIT_BYTES,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -68,6 +72,10 @@ class KVPPConfig:
     """Configuration for KV layer parallelism on Ascend."""
 
     size: int = 1
+    transport: Literal["memfabric", "ipc_pull", "ipc_broadcast"] = "memfabric"
+    ipc_kernel_library: str | None = None
+    ipc_cores: int = 8
+    ipc_pool_budget_bytes: int = DEFAULT_IPC_POOL_BUDGET_BYTES
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> KVPPConfig:
@@ -77,7 +85,19 @@ class KVPPConfig:
             raise ValueError(f"additional_config.enable_kvpp must be a boolean, got {enabled!r}.")
 
         size = vllm_config.parallel_config.tensor_parallel_size if enabled else 1
-        return cls(size=size)
+        result = cls(size=size, transport=additional_config.get("kvpp_transport", "memfabric"),
+                     ipc_kernel_library=additional_config.get("kvpp_ipc_kernel_library"),
+                     ipc_cores=additional_config.get("kvpp_ipc_cores", 8),
+                     ipc_pool_budget_bytes=additional_config.get(
+                         "kvpp_ipc_pool_budget_bytes", DEFAULT_IPC_POOL_BUDGET_BYTES))
+        if result.transport in ("ipc_pull", "ipc_broadcast"):
+            if size <= 1 or not result.ipc_kernel_library or not 1 <= result.ipc_cores <= 40:
+                raise ValueError("IPC pull requires enabled multi-rank KVPP, a kernel library, and 1-40 cores")
+            if not 0 < result.ipc_pool_budget_bytes <= VERIFIED_IPC_POOL_LIMIT_BYTES:
+                raise ValueError("IPC pool budget must be positive and within this backend's verified 8 GiB bound")
+            if vllm_config.kv_transfer_config is not None or vllm_config.speculative_config is not None:
+                raise ValueError("Experimental IPC pull has not yet validated connectors or speculative rollback")
+        return result
 
     def validate(self, vllm_config: VllmConfig) -> None:
         parallel_config = vllm_config.parallel_config
@@ -1433,6 +1453,10 @@ def init_ascend_config(vllm_config):
         "enable_kvpp",
         "kvpp_size",
         "kvpp_config",
+        "kvpp_transport",
+        "kvpp_ipc_kernel_library",
+        "kvpp_ipc_cores",
+        "kvpp_ipc_pool_budget_bytes",
         # Factory-only input: materialized by _resolve_dump_config_path and
         # replaced with the validated dump_config_path field below.
         "dump_config",

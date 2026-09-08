@@ -1,0 +1,163 @@
+{
+  "rows": [
+    {
+      "backend": "off",
+      "input_tokens": 65536,
+      "mean_seconds": 8.41207899649938,
+      "stddev_seconds": 0.024409904290053016,
+      "samples_seconds": [
+        8.40092256013304,
+        8.440073589794338,
+        8.39524083957076
+      ],
+      "generated_texts": [
+        [
+          "rimon"
+        ],
+        [
+          "ใ"
+        ],
+        [
+          "char"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-07T18-21-57Z_kvpp-ttft-157-20260906_14444_a9bb27d4.json",
+      "ttft_change_percent_vs_off": 0.0,
+      "first_token_text_matches_off": true
+    },
+    {
+      "backend": "off",
+      "input_tokens": 131072,
+      "mean_seconds": 17.20097022658835,
+      "stddev_seconds": 0.007321262334686611,
+      "samples_seconds": [
+        17.2079102601856,
+        17.201680859550834,
+        17.193319560028613
+      ],
+      "generated_texts": [
+        [
+          "特征"
+        ],
+        [
+          "甲"
+        ],
+        [
+          "由于"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-07T18-21-57Z_kvpp-ttft-157-20260906_14444_a9bb27d4.json",
+      "ttft_change_percent_vs_off": 0.0,
+      "first_token_text_matches_off": true
+    },
+    {
+      "backend": "ipc_pull",
+      "input_tokens": 65536,
+      "mean_seconds": 8.609589342959225,
+      "stddev_seconds": 0.006867032871540501,
+      "samples_seconds": [
+        8.606394560076296,
+        8.604901739396155,
+        8.617471729405224
+      ],
+      "generated_texts": [
+        [
+          "rimon"
+        ],
+        [
+          "ใ"
+        ],
+        [
+          "char"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-07T18-33-48Z_kvpp-ttft-157-20260906_6956_aee07f00.json",
+      "ttft_change_percent_vs_off": 2.3479373712733453,
+      "first_token_text_matches_off": true
+    },
+    {
+      "backend": "ipc_pull",
+      "input_tokens": 131072,
+      "mean_seconds": 18.94725349980096,
+      "stddev_seconds": 0.04750642110664628,
+      "samples_seconds": [
+        18.99618500005454,
+        18.90131354983896,
+        18.944261949509382
+      ],
+      "generated_texts": [
+        [
+          "特征"
+        ],
+        [
+          "甲"
+        ],
+        [
+          "由于"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-07T18-33-48Z_kvpp-ttft-157-20260906_6956_aee07f00.json",
+      "ttft_change_percent_vs_off": 10.152237055287138,
+      "first_token_text_matches_off": true
+    },
+    {
+      "backend": "ipc_broadcast",
+      "input_tokens": 65536,
+      "mean_seconds": 8.552141712978482,
+      "stddev_seconds": 0.02077871368073601,
+      "samples_seconds": [
+        8.54848566930741,
+        8.57450579944998,
+        8.533433670178056
+      ],
+      "generated_texts": [
+        [
+          "rimon"
+        ],
+        [
+          "ใ"
+        ],
+        [
+          "char"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-07T18-09-30Z_kvpp-ttft-157-20260906_30352_cd9f3ae4.json",
+      "ttft_change_percent_vs_off": 1.6650190343836302,
+      "first_token_text_matches_off": true
+    },
+    {
+      "backend": "ipc_broadcast",
+      "input_tokens": 131072,
+      "mean_seconds": 18.279319253439706,
+      "stddev_seconds": 0.056877646777825544,
+      "samples_seconds": [
+        18.31631457991898,
+        18.213826100341976,
+        18.307817080058157
+      ],
+      "generated_texts": [
+        [
+          "特征"
+        ],
+        [
+          "甲"
+        ],
+        [
+          "由于"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-07T18-09-30Z_kvpp-ttft-157-20260906_30352_cd9f3ae4.json",
+      "ttft_change_percent_vs_off": 6.269117454691608,
+      "first_token_text_matches_off": true
+    }
+  ],
+  "complete": true,
+  "family": "default",
+  "configuration": "TP16 EP async chunk32768 DSA-CP=true FlashComm legacy flag=true",
+  "caveats": [
+    "fixed backend order, 3 measured requests per length",
+    "one generated token; no full model accuracy acceptance",
+    "TP8 capacity failures excluded",
+    "FlashComm legacy flag is deprecated; deployed use_sequence_parallel_moe requires DP>1 and is false at DP1"
+  ]
+}

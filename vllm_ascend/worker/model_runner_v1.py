@@ -350,6 +350,12 @@ class NPUModelRunner(GPUModelRunner):
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         self.kvpp = KVPPV1Runtime()
+        self._kvpp_ipc_pool = None
+        if self.ascend_config.kvpp_config.transport in ("ipc_pull", "ipc_broadcast"):
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_allocation import IpcAllocationPool
+
+            self._kvpp_ipc_pool = IpcAllocationPool(
+                self.device, budget_bytes=self.ascend_config.kvpp_config.ipc_pool_budget_bytes)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -4003,7 +4009,16 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
             kv_caches=kv_caches,
             block_tables=self.input_batch.block_table,
+            ipc_allocation_pool=self._kvpp_ipc_pool,
         )
+
+    def shutdown(self) -> None:
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if callable(parent_shutdown):
+            parent_shutdown()
+        self.kvpp.close()
+        if self._kvpp_ipc_pool is not None:
+            self._kvpp_ipc_pool.close()
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
@@ -4116,6 +4131,9 @@ class NPUModelRunner(GPUModelRunner):
         """
         if numel <= 0:
             raise ValueError(f"Invalid cache tensor size: {numel}")
+
+        if self._kvpp_ipc_pool is not None:
+            return self._kvpp_ipc_pool.allocate(numel)
 
         if self.vllm_config.kv_transfer_config is None:
             return torch.zeros(numel, dtype=torch.int8, device=self.device)

@@ -537,6 +537,23 @@ class NPUWorker(WorkerBase):
         )
         return int(budget.final_planner_bytes)
 
+    def _apply_ipc_kv_memory_budget(self, available_bytes: int, *, explicit: bool = False) -> int:
+        kvpp_config = KVPPConfig.from_vllm_config(self.vllm_config)
+        if kvpp_config.transport not in ("ipc_pull", "ipc_broadcast"):
+            return available_bytes
+        from vllm_ascend.kvpp_memory import ipc_cache_payload_budget
+
+        plan = self._kvpp_cache_allocation_plan
+        if plan is None:
+            raise RuntimeError("IPC KV memory budgeting requires the physical cache allocation plan")
+        bounded = ipc_cache_payload_budget(available_bytes, kvpp_config.ipc_pool_budget_bytes,
+                                           len(plan.physical_cache_spec))
+        if explicit and bounded < available_bytes:
+            raise ValueError("Explicit KV cache memory exceeds the IPC pool budget after alignment reserve")
+        logger.info("KVPP IPC cache payload budget: %d bytes; pool bound including alignment: %d bytes",
+                    bounded, kvpp_config.ipc_pool_budget_bytes)
+        return bounded
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -564,7 +581,8 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            return self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+            return self._apply_ipc_kv_memory_budget(
+                self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes), explicit=True)
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -630,6 +648,7 @@ class NPUWorker(WorkerBase):
         self.available_kv_cache_memory_bytes = self._apply_kv_offload_decode_memory_constraints(
             self.available_kv_cache_memory_bytes
         )
+        self.available_kv_cache_memory_bytes = self._apply_ipc_kv_memory_budget(self.available_kv_cache_memory_bytes)
 
         return int(self.available_kv_cache_memory_bytes)
 
