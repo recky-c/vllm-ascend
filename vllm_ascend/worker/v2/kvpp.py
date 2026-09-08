@@ -169,6 +169,11 @@ class KVPPRuntime:
             if kvpp_config.transport == "ipc_broadcast":
                 from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_broadcast_transport import IpcBroadcastKVPPTransport
                 transport_class = IpcBroadcastKVPPTransport
+                if kvpp_config.broadcast_full_pages:
+                    from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_fullpage_broadcast_transport import (
+                        IpcFullPageBroadcastKVPPTransport,
+                    )
+                    transport_class = IpcFullPageBroadcastKVPPTransport
             transport = transport_class(kvpp_group, num_physical_blocks, cache_layout.ipc_allocation_pool,
                                             layer_owner_ranks, kvpp_config.ipc_kernel_library, kvpp_config.ipc_cores)
         else:

@@ -75,6 +75,7 @@ class KVPPConfig:
     transport: Literal["memfabric", "ipc_pull", "ipc_broadcast"] = "memfabric"
     ipc_kernel_library: str | None = None
     ipc_cores: int = 8
+    broadcast_full_pages: bool = False
     ipc_pool_budget_bytes: int = DEFAULT_IPC_POOL_BUDGET_BYTES
 
     @classmethod
@@ -83,9 +84,15 @@ class KVPPConfig:
         enabled = additional_config.get("enable_kvpp", False)
         if not isinstance(enabled, bool):
             raise ValueError(f"additional_config.enable_kvpp must be a boolean, got {enabled!r}.")
+        full_pages = additional_config.get("kvpp_broadcast_full_pages", False)
+        if not isinstance(full_pages, bool):
+            raise ValueError("kvpp_broadcast_full_pages must be a boolean")
+        if full_pages and (not enabled or additional_config.get("kvpp_transport") != "ipc_broadcast"):
+            raise ValueError("kvpp_broadcast_full_pages requires enabled ipc_broadcast")
 
         size = vllm_config.parallel_config.tensor_parallel_size if enabled else 1
         result = cls(size=size, transport=additional_config.get("kvpp_transport", "memfabric"),
+                     broadcast_full_pages=full_pages,
                      ipc_kernel_library=additional_config.get("kvpp_ipc_kernel_library"),
                      ipc_cores=additional_config.get("kvpp_ipc_cores", 8),
                      ipc_pool_budget_bytes=additional_config.get(
@@ -1457,6 +1464,7 @@ def init_ascend_config(vllm_config):
         "kvpp_ipc_kernel_library",
         "kvpp_ipc_cores",
         "kvpp_ipc_pool_budget_bytes",
+        "kvpp_broadcast_full_pages",
         # Factory-only input: materialized by _resolve_dump_config_path and
         # replaced with the validated dump_config_path field below.
         "dump_config",

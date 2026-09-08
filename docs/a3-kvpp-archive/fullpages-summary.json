@@ -1,0 +1,105 @@
+{
+  "complete": true,
+  "rows": [
+    {
+      "mode": "full",
+      "input_tokens": 65536,
+      "mean_seconds": 8.545381726386646,
+      "stddev_seconds": 0.008108557216257955,
+      "samples_seconds": [
+        8.539511889219284,
+        8.541999409906566,
+        8.554633880034089
+      ],
+      "texts": [
+        [
+          "rimon"
+        ],
+        [
+          "ใ"
+        ],
+        [
+          "char"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-08T01-27-43Z_kvpp-ttft-157-20260906_8956_61a766c4.json",
+      "change_percent_vs_active": -0.973107386321237,
+      "first_tokens_match": true
+    },
+    {
+      "mode": "full",
+      "input_tokens": 131072,
+      "mean_seconds": 18.357834580354393,
+      "stddev_seconds": 0.040120760828251785,
+      "samples_seconds": [
+        18.380088720470667,
+        18.311518870294094,
+        18.381896150298417
+      ],
+      "texts": [
+        [
+          "特征"
+        ],
+        [
+          "甲"
+        ],
+        [
+          "由于"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-08T01-27-43Z_kvpp-ttft-157-20260906_8956_61a766c4.json",
+      "change_percent_vs_active": -0.258644881186898,
+      "first_tokens_match": true
+    },
+    {
+      "mode": "active",
+      "input_tokens": 65536,
+      "mean_seconds": 8.629354613522688,
+      "stddev_seconds": 0.0228813261897473,
+      "samples_seconds": [
+        8.616763779893517,
+        8.65576614998281,
+        8.615533910691738
+      ],
+      "texts": [
+        [
+          "rimon"
+        ],
+        [
+          "ใ"
+        ],
+        [
+          "char"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-08T01-39-24Z_kvpp-ttft-157-20260906_30348_f2dda793.json",
+      "change_percent_vs_active": 0.0,
+      "first_tokens_match": true
+    },
+    {
+      "mode": "active",
+      "input_tokens": 131072,
+      "mean_seconds": 18.40543930698186,
+      "stddev_seconds": 0.03265519229616945,
+      "samples_seconds": [
+        18.43989934027195,
+        18.374952550046146,
+        18.40146603062749
+      ],
+      "texts": [
+        [
+          "特征"
+        ],
+        [
+          "甲"
+        ],
+        [
+          "由于"
+        ]
+      ],
+      "source": "D:\\code\\vllm-ascend-workspace\\.vaws-local\\sessions\\kvpp-ttft-157-20260906\\benchmark\\runs\\2026-09-08T01-39-24Z_kvpp-ttft-157-20260906_30348_f2dda793.json",
+      "change_percent_vs_active": 0.0,
+      "first_tokens_match": true
+    }
+  ]
+}

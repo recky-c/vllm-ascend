@@ -27,7 +27,7 @@ def load(name, filename):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--label')
-    parser.add_argument('--backend', choices=['ipc_pull', 'ipc_broadcast'], default='ipc_pull')
+    parser.add_argument('--backend', choices=['ipc_pull', 'ipc_broadcast', 'ipc_fullpage'], default='ipc_pull')
     args = parser.parse_args()
     allocation = load('vllm_ascend.distributed.kv_transfer.kv_pool.ipc_allocation', 'ipc_allocation.py')
     load('vllm_ascend.distributed.kv_transfer.kv_pool.ipc_lifecycle', 'ipc_lifecycle.py')
@@ -36,6 +36,9 @@ def main():
     if args.backend == 'ipc_broadcast':
         from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_broadcast_transport import IpcBroadcastKVPPTransport
         transport_class = IpcBroadcastKVPPTransport
+    if args.backend == 'ipc_fullpage':
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_fullpage_broadcast_transport import IpcFullPageBroadcastKVPPTransport
+        transport_class = IpcFullPageBroadcastKVPPTransport
     scheduler_module = load('vllm_ascend.worker.v2.kvpp', 'kvpp.py')
     rank = int(os.environ['RANK'])
     world = int(os.environ['WORLD_SIZE'])
@@ -66,6 +69,8 @@ def main():
         raw = layout_slots[slot]
         names = (layer, layer.replace('.attn', '.indexer'), layer.replace('.attn', '.scale'))
         specs = ((0, 129 + layout * 16, 160), (4096, 33 + layout * 8, 64), (8192, 12, 32))
+        if args.backend == 'ipc_fullpage':
+            specs = tuple((offset, length, length) for offset, length, stride in specs)
         layer_bundles[layer] = names
         for name, (offset, length, stride) in zip(names, specs):
             owners[name] = owner
@@ -120,6 +125,8 @@ def main():
                               + forward * 29 + index * 11 + kind * 7) % 101).to(torch.int8)
                 # Consumer reads are submitted on NPU before any byte is changed.
                 outputs.append((caches[name][unique].clone(), reference[unique], layer, name))
+                if args.backend == 'ipc_fullpage':
+                    outputs.append((caches[name].clone(), reference, layer, name + '.all_pages'))
                 # Actual local new-token write into the shared historical tail page.
                 caches[name][unique[-1], -1].fill_(forward + 111)
                 outputs.append((caches[name][unique[-1], -1:].clone(), torch.tensor([forward + 111], dtype=torch.int8),
