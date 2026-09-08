@@ -174,6 +174,9 @@ class KVPPRuntime:
                         IpcFullPageBroadcastKVPPTransport,
                     )
                     transport_class = IpcFullPageBroadcastKVPPTransport
+            if kvpp_config.remote_read:
+                from vllm_ascend.distributed.kv_transfer.kv_pool.ipc_remote_read_transport import IpcRemoteReadKVPPTransport
+                transport_class = IpcRemoteReadKVPPTransport
             transport = transport_class(kvpp_group, num_physical_blocks, cache_layout.ipc_allocation_pool,
                                             layer_owner_ranks, kvpp_config.ipc_kernel_library, kvpp_config.ipc_cores)
         else:
@@ -330,7 +333,8 @@ class KVPPScheduler:
             self._forward_ready = torch.npu.Event()
             self._forward_ready.record(torch.npu.current_stream())
         self._next_attention_layer_index = 0
-        self.start_layer_prefetch(self.attention_layer_names[0])
+        if not getattr(type(self.transport), "uses_remote_read", False):
+            self.start_layer_prefetch(self.attention_layer_names[0])
 
     def complete_forward(self) -> None:
         if self._active_pages is None:
@@ -357,6 +361,10 @@ class KVPPScheduler:
         expected_layer = self.attention_layer_names[self._next_attention_layer_index]
         if layer_name != expected_layer:
             raise RuntimeError(f"KVPP expected attention layer {expected_layer!r}, got {layer_name!r}.")
+        if getattr(type(self.transport), "uses_remote_read", False):
+            self.transport.finish_remote_reads()
+            self._next_attention_layer_index += 1
+            return
         # This point is after every previously submitted cache reader, including
         # indexer/cache-load work on the compute stream, not merely attention.
         self._release_direct_cache_use()
@@ -375,7 +383,14 @@ class KVPPScheduler:
         if self._next_attention_layer_index < len(self.attention_layer_names):
             self.start_layer_prefetch(self.attention_layer_names[self._next_attention_layer_index])
 
+    def remote_read_cache(self, layer_name: str, caches: tuple) -> tuple:
+        if not getattr(type(self.transport), "uses_remote_read", False):
+            return caches
+        return self.transport.remote_read_cache(layer_name, caches)
+
     def _release_direct_cache_use(self) -> None:
+        if getattr(type(self.transport), "uses_remote_read", False):
+            self.transport.finish_remote_reads()
         if self._active_transfer_ticket is not None:
             self.transport.release_after_last_cache_use(self._active_transfer_ticket, torch.npu.current_stream())
             self._active_transfer_ticket = None
@@ -494,3 +509,4 @@ class KVPPScheduler:
                     self.layer_cache_bundles[layer_name], active_pages, self._kv_transfer_stream
                 )
             completion.synchronize()
+

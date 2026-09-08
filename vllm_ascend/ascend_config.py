@@ -76,6 +76,7 @@ class KVPPConfig:
     ipc_kernel_library: str | None = None
     ipc_cores: int = 8
     broadcast_full_pages: bool = False
+    remote_read: bool = False
     ipc_pool_budget_bytes: int = DEFAULT_IPC_POOL_BUDGET_BYTES
 
     @classmethod
@@ -84,6 +85,11 @@ class KVPPConfig:
         enabled = additional_config.get("enable_kvpp", False)
         if not isinstance(enabled, bool):
             raise ValueError(f"additional_config.enable_kvpp must be a boolean, got {enabled!r}.")
+        remote_read = additional_config.get("kvpp_remote_read", False)
+        if not isinstance(remote_read, bool):
+            raise ValueError("kvpp_remote_read must be a boolean")
+        if remote_read and (not enabled or additional_config.get("kvpp_transport") != "ipc_pull"):
+            raise ValueError("kvpp_remote_read requires enabled ipc_pull")
         full_pages = additional_config.get("kvpp_broadcast_full_pages", False)
         if not isinstance(full_pages, bool):
             raise ValueError("kvpp_broadcast_full_pages must be a boolean")
@@ -92,7 +98,7 @@ class KVPPConfig:
 
         size = vllm_config.parallel_config.tensor_parallel_size if enabled else 1
         result = cls(size=size, transport=additional_config.get("kvpp_transport", "memfabric"),
-                     broadcast_full_pages=full_pages,
+                     broadcast_full_pages=full_pages, remote_read=remote_read,
                      ipc_kernel_library=additional_config.get("kvpp_ipc_kernel_library"),
                      ipc_cores=additional_config.get("kvpp_ipc_cores", 8),
                      ipc_pool_budget_bytes=additional_config.get(
@@ -1464,7 +1470,7 @@ def init_ascend_config(vllm_config):
         "kvpp_ipc_kernel_library",
         "kvpp_ipc_cores",
         "kvpp_ipc_pool_budget_bytes",
-        "kvpp_broadcast_full_pages",
+        "kvpp_broadcast_full_pages", "kvpp_remote_read",
         # Factory-only input: materialized by _resolve_dump_config_path and
         # replaced with the validated dump_config_path field below.
         "dump_config",
