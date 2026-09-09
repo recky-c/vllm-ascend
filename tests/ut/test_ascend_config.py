@@ -1382,6 +1382,22 @@ class TestKVPPConfig(TestBase):
                 with self.assertRaisesRegex(ValueError, message):
                     _validate_parallel_config(config)
 
+    def test_kvpp_full_decode_only_configuration(self):
+        from vllm.config.compilation import CUDAGraphMode
+
+        from tests.ut.kvpp_utils import make_kvpp_config
+        from vllm_ascend.ascend_config import KVPPConfig
+
+        config = make_kvpp_config()
+        config.model_config.enforce_eager = False
+        for mode in CUDAGraphMode:
+            config.compilation_config.cudagraph_mode = mode
+            if mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                KVPPConfig.from_vllm_config(config).validate(config)
+            else:
+                with self.assertRaisesRegex(ValueError, "FULL_DECODE_ONLY"):
+                    KVPPConfig.from_vllm_config(config).validate(config)
+
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_config_factory_keeps_kvpp_enabled(self, _check_config):
         clear_ascend_config()

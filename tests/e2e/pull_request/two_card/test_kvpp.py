@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import pytest
+from vllm.transformers_utils.utils import maybe_model_redirect
 
 from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 from tests.e2e.kvpp_utils import (
@@ -49,13 +50,14 @@ def test_kvpp_prefix_hit_and_block_reuse(monkeypatch):
     results = []
     for enabled in (False, True):
         with VllmRunner(
-            MODEL,
+            maybe_model_redirect(MODEL),
             dtype="bfloat16",
             tensor_parallel_size=2,
             enforce_eager=True,
-            async_scheduling=False,
+            async_scheduling=True,
+            enable_expert_parallel=True,
             distributed_executor_backend="mp",
-            max_model_len=512,
+            max_model_len=8 * BLOCK_SIZE,
             max_num_seqs=1,
             max_num_batched_tokens=64,
             block_size=BLOCK_SIZE,
@@ -68,7 +70,9 @@ def test_kvpp_prefix_hit_and_block_reuse(monkeypatch):
         ) as runner:
             assert_worker_state(runner, enabled, 2, 1, NUM_BLOCKS)
             tokenizer = runner.model.get_tokenizer()
-            prefix = token_prompt(tokenizer, "Explain the importance of storing historical information. ", 96)
+            prefix = token_prompt(
+                tokenizer, "Explain the importance of storing historical information. ", 6 * BLOCK_SIZE
+            )
             warmup = prefix + token_prompt(tokenizer, "First answer: ", 16)
             repeated = prefix + token_prompt(tokenizer, "Second answer: ", 16)
             outputs = []
@@ -82,7 +86,7 @@ def test_kvpp_prefix_hit_and_block_reuse(monkeypatch):
                 first_blocks = set()
                 for index in range(12):
                     prompt = token_prompt(
-                        tokenizer, f"Unique record {index:04d}: describe this distinct observation. ", 96
+                        tokenizer, f"Unique record {index:04d}: describe this distinct observation. ", 6 * BLOCK_SIZE
                     )
                     first = tuple(prompt[:BLOCK_SIZE])
                     assert first not in first_blocks

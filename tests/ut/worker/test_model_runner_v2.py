@@ -189,13 +189,16 @@ def test_prepare_inputs_preserves_pcp_tokens_and_forwards_graph_padding():
         ([0, 4, 0, 0], False, True, False),
     ],
 )
-def test_kvpp_history_ignores_padding_and_dummy_work(monkeypatch, computed, dummy_run, is_profile, expected):
+@pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_kvpp_history_ignores_padding_and_dummy_work(
+    monkeypatch, computed, dummy_run, is_profile, expected, graph_mode
+):
     from vllm_ascend.worker.v2.model_states import default
 
     runner = _make_runner(need_timing=False)
     events = []
     runner.kvpp = SimpleNamespace(
-        prepare_forward=lambda history: events.append(("prepare", history)),
+        prepare_forward=lambda history, full_graph=False: events.append(("prepare", history, full_graph)),
         complete_forward=lambda: events.append("complete"),
     )
     state = default.AscendModelState.__new__(default.AscendModelState)
@@ -224,11 +227,11 @@ def test_kvpp_history_ignores_padding_and_dummy_work(monkeypatch, computed, dumm
 
     def forward(_self, _scheduler_output, **_kwargs):
         assert state.kvpp_is_dummy_run is (dummy_run or is_profile)
-        assert state.prepare_attn(batch, CUDAGraphMode.NONE, (), torch.empty(0), [], None) is metadata
+        assert state.prepare_attn(batch, graph_mode, (), torch.empty(0), [], None) is metadata
         events.append("forward")
         return metadata
 
     monkeypatch.setattr(GPUModelRunner, "execute_model", forward)
     assert runner.execute_model(SimpleNamespace(), dummy_run=dummy_run, is_profile=is_profile) is metadata
-    assert events == [("prepare", expected), "forward", "complete"]
+    assert events == [("prepare", expected, graph_mode == CUDAGraphMode.FULL), "forward", "complete"]
     assert state.kvpp_is_dummy_run is False

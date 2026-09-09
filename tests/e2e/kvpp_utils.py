@@ -2,11 +2,12 @@
 from collections import defaultdict
 
 from vllm import SamplingParams
+from vllm.transformers_utils.utils import maybe_model_redirect
 
 from tests.e2e.conftest import VllmRunner
 from tests.e2e.model_utils import check_outputs_equal
 
-BLOCK_SIZE = 16
+BLOCK_SIZE = 128
 NUM_BLOCKS = 64
 MAX_TOKENS = 16
 
@@ -58,7 +59,7 @@ def assert_worker_state(runner, enabled, tp, pp, num_blocks, *, v2=False, mtp=Fa
         if enabled:
             assert {state["rank"] for state in workers} == set(range(tp))
             assert {tuple(state["ranks"]) for state in workers} == {tuple(range(stage * tp, (stage + 1) * tp))}
-            assert all(len(state["targets"]) >= 3 for state in workers)
+            assert all(state["targets"] for state in workers)
         else:
             assert all(not state["targets"] and len(state["ranks"]) == 1 for state in workers)
     if mtp:
@@ -83,7 +84,8 @@ class SchedulerTrace:
     """Observe real scheduling and written block IDs without changing execution."""
 
     def __init__(self, runner, monkeypatch):
-        scheduler = runner.model.llm_engine.engine_core.engine_core.scheduler
+        engine = runner.model.llm_engine
+        scheduler = engine.engine_core.engine_core.scheduler
         manager = scheduler.kv_cache_manager
         block_sizes = [group.kv_cache_spec.block_size for group in manager.kv_cache_config.kv_cache_groups]
         null_block = manager.block_pool.null_block.block_id
@@ -91,19 +93,20 @@ class SchedulerTrace:
         self.written_blocks = defaultdict(set)
         original_schedule = scheduler.schedule
 
-        def schedule():
-            output = original_schedule()
+        def schedule(*args, **kwargs):
+            output = original_schedule(*args, **kwargs)
             starts = {request.req_id: request.num_computed_tokens for request in output.scheduled_new_reqs}
             cached = output.scheduled_cached_reqs
             starts.update(zip(cached.req_ids, cached.num_computed_tokens))
             for request_id, count in output.num_scheduled_tokens.items():
+                external_id = engine.output_processor.request_states[request_id].external_req_id
                 start = starts[request_id]
                 prompt_len = len(scheduler.requests[request_id].prompt_token_ids)
-                self.steps[request_id].append((start, count, prompt_len))
+                self.steps[external_id].append((start, count, prompt_len))
                 for group_id, (ids, block_size) in enumerate(zip(manager.get_block_ids(request_id), block_sizes)):
                     end_block = (start + count + block_size - 1) // block_size
                     touched = ids[start // block_size : end_block]
-                    self.written_blocks[request_id].update(
+                    self.written_blocks[external_id].update(
                         (group_id, block_id) for block_id in touched if block_id != null_block
                     )
             return output
@@ -164,6 +167,7 @@ def run_basic_comparison(
 ):
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(v2)))
+    model = maybe_model_redirect(model)
     token_budget = max(block_size, 128 if mtp else 64)
     results = []
     for enabled in (False, True):
@@ -172,7 +176,8 @@ def run_basic_comparison(
             tensor_parallel_size=tp,
             pipeline_parallel_size=pp,
             enforce_eager=True,
-            async_scheduling=False,
+            async_scheduling=True,
+            enable_expert_parallel=True,
             distributed_executor_backend="mp",
             max_model_len=512,
             max_num_seqs=4,

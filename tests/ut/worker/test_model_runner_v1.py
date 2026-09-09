@@ -120,7 +120,7 @@ class TestDeviceMetadataFullGraphEvents(unittest.TestCase):
         events = []
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.kvpp = SimpleNamespace(
-            prepare_forward=lambda history: events.append(("prepare", history)),
+            prepare_forward=lambda history, full_graph=False: events.append(("prepare", history)),
             complete_forward=lambda: events.append("complete"),
         )
         runner.uniform_decode_query_len = 1
@@ -2062,7 +2062,7 @@ class TestKVPPExecute(unittest.TestCase):
                 runner._prepare_device_metadata_for_forward = lambda _: None
                 runner.maybe_get_kv_connector_output = lambda *_args, **_kwargs: nullcontext()
                 runner.kvpp = SimpleNamespace(
-                    prepare_forward=lambda history: events.append(("prepare", history)),
+                    prepare_forward=lambda history, full_graph=False: events.append(("prepare", history)),
                     complete_forward=lambda: events.append("complete"),
                 )
 

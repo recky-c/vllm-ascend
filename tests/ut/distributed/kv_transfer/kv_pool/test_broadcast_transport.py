@@ -58,3 +58,17 @@ def test_full_layer_broadcast_completes_before_future(monkeypatch, local_rank):
     assert torch.all(payload == 17)
     assert torch.count_nonzero(backing[:2]) == 0
     assert torch.count_nonzero(backing[38:]) == 0
+
+
+def test_graph_broadcast_waits_on_calling_stream_without_host_sync(monkeypatch):
+    group = SimpleNamespace(ranks=[4, 9], device_group=object())
+    payload = torch.zeros(36, dtype=torch.int8)
+    broadcast = Mock()
+    event = Mock()
+    monkeypatch.setattr(broadcast_transport.dist, "broadcast", broadcast)
+    monkeypatch.setattr(broadcast_transport.torch.npu, "Event", event)
+    transport = broadcast_transport.BroadcastKVPPTransport(group, {"layer": 1}, {"layer": payload})
+    transport.broadcast("layer")
+    broadcast.assert_called_once_with(payload, src=9, group=group.device_group, async_op=True)
+    broadcast.return_value.wait.assert_called_once_with()
+    event.assert_not_called()

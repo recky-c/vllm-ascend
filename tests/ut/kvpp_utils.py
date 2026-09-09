@@ -4,6 +4,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, UniformTypeKVCacheSpecs
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
@@ -36,6 +37,7 @@ def make_kvpp_config(tp=3):
         kv_transfer_config=None,
         quant_config=None,
         cache_config=SimpleNamespace(cache_dtype="auto"),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
     )
 
 

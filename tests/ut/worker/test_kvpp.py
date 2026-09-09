@@ -122,3 +122,22 @@ def test_hook_propagates_failed_future_without_scheduling_next(scheduler_device)
         scheduler.wait_for_layer(layer_name(0))
     assert raised.value is error
     assert len(scheduler._prefetch_executor.submitted) == 1
+
+
+@pytest.mark.parametrize("has_history", [False, True])
+def test_full_graph_captures_every_layer_without_host_prefetch(scheduler_device, has_history):
+    transport = Mock()
+    names = tuple(layer_name(i) for i in range(3))
+    scheduler = kvpp.KVPPScheduler(transport, names)
+    # Capture uses dummy inputs without history, but must record transfers
+    # for all layers so replay reads the latest owner's cache.
+    scheduler.schedule_forward(has_history, full_graph=True)
+    for name in names:
+        scheduler.wait_for_layer(name)
+    assert [call.args[0] for call in transport.broadcast.call_args_list] == list(names)
+    assert not scheduler._prefetch_executor.submitted
+    transport.prefetch.assert_not_called()
+    scheduler.complete_forward()
+    scheduler.schedule_forward(False)
+    scheduler.wait_for_layer(names[0])
+    assert transport.broadcast.call_count == len(names)

@@ -19,16 +19,21 @@ class BroadcastKVPPTransport:
         self._owner_global_ranks = {name: kvpp_group.ranks[owner] for name, owner in layer_owner_ranks.items()}
         self._layer_buffers = layer_buffers
 
+    def broadcast(self, layer_name: str) -> None:
+        # Work.wait establishes completion on the calling stream. Unlike the
+        # eager prefetch Future, graph capture must not synchronize the host.
+        work = dist.broadcast(
+            self._layer_buffers[layer_name],
+            src=self._owner_global_ranks[layer_name],
+            group=self._device_group,
+            async_op=True,
+        )
+        work.wait()
+
     def prefetch(self, layer_name: str, cache_ready: Any, transfer_stream: Any) -> None:
         with torch.npu.stream(transfer_stream):
             transfer_stream.wait_event(cache_ready)
-            work = dist.broadcast(
-                self._layer_buffers[layer_name],
-                src=self._owner_global_ranks[layer_name],
-                group=self._device_group,
-                async_op=True,
-            )
-            work.wait()
+            self.broadcast(layer_name)
             done = torch.npu.Event()
             done.record(transfer_stream)
         # A Future must cover device completion, including the owner's source

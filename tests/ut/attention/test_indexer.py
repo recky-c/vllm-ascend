@@ -26,6 +26,10 @@ def test_sfa_indexer_backend_contract():
     assert AscendSFAIndexerBackend.get_supported_kernel_block_sizes() == [128]
 
 
+def test_sfa_indexer_cache_dtype_keyword():
+    assert AscendSFAIndexerBackend.get_kv_cache_shape(2, 128, 1, 160, cache_dtype_str="auto") == (2, 128, 1, 160)
+
+
 def test_sfa_indexer_metadata_builder_is_cache_only():
     kv_cache_spec = FullAttentionSpec(
         block_size=128,
