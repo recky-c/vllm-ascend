@@ -62,9 +62,9 @@ class KVPPRuntime:
             static_forward_context[name].impl.layerwise_kv_cache_hook = scheduler
         return cls(scheduler)
 
-    def prepare_forward(self, has_history: bool) -> None:
+    def prepare_forward(self, has_history: bool, full_graph: bool = False) -> None:
         if self.scheduler is not None:
-            self.scheduler.schedule_forward(has_history)
+            self.scheduler.schedule_forward(has_history, full_graph)
 
     def complete_forward(self) -> None:
         if self.scheduler is not None:
@@ -78,16 +78,18 @@ class KVPPScheduler:
         self.transport = transport
         self.attention_layer_names = attention_layer_names
         self._has_history = False
+        self._full_graph = False
         self._next_attention_layer_index = 0
         self._prefetch_future: Future[None] | None = None
         self._npu_device_id = torch.npu.current_device()
         self._kv_transfer_stream = torch.npu.Stream()
         self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvpp-prefetch")
 
-    def schedule_forward(self, has_history: bool) -> None:
+    def schedule_forward(self, has_history: bool, full_graph: bool = False) -> None:
         self._has_history = has_history
+        self._full_graph = full_graph
         self._next_attention_layer_index = 0
-        if has_history:
+        if has_history and not full_graph:
             self.start_layer_prefetch(self.attention_layer_names[0])
 
     def start_layer_prefetch(self, layer_name: str) -> None:
@@ -100,6 +102,11 @@ class KVPPScheduler:
         self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)
 
     def wait_for_layer(self, layer_name: str) -> None:
+        if self._full_graph:
+            # Capture each layer's transfer before its first cache access.
+            # Replay executes these device dependencies without Python hooks.
+            self.transport.broadcast(layer_name)
+            return
         if not self._has_history:
             return
         self._prefetch_future.result()
@@ -110,4 +117,5 @@ class KVPPScheduler:
 
     def complete_forward(self) -> None:
         self._has_history = False
+        self._full_graph = False
         self._next_attention_layer_index = 0

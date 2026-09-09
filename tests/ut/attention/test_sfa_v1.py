@@ -75,6 +75,9 @@ class TestAscendSFABackend(TestBase):
         result = AscendSFABackend.get_kv_cache_shape(2, 4, 8, 128)
         self.assertEqual(result, (2, 4, 8, 128))
 
+    def test_get_kv_cache_shape_dtype_keyword(self):
+        self.assertEqual(AscendSFABackend.get_kv_cache_shape(2, 128, 1, 576, cache_dtype_str="auto"), (2, 128, 1, 576))
+
     @patch("vllm_ascend.attention.sfa_v1.get_ascend_config")
     def test_get_impl_cls(self, mock_get_ascend_config):
         mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
