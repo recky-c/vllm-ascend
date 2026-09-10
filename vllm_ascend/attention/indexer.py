@@ -474,6 +474,28 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         self.kernel_block_size = select_common_block_size(kv_cache_spec.block_size, [AscendSFAIndexerBackend])
         self._pcp_active = vllm_config.parallel_config.prefill_context_parallel_size > 1
 
+        # Pure DCP: the Indexer owns a replicated cache, unlike the local MLA
+        # cache. Build its addresses from its own spec and cache-group metadata.
+        self._dcp_size = getattr(kv_cache_spec, "sfa_dcp_replicated_indexer_size", 1)
+        if self._dcp_size > 1 and not self._pcp_active:
+            self._blocks_per_page = kv_cache_spec.block_size // self.kernel_block_size
+            page_span = kv_cache_spec.block_size * self._dcp_size
+            max_len = vllm_config.model_config.max_model_len
+            self._local_cols = (max_len + page_span - 1) // page_span * self._blocks_per_page
+            cols = torch.arange(self._local_cols * self._dcp_size, dtype=torch.int32, device=device)
+            self._local_col_indices = (
+                cols // (self._dcp_size * self._blocks_per_page) * self._blocks_per_page
+                + cols % self._blocks_per_page
+            )
+            self._replica_indices = cols // self._blocks_per_page % self._dcp_size
+            # Keep addresses stable across graph capture and replay.
+            self._dcp_block_table = torch.empty(
+                (vllm_config.scheduler_config.max_num_seqs + 1, cols.numel()), dtype=torch.int32, device=device
+            )
+            self._dcp_slots = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32, device=device
+            )
+
     @classmethod
     def get_cudagraph_support(
         cls,
@@ -501,6 +523,33 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
         block_size = self.kernel_block_size
 
+        block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        if self._dcp_size > 1 and not self._pcp_active:
+            cols = min(block_table.shape[1], self._local_cols) * self._dcp_size
+            local_blocks = block_table.index_select(1, self._local_col_indices[:cols])
+            blocks = local_blocks // self._blocks_per_page * self._dcp_size + self._replica_indices[:cols]
+            blocks = blocks * self._blocks_per_page + local_blocks % self._blocks_per_page
+            block_table = self._dcp_block_table[:num_reqs, :cols]
+            seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+            block_table.copy_(blocks * (seq_lens > 0).to(blocks.dtype).unsqueeze(1))
+            slot_mapping = self._dcp_slots[:num_input_tokens]
+            slot_mapping.fill_(-1)
+            actual = min(common_attn_metadata.num_actual_tokens, num_input_tokens)
+            query_lens = (
+                common_attn_metadata.query_start_loc[1 : num_reqs + 1]
+                - common_attn_metadata.query_start_loc[:num_reqs]
+            )
+            req_ids = torch.repeat_interleave(
+                torch.arange(num_reqs, dtype=torch.int32, device=block_table.device),
+                query_lens.to(device=block_table.device),
+                output_size=num_input_tokens,
+            )[:actual]
+            positions = input_positions[:actual]
+            valid = (positions >= 0) & (positions < seq_lens[req_ids])
+            positions = torch.where(valid, positions, 0)
+            pages = block_table[req_ids, positions // block_size]
+            slot_mapping[:actual].copy_(torch.where(valid, pages * block_size + positions % block_size, -1))
+
         cos, sin = get_cos_and_sin_mla(input_positions, use_cache=True)
 
         if get_ascend_config().c8_reshape_optim_enabled:
@@ -517,7 +566,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             slot_mapping=slot_mapping,
             seq_lens=common_attn_metadata.seq_lens[:num_reqs],
             cum_query_lens=common_attn_metadata.query_start_loc[1 : num_reqs + 1],
-            block_table=common_attn_metadata.block_table_tensor[:num_reqs],
+            block_table=block_table,
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
             block_size=block_size,
