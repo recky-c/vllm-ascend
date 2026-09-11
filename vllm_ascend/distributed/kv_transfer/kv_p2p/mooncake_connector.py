@@ -2945,7 +2945,16 @@ class MooncakeConnectorWorker:
         """
         prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
 
-        if self.dcp_size == meta.remote_dcp_size == 1:
+        unsharded_sfa_prefill = (
+            self.use_sfa_sparse
+            and self.dcp_size > 1
+            and self.pcp_size == meta.remote_pcp_size == meta.remote_dcp_size == 1
+        )
+        if self.dcp_size == meta.remote_dcp_size == 1 or unsharded_sfa_prefill:
+            if unsharded_sfa_prefill:
+                assert (meta.remote_block_size or self.block_size) == self.block_size, (
+                    "SFA decode-only DCP requires equal P/D block sizes."
+                )
             if self._is_hma_required:
                 chosen_rank_list, _ = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
             else:
@@ -2970,9 +2979,29 @@ class MooncakeConnectorWorker:
                 local_block_ids = [[] for _ in meta.local_block_ids]
                 remote_block_ids = [[] for _ in meta.remote_block_ids]
             for group_idx, (group_spec, layer_indices) in self.kv_group2layeridx.items():
-                local_kernel_block_ids, remote_kernel_block_ids = self._get_kernel_block_ids(
-                    layer_indices, meta, group_idx, group_spec
-                )
+                if unsharded_sfa_prefill:
+                    if group_spec["kv_cache_spec_type"] == "AscendSFAIndexerCacheSpec":
+                        # The full indexer cache is transferred separately.
+                        continue
+                    group_id = self._get_kv_cache_group_id(group_idx, group_spec)
+                    local_blocks = (meta.local_full_block_ids or meta.local_block_ids)[group_id]
+                    remote_blocks = meta.remote_block_ids[group_id]
+                    first_block = meta.num_computed_tokens // self.block_size
+                    first_block += (self.dcp_rank - first_block) % self.dcp_size
+                    # P owns the full sequence. D rank r owns global blocks
+                    # r, r + DCP, ...; use the global index on P and /DCP on D.
+                    global_blocks = range(first_block, min(meta.num_prompt_blocks, len(remote_blocks)), self.dcp_size)
+                    scale = self._get_kernel_block_scale(layer_indices)
+                    local_kernel_block_ids = self._expand_block_ids(
+                        [local_blocks[block // self.dcp_size] for block in global_blocks], scale
+                    )
+                    remote_kernel_block_ids = self._expand_block_ids(
+                        [remote_blocks[block] for block in global_blocks], scale
+                    )
+                else:
+                    local_kernel_block_ids, remote_kernel_block_ids = self._get_kernel_block_ids(
+                        layer_indices, meta, group_idx, group_spec
+                    )
                 block_id_idx = (
                     group_idx if use_transfer_group_block_ids else self._get_kv_cache_group_id(group_idx, group_spec)
                 )
@@ -3644,12 +3673,6 @@ class MooncakeConnectorWorker:
 
         remote_cp_size = meta.remote_pcp_size * meta.remote_dcp_size
         local_cp_size = self.pcp_size * self.dcp_size
-        if local_cp_size == 0 or remote_cp_size % local_cp_size != 0:
-            raise AssertionError(
-                f"SFA replicate-K expects remote cp size({remote_cp_size}) to be divisible by "
-                f"local cp size({local_cp_size})."
-            )
-
         num_prefix_cached_blocks = min(meta.num_computed_tokens // self.block_size, meta.num_prompt_blocks)
         num_external_blocks = meta.num_prompt_blocks - num_prefix_cached_blocks
         num_external_blocks_from_tokens = math.ceil(meta.num_external_tokens / self.block_size)
@@ -3772,12 +3795,22 @@ class MooncakeConnectorWorker:
                         if replicate_k_transfer_port is not None and remote_handshake_port == replicate_k_transfer_port
                         else None
                     )
+                    group_pulls = group_pulls_list[shard_idx][remote_tp_offset]
+                    if has_replicate_k_blocks and remote_handshake_port != replicate_k_transfer_port:
+                        # The indexer is replicated, not an attention DCP shard.
+                        # Other ports must not overwrite its full-cache transfer.
+                        group_pulls = [
+                            pull
+                            for pull in group_pulls
+                            if self.kv_group2layeridx[pull.group_id][0]["kv_cache_spec_type"]
+                            != "AscendSFAIndexerCacheSpec"
+                        ]
                     self.kv_recv_thread.add_request(
                         request_id=req_id,
                         remote_request_id=remote_req_id,
                         local_block_ids=local_block_ids_list[shard_idx],
                         remote_block_ids=remote_block_ids_list[shard_idx],
-                        group_pulls=group_pulls_list[shard_idx][remote_tp_offset],
+                        group_pulls=group_pulls,
                         remote_engine_id=remote_engine_id,
                         remote_host=remote_host,
                         remote_handshake_port=remote_handshake_port,
