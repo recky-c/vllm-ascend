@@ -2108,7 +2108,16 @@ class MooncakeConnectorWorker:
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
         self._get_prefill_decode_size(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
-        if self._prefill_tp_size < self._decode_tp_size:
+        self.use_sfa_sparse = model_uses_sfa_sparse(vllm_config.model_config)
+        parallel_config = vllm_config.parallel_config
+        sfa_dcp_fanout = (
+            self.use_sfa_sparse
+            and self._prefill_tp_size > 1
+            and self._prefill_pp_size == parallel_config.prefill_context_parallel_size == 1
+            and parallel_config.decode_context_parallel_size == parallel_config.tensor_parallel_size
+            and self._decode_tp_size % self._prefill_tp_size == 0
+        )
+        if self._prefill_tp_size < self._decode_tp_size and not sfa_dcp_fanout:
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
                 f" or equal to the decode_tp_size: {self._decode_tp_size}"
@@ -2118,7 +2127,6 @@ class MooncakeConnectorWorker:
         self.vllm_config = vllm_config
         self.ascend_config = get_ascend_config()
         self.engine_id = engine_id
-        self.use_sfa_sparse = model_uses_sfa_sparse(vllm_config.model_config)
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_group = get_tp_group()
@@ -2950,12 +2958,38 @@ class MooncakeConnectorWorker:
             and self.dcp_size > 1
             and self.pcp_size == meta.remote_pcp_size == meta.remote_dcp_size == 1
         )
-        if self.dcp_size == meta.remote_dcp_size == 1 or unsharded_sfa_prefill:
-            if unsharded_sfa_prefill:
+        sharded_sfa_fanout = (
+            self.use_sfa_sparse
+            and self.pcp_size == meta.remote_pcp_size == self._prefill_pp_size == 1
+            and 1 < meta.remote_dcp_size < self.dcp_size
+            and meta.remote_dcp_size == prefill_tp_size
+            and self.dcp_size == self.tp_size
+            and self.dcp_size % meta.remote_dcp_size == 0
+        )
+        split_sfa_prefill = unsharded_sfa_prefill or sharded_sfa_fanout
+        if self.dcp_size == meta.remote_dcp_size == 1 or split_sfa_prefill:
+            if split_sfa_prefill:
                 assert (meta.remote_block_size or self.block_size) == self.block_size, (
-                    "SFA decode-only DCP requires equal P/D block sizes."
+                    "SFA DCP fanout requires equal P/D block sizes."
                 )
-            if self._is_hma_required:
+            if sharded_sfa_fanout:
+                chosen_rank_list = [self.dcp_rank % meta.remote_dcp_size]
+                # Each P shard has several D readers. Keep it alive until all
+                # readers acknowledge both their attention and indexer pulls.
+                self.remote_port_send_num[meta.remote_engine_id] = {
+                    meta.remote_port + rank: {
+                        "num": self.dcp_size // meta.remote_dcp_size,
+                        "host": self._get_remote_host_info_by_port(
+                            meta.remote_port,
+                            meta.remote_port + rank,
+                            meta.remote_host,
+                            meta.remote_engine_id,
+                            meta.remote_multi_nodes_meta_mapping,
+                        )[0],
+                    }
+                    for rank in range(prefill_tp_size)
+                }
+            elif self._is_hma_required:
                 chosen_rank_list, _ = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
             else:
                 chosen_rank_list = self._get_remote_rank(req_id, prefill_tp_size)
@@ -2979,7 +3013,7 @@ class MooncakeConnectorWorker:
                 local_block_ids = [[] for _ in meta.local_block_ids]
                 remote_block_ids = [[] for _ in meta.remote_block_ids]
             for group_idx, (group_spec, layer_indices) in self.kv_group2layeridx.items():
-                if unsharded_sfa_prefill:
+                if split_sfa_prefill:
                     if group_spec["kv_cache_spec_type"] == "AscendSFAIndexerCacheSpec":
                         # The full indexer cache is transferred separately.
                         continue
@@ -2988,15 +3022,19 @@ class MooncakeConnectorWorker:
                     remote_blocks = meta.remote_block_ids[group_id]
                     first_block = meta.num_computed_tokens // self.block_size
                     first_block += (self.dcp_rank - first_block) % self.dcp_size
-                    # P owns the full sequence. D rank r owns global blocks
-                    # r, r + DCP, ...; use the global index on P and /DCP on D.
-                    global_blocks = range(first_block, min(meta.num_prompt_blocks, len(remote_blocks)), self.dcp_size)
+                    # Select global blocks owned by this D rank, then convert
+                    # each global index to the corresponding P/D local index.
+                    global_blocks = range(
+                        first_block,
+                        min(meta.num_prompt_blocks, len(remote_blocks) * meta.remote_dcp_size),
+                        self.dcp_size,
+                    )
                     scale = self._get_kernel_block_scale(layer_indices)
                     local_kernel_block_ids = self._expand_block_ids(
                         [local_blocks[block // self.dcp_size] for block in global_blocks], scale
                     )
                     remote_kernel_block_ids = self._expand_block_ids(
-                        [remote_blocks[block] for block in global_blocks], scale
+                        [remote_blocks[block // meta.remote_dcp_size] for block in global_blocks], scale
                     )
                 else:
                     local_kernel_block_ids, remote_kernel_block_ids = self._get_kernel_block_ids(
