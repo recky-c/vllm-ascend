@@ -478,12 +478,18 @@ class AscendSFAIndexerMetadataBuilder(
         self.kernel_block_size = select_common_block_size(kv_cache_spec.block_size, [AscendSFAIndexerBackend])
         self._pcp_active = vllm_config.parallel_config.prefill_context_parallel_size > 1
         self._replicated_dcp = getattr(kv_cache_spec, "sfa_dcp_replicated_indexer_size", 1)
-        if self._replicated_dcp > 1 and not self._pcp_active:
+        if self._replicated_dcp > 1:
+            # MRV2 PCP represents each prefill with two local query segments.
+            # They reference the same full KV cache but need separate table rows.
+            max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+            if self._pcp_active:
+                max_num_reqs *= 2
+            max_num_reqs += 1  # Full-graph FIA padding may add a dummy request.
             self._init_replicated_view(
                 kv_cache_spec,
                 self.kernel_block_size,
                 self._replicated_dcp,
-                vllm_config.scheduler_config.max_num_seqs + 1,
+                max_num_reqs,
                 vllm_config,
                 device,
             )
@@ -496,11 +502,18 @@ class AscendSFAIndexerMetadataBuilder(
     ) -> AttentionCGSupport:
         return AttentionCGSupport.UNIFORM_BATCH
 
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata, **kwargs: Any
+    ) -> AscendSFAIndexerMetadata:
+        return self.build(0, common_attn_metadata, **kwargs)
+
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        pcp_context: Any | None = None,
+        pcp_cache_group_idx: int | None = None,
         **kwargs,
     ) -> AscendSFAIndexerMetadata:
         # common_prefix_len / fast_build are unused; kept for API compatibility.
@@ -515,11 +528,22 @@ class AscendSFAIndexerMetadataBuilder(
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
         block_size = self.kernel_block_size
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
-        if self._replicated_dcp > 1 and not self._pcp_active:
+        if self._replicated_dcp > 1:
+            pcp_slot_mapping = None
+            if pcp_context is not None and bool(pcp_context.global_batch.is_prefilling_np.any()):
+                if pcp_cache_group_idx is None:
+                    raise RuntimeError("PCP+DCP indexer requires the PCP cache-group index.")
+                pcp_slot_mapping = self._build_pcp_ordered_indexer_slot_mapping(
+                    common_attn_metadata, pcp_context, pcp_cache_group_idx
+                )
             block_table = self._build_block_table_replicated_view(
                 self._get_dcp_local_block_table(block_table, num_reqs), common_attn_metadata.seq_lens
             )
-            slot_mapping = self._build_slot_mapping_replicated_view(common_attn_metadata, block_table)
+            slot_mapping = (
+                pcp_slot_mapping
+                if pcp_slot_mapping is not None
+                else self._build_slot_mapping_replicated_view(common_attn_metadata, block_table)
+            )
 
         cos, sin = get_cos_and_sin_mla(input_positions, use_cache=True)
 

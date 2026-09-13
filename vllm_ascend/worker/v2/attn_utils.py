@@ -45,6 +45,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+from vllm_ascend.attention.indexer import AscendSFAIndexerMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -299,8 +300,10 @@ def build_attn_metadata(
                     num_actual_reqs=num_actual_reqs,
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                 )
-            # Only SFA and DSA metadata builders consume PCP context.
-            if pcp_context is not None and (is_sfa_builder or is_dsa_builder):
+            # Indexer writes also need the gathered PCP token order.
+            if pcp_context is not None and (
+                is_sfa_builder or is_dsa_builder or isinstance(attn_metadata_builder, AscendSFAIndexerMetadataBuilder)
+            ):
                 attn_metadata_extra_kwargs.update(
                     pcp_context=pcp_context,
                     pcp_cache_group_idx=i,

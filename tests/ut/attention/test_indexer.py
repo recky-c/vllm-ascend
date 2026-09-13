@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -110,6 +111,67 @@ def test_replicated_indexer_builds_own_full_addresses(mock_cos_sin, mock_get_asc
     repeated = builder.build(0, common)
     assert repeated.block_table.data_ptr() == metadata.block_table.data_ptr()
     assert repeated.slot_mapping.data_ptr() == metadata.slot_mapping.data_ptr()
+
+
+@patch("vllm_ascend.attention.indexer.get_ascend_config")
+@patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+def test_pcp_replicated_indexer_uses_global_slots_in_gather_order(mock_cos_sin, mock_get_ascend_config):
+    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+    mock_cos_sin.return_value = (torch.zeros(4, 1, 1, 8), torch.zeros(4, 1, 1, 8))
+    spec = AscendSFAIndexerCacheSpec(
+        block_size=128, num_kv_heads=1, head_size=160, dtype=torch.uint8, sfa_dcp_replicated_indexer_size=16
+    )
+    config = MagicMock()
+    config.parallel_config.prefill_context_parallel_size = 2
+    config.scheduler_config.max_num_seqs = 2
+    config.scheduler_config.max_num_batched_tokens = 8
+    config.model_config.max_model_len = 4096
+    with patch("vllm_ascend.attention.indexer.select_common_block_size", return_value=128):
+        builder = AscendSFAIndexerMetadataBuilder(spec, ["indexer.k_cache"], config, torch.device("cpu"))
+    common = _make_common_metadata()
+    common.num_reqs = 1
+    common.num_actual_tokens = common.num_input_tokens = 4
+    common.positions = torch.tensor([0, 127, 2048, 2049])
+    common.query_start_loc = torch.tensor([0, 4])
+    common.seq_lens = torch.tensor([2050])
+    common.block_table_tensor = torch.tensor([[3, 7]], dtype=torch.int32)
+    common.replace = lambda **kwargs: SimpleNamespace(**{**vars(common), **kwargs})
+    context = SimpleNamespace(
+        global_batch=SimpleNamespace(
+            num_reqs=1,
+            num_tokens=4,
+            query_start_loc=common.query_start_loc,
+            positions=common.positions,
+            seq_lens=common.seq_lens,
+            is_prefilling_np=np.array([True]),
+        ),
+        global_block_tables=[common.block_table_tensor],
+        padded_gather_idx=torch.tensor([0, 2, 1, 3, 0, 0]),
+        gathered_kv_write_mask=torch.tensor([True, True, True, True, False, False]),
+    )
+    metadata = builder.build(0, common, pcp_context=context, pcp_cache_group_idx=0)
+    assert metadata.block_table.tolist() == [list(range(48, 64)) + list(range(112, 128))]
+    assert metadata.slot_mapping.tolist() == [6144, 14336, 6271, 14337, -1, -1]
+    captured = builder.build_for_cudagraph_capture(common, pcp_context=context, pcp_cache_group_idx=0)
+    assert captured.slot_mapping.tolist() == [6144, 14336, 6271, 14337, -1, -1]
+    decode_metadata = builder.build(0, common)
+    assert decode_metadata.slot_mapping.tolist() == [6144, 6271, 14336, 14337]
+
+    # Two requests become four local PCP segments, plus one FIA padding row.
+    # Repeated rows still address the same full cache, without duplicating KV.
+    common.num_reqs = 5
+    common.num_actual_tokens = common.num_input_tokens = 5
+    common.positions = torch.tensor([0, 127, 2048, 2049, 0])
+    common.query_start_loc = torch.arange(6, dtype=torch.int32)
+    common.seq_lens = torch.tensor([1, 128, 2049, 2050, 0])
+    common.block_table_tensor = torch.tensor([[3, 7]] * 5, dtype=torch.int32)
+    table_ptr = builder.block_table_replicated_view_buf.data_ptr()
+    segmented = builder.build(0, common)
+    assert segmented.block_table.shape == (5, 32)
+    assert segmented.block_table[0].tolist() == list(range(48, 64)) + list(range(112, 128))
+    assert torch.equal(segmented.block_table[0], segmented.block_table[1])
+    assert segmented.cum_query_lens.tolist() == [1, 2, 3, 4, 5]
+    assert segmented.block_table.data_ptr() == table_ptr
 
 
 @patch("vllm_ascend.attention.indexer.get_ascend_config")

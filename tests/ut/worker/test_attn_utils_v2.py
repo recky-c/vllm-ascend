@@ -844,8 +844,9 @@ class _CaptureStateBuilder(_PrefillStateBuilder):
 
 
 @pytest.mark.parametrize("for_cudagraph_capture", [False, True])
-def test_build_attn_metadata_propagates_prefill_and_pcp_context(monkeypatch, for_cudagraph_capture):
-    monkeypatch.setattr(attn_utils, "AscendSFAMetadataBuilder", _PrefillStateBuilder)
+@pytest.mark.parametrize("builder_type", ["AscendSFAMetadataBuilder", "AscendSFAIndexerMetadataBuilder"])
+def test_build_attn_metadata_propagates_prefill_and_pcp_context(monkeypatch, for_cudagraph_capture, builder_type):
+    monkeypatch.setattr(attn_utils, builder_type, _PrefillStateBuilder)
     builder = _CaptureStateBuilder() if for_cudagraph_capture else _PrefillStateBuilder()
     attn_group = SimpleNamespace(
         layer_names=["layer.0"],

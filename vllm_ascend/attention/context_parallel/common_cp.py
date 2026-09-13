@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -79,6 +79,11 @@ class ReplicatedKVMetadataMixin:
             dtype=torch.int32,
             device=device,
         )
+        pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        if pcp_size > 1:
+            self.pcp_indexer_slot_mapping_buf = torch.empty(
+                (max_num_input_tokens * pcp_size,), dtype=torch.int32, device=device
+            )
 
     def _get_dcp_local_block_table(self, block_table: torch.Tensor, num_reqs: int) -> torch.Tensor:
         local_cols = min(block_table.shape[1], self.max_local_block_table_cols)
@@ -191,6 +196,56 @@ class ReplicatedKVMetadataMixin:
             block_numbers * self.replicated_view_block_size + block_offsets
         )
         return slot_mapping_replicated_view
+
+    def _build_pcp_ordered_indexer_slot_mapping(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        pcp_context: Any,
+        pcp_cache_group_idx: int,
+    ) -> torch.Tensor:
+        """Build this receiver's Indexer addresses in PCP token order."""
+        global_batch = pcp_context.global_batch
+        num_reqs = global_batch.num_reqs
+        global_block_table = pcp_context.global_block_tables[pcp_cache_group_idx]
+        global_common_attn_metadata = cast(
+            AscendCommonAttentionMetadata,
+            common_attn_metadata.replace(
+                query_start_loc=global_batch.query_start_loc,
+                seq_lens=global_batch.seq_lens[:num_reqs],
+                num_reqs=num_reqs,
+                num_actual_tokens=global_batch.num_tokens,
+                num_input_tokens=global_batch.num_tokens,
+                positions=global_batch.positions,
+                block_table_tensor=global_block_table,
+            ),
+        )
+        dcp_block_table = self._get_dcp_local_block_table(
+            global_block_table,
+            num_reqs,
+        )
+        replicated_block_table = self._build_block_table_replicated_view(
+            dcp_block_table,
+            global_common_attn_metadata.seq_lens,
+        )
+        global_slot_mapping = self._build_slot_mapping_replicated_view(
+            global_common_attn_metadata,
+            replicated_block_table,
+        )
+
+        gather_idx = pcp_context.padded_gather_idx
+        write_mask = pcp_context.gathered_kv_write_mask
+        if gather_idx is None or write_mask is None:
+            raise RuntimeError("PCP+DCP prefill requires the PCP gathered-token layout.")
+        num_pcp_ordered_tokens = gather_idx.numel()
+        pcp_ordered_slot_mapping = self.pcp_indexer_slot_mapping_buf[:num_pcp_ordered_tokens]
+        torch.index_select(
+            global_slot_mapping,
+            0,
+            gather_idx,
+            out=pcp_ordered_slot_mapping,
+        )
+        pcp_ordered_slot_mapping.masked_fill_(~write_mask, -1)
+        return pcp_ordered_slot_mapping
 
 
 class DCPMetadataBuilderMixin:
