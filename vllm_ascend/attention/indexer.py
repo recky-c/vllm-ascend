@@ -943,6 +943,11 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             **kwargs,
         )
 
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata, **kwargs: Any
+    ) -> AscendSFAIndexerMetadata:
+        return self.build_for_graph_capture(common_attn_metadata, **kwargs)
+
     def build_for_graph_capture(
         self,
         common_attn_metadata: CommonAttentionMetadata,

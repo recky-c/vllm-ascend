@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -409,10 +410,12 @@ def test_sfa_indexer_graph_capture_owns_stable_rope_buffers_without_dsa(
 @patch("vllm_ascend.attention.indexer.get_ascend_config")
 @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
 @patch("vllm_ascend.attention.indexer.torch.ops._C_ascend.store_kv_block_metadata", create=True)
+@pytest.mark.parametrize("for_capture", [False, True])
 def test_sfa_indexer_metadata_builder_builds_pcp_dcp_slots_and_c8_groups(
     mock_store_kv_block_metadata,
     mock_cos_sin,
     mock_get_ascend_config,
+    for_capture,
 ):
     mock_get_ascend_config.return_value.c8_reshape_optim_enabled = True
     mock_cos_sin.return_value = (torch.zeros(5, 1, 1, 8), torch.zeros(5, 1, 1, 8))
@@ -432,11 +435,12 @@ def test_sfa_indexer_metadata_builder_builds_pcp_dcp_slots_and_c8_groups(
         gathered_kv_write_mask=torch.tensor([True, True, True, False]),
     )
 
-    metadata = _make_builder(pcp_size=2, dcp_size=2).build(
-        0,
-        common,
-        pcp_context=pcp_context,
-        pcp_cache_group_idx=0,
+    builder = _make_builder(pcp_size=2, dcp_size=2)
+    kwargs = dict(pcp_context=pcp_context, pcp_cache_group_idx=0)
+    metadata = (
+        builder.build_for_cudagraph_capture(common, **kwargs)
+        if for_capture
+        else builder.build(0, common, **kwargs)
     )
 
     torch.testing.assert_close(
