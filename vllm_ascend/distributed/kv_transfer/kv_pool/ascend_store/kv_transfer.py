@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
     Backend,
+    BatchResultShapeError,
     require_aligned_batch_results,
 )
 
@@ -977,6 +978,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             return skip_end > skip_start and start >= skip_start and end <= skip_end
 
         for group_id in req_meta.kv_cache_group_ids or [0]:
+            if self.worker is not None and self.worker.use_kvpp and not self.token_database.group_block_len[group_id]:
+                continue
             group_block_size = self._get_block_size(group_id)
 
             group_store_mask = (
@@ -1185,6 +1188,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             group_ids = req_meta.kv_cache_group_ids or [0]
             load_masks = self.token_database.load_mask(req_meta.block_hashes, token_len)
             for group_id in group_ids:
+                if (
+                    self.worker is not None
+                    and self.worker.use_kvpp
+                    and not self.token_database.group_block_len[group_id]
+                ):
+                    continue
                 block_ids = req_meta.block_ids_by_group[group_id]
                 group_block_size = self._get_block_size(group_id)
                 mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
@@ -1238,6 +1247,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     time.perf_counter() - load_get_start,
                     len(key_list_c),
                 )
+            if self.worker is not None and self.worker.use_kvpp:
+                try:
+                    ret = require_aligned_batch_results("KVPP pool get", key_list_c, ret)
+                except BatchResultShapeError as exc:
+                    logger.error("%s", exc)
+                    ret = None
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,

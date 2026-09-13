@@ -145,6 +145,8 @@ class KeyMetadata:
     cache_role: str = "kv"
     """ Family name for compress-aware hybrid cache layouts """
     cache_family: str = "default"
+    # Owner-sharded objects must not collide with replicated or different layouts.
+    kvpp_layout: str | None = None
 
 
 @dataclass(order=True)
@@ -163,11 +165,13 @@ class PoolKey:
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.kvpp_layout,
                 self.chunk_hash,
             )
         )
 
     def to_string(self):
+        layout = f"@kvpp:{self.key_metadata.kvpp_layout}" if self.key_metadata.kvpp_layout is not None else ""
         return (
             f"{self.key_metadata.model_name}"
             f"@pcp:{self.key_metadata.pcp_rank}@dcp:{self.key_metadata.dcp_rank}"
@@ -176,6 +180,7 @@ class PoolKey:
             f"@group:{self.key_metadata.kv_cache_group_id}"
             f"@cache_role:{self.key_metadata.cache_role}"
             f"@cache_family:{self.key_metadata.cache_family}"
+            f"{layout}"
             f"@{self.chunk_hash}"
         )
 
@@ -387,8 +392,11 @@ class ChunkedTokenDatabase:
                 f"@pp_rank:{group_metadata.pp_rank}"
                 f"@group:{kv_cache_group_id}"
                 f"@cache_role:{cache_role}"
-                f"@cache_family:{cache_family}@"
+                f"@cache_family:{cache_family}"
             )
+            if group_metadata.kvpp_layout is not None:
+                prefix += f"@kvpp:{group_metadata.kvpp_layout}"
+            prefix += "@"
             self._key_prefix_cache[cache_key] = prefix
         return prefix
 
@@ -444,6 +452,7 @@ class ChunkedTokenDatabase:
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,
+                kvpp_layout=group_metadata.kvpp_layout,
             ),
             chunk_hash,
         )

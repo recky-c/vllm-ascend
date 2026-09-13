@@ -1490,6 +1490,43 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
 
 class TestKVPPConfig(TestBase):
+    def test_memcache_pool_configuration(self):
+        from tests.ut.kvpp_utils import make_kvpp_config
+        from vllm_ascend.ascend_config import KVPPConfig
+
+        defaults = {"backend": "memcache", "use_layerwise": False, "load_async": True}
+        for role, overrides, supported in (
+            ("kv_producer", {}, True),
+            ("kv_consumer", {}, False),
+            ("kv_both", {}, False),
+            ("kv_producer", {"backend": "mooncake"}, False),
+            ("kv_producer", {"use_layerwise": True}, False),
+            ("kv_producer", {"load_async": False}, False),
+            ("kv_producer", {"discard_partial_chunks": False}, False),
+            ("kv_producer", {"consumer_is_to_put": True}, False),
+        ):
+            with self.subTest(role=role, overrides=overrides):
+                config = make_kvpp_config()
+                config.kv_transfer_config = KVTransferConfig(
+                    kv_connector="AscendStoreConnector",
+                    kv_role=role,
+                    kv_connector_extra_config={**defaults, **overrides},
+                )
+                kvpp = KVPPConfig.from_vllm_config(config)
+                if supported:
+                    kvpp.validate(config)
+                    config.parallel_config.prefill_context_parallel_size = 2
+                    config.use_v2_model_runner = True
+                    with self.assertRaisesRegex(ValueError, "pooling with PCP"):
+                        kvpp.validate(config)
+                    config.parallel_config.prefill_context_parallel_size = 1
+                    config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
+                    with self.assertRaisesRegex(ValueError, "events"):
+                        kvpp.validate(config)
+                else:
+                    with self.assertRaisesRegex(ValueError, "transfer"):
+                        kvpp.validate(config)
+
     def test_enable_switch_uses_tp_size(self):
         from tests.ut.kvpp_utils import make_kvpp_config
         from vllm_ascend.ascend_config import KVPPConfig
@@ -1539,7 +1576,12 @@ class TestKVPPConfig(TestBase):
         KVPPConfig.from_vllm_config(config).validate(config)
         restrictions = (
             ("parallel_config", "decode_context_parallel_size", 2, "DCP"),
-            (None, "kv_transfer_config", object(), "transfer"),
+            (
+                None,
+                "kv_transfer_config",
+                KVTransferConfig(kv_connector="MooncakeConnectorV1", kv_role="kv_producer"),
+                "transfer",
+            ),
             ("model_config", "enforce_eager", False, "eager"),
             ("model_config", "use_mla", False, "MLA"),
             ("model_config", "is_hybrid", True, "MLA"),

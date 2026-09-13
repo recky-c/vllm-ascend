@@ -76,9 +76,24 @@ KVPP broadcasts each full layer once. No broadcast granularity or separate KVPP 
 | Speculative decoding | Fixed-step MTP; variable-step MTP and other speculative decoding methods are not supported |
 | Execution mode | Eager mode only; graph execution is not supported |
 | Context parallelism | PCP requires Model Runner V2; DCP is not supported |
-| KV transfer | Integration is complete but is not included in this submission; it will be merged in a follow-up submission |
+| KV pooling | Memcache with `AscendStoreConnector`, `kv_producer`, asynchronous whole-block loading; one logical full-attention cache group; PCP disabled |
+| PD disaggregation | Not supported |
 
 Feature combinations must also meet the requirements of the model and the individual features.
+
+### Memcache Pooling
+
+Configure the memcache SDK and MetaService as described in [KV Pool](kv_pool.md), then add:
+
+```bash
+--kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_producer","kv_connector_extra_config":{"lookup_rpc_port":"0","backend":"memcache","use_layerwise":false,"load_async":true}}'
+```
+
+This role both saves and loads pooled prefixes. Keep `discard_partial_chunks=true` (the default). Layerwise pooling, KV events, `kv_consumer`, `kv_both`, and consumer write-back are not supported with KVPP.
+
+Each TP rank saves one complete object per token block containing its persistent target layers and its own MTP caches. Scratch buffers are excluded. Loading restores those same persistent buffers; the existing KVPP broadcast supplies other ranks when a layer executes. Pool lookup requires every nonempty owner shard across all PP stages.
+
+KVPP objects use a layout-specific namespace. Different TP/PP layouts, component layouts or MTP configurations do not reuse incompatible objects. KVPP-disabled objects retain their existing format. Changing cache capacity alone does not change this namespace.
 
 ## Performance
 

@@ -81,8 +81,28 @@ class KVPPConfig:
             raise ValueError("KVPP with PCP requires Model Runner V2.")
         if parallel_config.decode_context_parallel_size != 1:
             raise ValueError("KVPP and DCP cannot be enabled at the same time.")
-        if vllm_config.kv_transfer_config is not None:
-            raise ValueError("KVPP broadcast does not support KV transfer connectors yet.")
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if kv_transfer_config is not None:
+            if parallel_config.prefill_context_parallel_size != 1:
+                raise ValueError("KVPP pooling with PCP is not supported yet.")
+            extra = kv_transfer_config.kv_connector_extra_config
+            if (
+                kv_transfer_config.kv_connector != "AscendStoreConnector"
+                or kv_transfer_config.kv_role != "kv_producer"
+                or extra.get("backend", "mooncake").lower() != "memcache"
+                or extra.get("use_layerwise", False)
+                or not extra.get("load_async", False)
+                or not extra.get("discard_partial_chunks", True)
+                or extra.get("consumer_is_to_put", False)
+            ):
+                raise ValueError(
+                    "KVPP KV transfer supports only AscendStoreConnector with kv_role='kv_producer', "
+                    "backend='memcache', use_layerwise=False, load_async=True, "
+                    "discard_partial_chunks=True and consumer_is_to_put=False."
+                )
+            kv_events_config = vllm_config.kv_events_config
+            if kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+                raise ValueError("KVPP pooling does not support KV cache events yet.")
 
         model_config = vllm_config.model_config
         if not model_config.enforce_eager:
