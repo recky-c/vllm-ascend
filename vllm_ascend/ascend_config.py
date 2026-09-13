@@ -84,9 +84,12 @@ class KVPPConfig:
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             if parallel_config.prefill_context_parallel_size != 1:
-                raise ValueError("KVPP pooling with PCP is not supported yet.")
+                raise ValueError("KVPP KV transfer with PCP is not supported yet.")
             extra = kv_transfer_config.kv_connector_extra_config
-            if (
+            if kv_transfer_config.kv_connector == "MooncakeConnectorV2":
+                if kv_transfer_config.kv_role != "kv_producer":
+                    raise ValueError("MooncakeConnectorV2 requires KVPP to be disabled on the decode node.")
+            elif (
                 kv_transfer_config.kv_connector != "AscendStoreConnector"
                 or kv_transfer_config.kv_role != "kv_producer"
                 or extra.get("backend", "mooncake").lower() != "memcache"
@@ -101,7 +104,11 @@ class KVPPConfig:
                     "discard_partial_chunks=True and consumer_is_to_put=False."
                 )
             kv_events_config = vllm_config.kv_events_config
-            if kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+            if (
+                kv_transfer_config.kv_connector == "AscendStoreConnector"
+                and kv_events_config is not None
+                and kv_events_config.enable_kv_cache_events
+            ):
                 raise ValueError("KVPP pooling does not support KV cache events yet.")
 
         model_config = vllm_config.model_config

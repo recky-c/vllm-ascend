@@ -1490,6 +1490,21 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
 
 class TestKVPPConfig(TestBase):
+    def test_mooncake_v2_producer_configuration(self):
+        from tests.ut.kvpp_utils import make_kvpp_config
+        from vllm_ascend.ascend_config import KVPPConfig
+
+        config = make_kvpp_config()
+        config.kv_transfer_config = KVTransferConfig(kv_connector="MooncakeConnectorV2", kv_role="kv_producer")
+        kvpp = KVPPConfig.from_vllm_config(config)
+        kvpp.validate(config)
+        for role in ("kv_consumer", "kv_both"):
+            config.kv_transfer_config = KVTransferConfig(
+                kv_connector="MooncakeConnectorV2", kv_role=role, kv_port=37010
+            )
+            with self.assertRaisesRegex(ValueError, "decode node"):
+                kvpp.validate(config)
+
     def test_memcache_pool_configuration(self):
         from tests.ut.kvpp_utils import make_kvpp_config
         from vllm_ascend.ascend_config import KVPPConfig
@@ -1517,7 +1532,7 @@ class TestKVPPConfig(TestBase):
                     kvpp.validate(config)
                     config.parallel_config.prefill_context_parallel_size = 2
                     config.use_v2_model_runner = True
-                    with self.assertRaisesRegex(ValueError, "pooling with PCP"):
+                    with self.assertRaisesRegex(ValueError, "transfer with PCP"):
                         kvpp.validate(config)
                     config.parallel_config.prefill_context_parallel_size = 1
                     config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)

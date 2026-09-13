@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakeTransferMetadata,
@@ -40,6 +41,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     as_kv_cache_tensors,
     collect_configured_register_regions,
+    collect_kvpp_register_regions,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     global_te,
@@ -211,6 +213,11 @@ class MooncakeBaseConnectorWorker:
         logger.info("num_blocks: %s", self.num_blocks)
         self.kv_caches = kv_caches
         self._build_kv_cache_spec_mappings()
+        owners = (
+            map_kvpp_layers_to_owners(self.vllm_config, kv_caches.keys())
+            if self.ascend_config.kvpp_config.size > 1
+            else {}
+        )
         layer_names: list[str] = []
         layer_block_sizes: list[int] = []
         group_indices: list[int] = []
@@ -231,6 +238,13 @@ class MooncakeBaseConnectorWorker:
                 cache_or_caches = kv_caches.get(layer_name)
                 if cache_or_caches is None:
                     raise ValueError(f"No KV cache was registered for configured layer {layer_name!r}.")
+
+                configured_layer_names.add(layer_name)
+                # Foreign target layers alias scratch. Publish persistent owners
+                # only; MTP caches are absent from owners and remain replicated.
+                owner = owners.get(layer_name)
+                if owner is not None and owner != self.tp_rank:
+                    continue
 
                 base_addrs: list[int] = []
                 block_strides: list[int] = []
@@ -264,7 +278,6 @@ class MooncakeBaseConnectorWorker:
                         block_shapes.append(block_shape)
                         block_size_scales.append(tensor_num_blocks // self.num_blocks)
 
-                configured_layer_names.add(layer_name)
                 layer_names.append(layer_name)
                 layer_block_size = spec.block_size
                 if isinstance(spec, AscendSFAIndexerCacheSpec):
@@ -286,7 +299,11 @@ class MooncakeBaseConnectorWorker:
         if unexpected_layers:
             raise ValueError(f"KV caches contain layers absent from kv_cache_tensors: {sorted(unexpected_layers)}.")
 
-        register_regions = collect_configured_register_regions(self.kv_cache_config, kv_caches)
+        register_regions = (
+            collect_kvpp_register_regions({name: kv_caches[name] for name in layer_names})
+            if self.ascend_config.kvpp_config.size > 1
+            else collect_configured_register_regions(self.kv_cache_config, kv_caches)
+        )
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 

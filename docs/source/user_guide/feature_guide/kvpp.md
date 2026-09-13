@@ -77,9 +77,23 @@ KVPP broadcasts each full layer once. No broadcast granularity or separate KVPP 
 | Execution mode | Eager mode only; graph execution is not supported |
 | Context parallelism | PCP requires Model Runner V2; DCP is not supported |
 | KV pooling | Memcache with `AscendStoreConnector`, `kv_producer`, asynchronous whole-block loading; one logical full-attention cache group; PCP disabled |
-| PD disaggregation | Not supported |
+| PD disaggregation | `MooncakeConnectorV2`; enable KVPP on the prefill node only; PCP disabled |
 
 Feature combinations must also meet the requirements of the model and the individual features.
+
+### PD Disaggregation
+
+Use `MooncakeConnectorV2` with `kv_producer` on the prefill node and `kv_consumer` on the decode node. Enable KVPP only on the prefill node. MTP caches remain replicated and are transferred alongside the persistent target caches.
+
+```bash
+# Prefill node: include {"enable_kvpp": true} in --additional-config.
+--kv-transfer-config '{"kv_connector":"MooncakeConnectorV2","kv_role":"kv_producer","kv_port":37000}'
+
+# Decode node: leave KVPP disabled.
+--kv-transfer-config '{"kv_connector":"MooncakeConnectorV2","kv_role":"kv_consumer","kv_port":37010}'
+```
+
+Each worker uses a handshake port derived from `kv_port` and its parallel rank. Choose non-overlapping port ranges when both nodes run on one host.
 
 ### Memcache Pooling
 
