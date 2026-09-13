@@ -71,6 +71,7 @@ def make_worker(
     if kvpp:
         config.additional_config = {"enable_kvpp": True}
     config.parallel_config.tensor_parallel_size = tp_size
+    config.parallel_config.prefill_context_parallel_size = 1
     config.model_config.dtype = "bfloat16"
     config.model_config.quantization = None
     config.model_config.hf_config = SimpleNamespace(num_hidden_layers=num_hidden_layers or num_layers)
