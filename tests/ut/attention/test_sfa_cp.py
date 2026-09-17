@@ -651,18 +651,26 @@ def test_sfa_dcp_split_uses_builder_config_without_current_context(is_consumer, 
     assert common.block_table_tensor is blocks
 
 
-@pytest.mark.parametrize("impl_cls", [AscendSFADCPImpl, AscendSFAPCPDCPImpl])
-def test_sfa_dcp_cache_slots_follow_token_layout(impl_cls):
-    impl = impl_cls.__new__(impl_cls)
+@pytest.mark.parametrize("enable_c8", [False, True])
+@pytest.mark.parametrize("num_prefills", [0, 1])
+def test_sfa_pcp_dcp_full_slots_only_for_deferred_c8_prefill(enable_c8, num_prefills):
+    impl = AscendSFAPCPDCPImpl.__new__(AscendSFAPCPDCPImpl)
+    impl.enable_sparse_sfa_c8 = enable_c8
     metadata = AscendSFADCPMetadata.__new__(AscendSFADCPMetadata)
     metadata.num_input_tokens = 2
-    slots = torch.tensor([3200, -1, 3201, -1], dtype=torch.int32)
-    metadata.dcp_context = SimpleNamespace(slot_mapping=slots)
+    metadata.num_prefills = num_prefills
+    full_slots = torch.tensor([3200, -1, 3201, -1], dtype=torch.int32)
+    metadata.dcp_context = SimpleNamespace(slot_mapping=full_slots)
+    local_slots = impl._get_sfa_kv_slot_mapping(metadata)
+    assert local_slots.tolist() == [3200, -1]
+    expected = (None, None)
 
-    result = impl._get_sfa_kv_slot_mapping(metadata)
+    with patch.object(AscendSFADCPImpl, "_store_parallel_kv", return_value=expected) as store:
+        result = impl._store_parallel_kv(
+            None, None, None, None, [], None, local_slots, metadata, False
+        )
 
-    if impl_cls is AscendSFAPCPDCPImpl:
-        assert result is slots
-        assert result.tolist() == [3200, -1, 3201, -1]
-    else:
-        assert result.tolist() == [3200, -1]
+    assert result is expected
+    expected_slots = full_slots if enable_c8 and num_prefills else local_slots
+    assert store.call_args.args[6] is expected_slots
+    assert store.call_args.args[7] is metadata
