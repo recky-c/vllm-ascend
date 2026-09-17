@@ -88,6 +88,15 @@ class TestKVPoolScheduler(unittest.TestCase):
     def _make_config(self, kv_role="kv_producer", extra_config=None, block_size=16):
         return make_config(kv_role, extra_config, block_size)
 
+    def test_mrv2_pcp_preserves_physical_block_token_count(self):
+        config = self._make_config(extra_config={"backend": "memcache"})
+        config.use_v2_model_runner = True
+        config.parallel_config.prefill_context_parallel_size = 2
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        self.assertEqual(scheduler.grouped_block_size, [16])
+        self.assertEqual(scheduler.hash_block_size, 16)
+        self.assertEqual(scheduler.cache_transfer_granularity, 16)
+
     def test_mooncake_layerwise_rejects_tp_mismatch(self):
         config = self._make_config(
             kv_role="kv_consumer",

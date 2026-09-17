@@ -78,7 +78,7 @@ KVPP broadcasts each full layer once. No broadcast granularity or separate KVPP 
 | Speculative decoding | Fixed-step MTP; variable-step MTP and other speculative decoding methods are not supported |
 | Execution mode | Eager mode only; graph execution is not supported |
 | Context parallelism | PCP requires Model Runner V2; DCP is not supported |
-| KV pooling | Memcache with `AscendStoreConnector`, `kv_producer`, asynchronous whole-block loading; PCP disabled |
+| KV pooling | Memcache with `AscendStoreConnector`, `kv_producer`, asynchronous whole-block loading; PCP requires Model Runner V2 |
 | PD disaggregation | `MooncakeConnectorV2`; enable KVPP on the prefill node only; PCP disabled |
 
 Feature combinations must also meet the requirements of the model and the individual features.
@@ -104,6 +104,8 @@ Configure the memcache SDK and MetaService as described in [KV Pool](kv_pool.md)
 ```bash
 --kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_producer","kv_connector_extra_config":{"lookup_rpc_port":"0","backend":"memcache","use_layerwise":false,"load_async":true}}'
 ```
+
+For pooling with PCP, set `VLLM_USE_V2_MODEL_RUNNER=1` and add `--prefill-context-parallel-size 2`. Allocate TP × PCP devices. Each pool shard stores only the layers owned by its PCP × TP rank; a prefix hit requires every shard. PCP gathers complete KV before cache writes, so pool block sizes are not multiplied by PCP.
 
 This role both saves and loads pooled prefixes. Keep `discard_partial_chunks=true` (the default). Layerwise pooling, KV events, `kv_consumer`, `kv_both`, and consumer write-back are not supported with KVPP.
 

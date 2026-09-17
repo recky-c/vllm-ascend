@@ -54,12 +54,17 @@ def make_worker(
     enable_kv_events=False,
     num_hidden_layers=None,
     use_kvpp=False,
+    pcp_size=1,
+    pcp_rank=0,
+    pp_size=1,
+    pp_rank=0,
 ):
     module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
     start_patch(test, f"{module}.get_tensor_model_parallel_rank", return_value=tp_rank)
     start_patch(test, f"{module}.get_tensor_model_parallel_world_size", return_value=tp_size)
     pcp_group = start_patch(test, f"{module}.get_pcp_group")
-    pcp_group.return_value.world_size = 1
+    pcp_group.return_value.world_size = pcp_size
+    pcp_group.return_value.rank_in_group = pcp_rank
     start_patch(test, f"{module}.get_decode_context_model_parallel_world_size", return_value=1)
     start_patch(test, f"{module}.get_decode_context_model_parallel_rank", return_value=0)
     importlib = start_patch(test, f"{module}.importlib")
@@ -75,10 +80,11 @@ def make_worker(
     config.model_config.get_num_layers.return_value = num_layers
     config.model_config.get_total_num_kv_heads.return_value = num_kv_heads
     config.parallel_config.data_parallel_rank = 0
-    config.parallel_config.rank = 0
-    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.rank = (pp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
+    config.parallel_config.pipeline_parallel_size = pp_size
     config.parallel_config.tensor_parallel_size = tp_size
-    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = pcp_size
+    config.use_v2_model_runner = True
     config.additional_config = {"enable_kvpp": use_kvpp}
     config.kv_transfer_config.kv_role = kv_role
     config.kv_transfer_config.kv_connector_extra_config = {
@@ -127,6 +133,57 @@ class TestKVPPPoolWorker(unittest.TestCase):
                 self.assertEqual(len(keys), 4)
                 self.assertTrue(all("@head_or_tp_rank:0" in key for key in keys[:2]))
                 self.assertTrue(all("@head_or_tp_rank:1" in key for key in keys[2:]))
+
+    def test_pcp_registers_only_persistent_owner_layers_and_mtp(self):
+        import torch
+
+        from tests.ut.kvpp_utils import layer_name, make_kvpp_config
+
+        for pcp_rank in range(2):
+            for tp_rank in range(2):
+                with self.subTest(pcp_rank=pcp_rank, tp_rank=tp_rank):
+                    worker = make_worker(
+                        self,
+                        tp_rank=tp_rank,
+                        tp_size=2,
+                        pcp_rank=pcp_rank,
+                        pcp_size=2,
+                        num_layers=18,
+                        use_mla=True,
+                        use_kvpp=True,
+                    )
+                    worker.vllm_config = make_kvpp_config(2)
+                    worker.vllm_config.parallel_config.prefill_context_parallel_size = 2
+                    worker._transfer_threads_started = True
+                    names = [layer_name(i) for i in (9, 10, 11, 12, 17)]
+                    caches = {name: torch.zeros((4, 16, 8)) for name in names}
+                    worker.register_kv_caches(caches)
+                    expected = [names[pcp_rank * 2 + tp_rank], names[-1]]
+                    self.assertEqual(list(worker.kv_caches), expected)
+                    self.assertEqual(worker.group_kv_caches_base_addr[0], [caches[n].data_ptr() for n in expected])
+                    self.assertEqual(worker.block_size, 16)
+                    self.assertEqual(worker.hash_block_size, 16)
+
+    def test_pcp_lookup_requires_every_owner_shard(self):
+        worker = make_worker(self, tp_size=2, pcp_size=2, use_mla=True, use_kvpp=True)
+        for missing_shard in range(4):
+            with self.subTest(missing_shard=missing_shard):
+                exists = [1] * 8
+                exists[missing_shard * 2 + 1] = 0
+                worker.m_store.exists.return_value = exists
+                self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"]), 16)
+                keys = worker.m_store.exists.call_args.args[0]
+                self.assertEqual(len(set(keys)), 8)
+                for shard in range(4):
+                    self.assertTrue(all(f"@pcp:{shard // 2}" in k for k in keys[shard * 2 : shard * 2 + 2]))
+                    self.assertTrue(all(f"@head_or_tp_rank:{shard % 2}" in k for k in keys[shard * 2 : shard * 2 + 2]))
+        worker.m_store.exists.return_value = [1] * 8
+        self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"]), 32)
+
+    def test_pcp_does_not_change_pipeline_stage_identity(self):
+        worker = make_worker(self, tp_size=2, tp_rank=1, pcp_size=2, pcp_rank=1, pp_size=2, pp_rank=0)
+        self.assertEqual(worker.pp_rank, 0)
+        self.assertEqual(worker.kvpp_rank, 3)
 
 
 class _SparseSWAHitManager:
