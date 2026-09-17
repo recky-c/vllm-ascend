@@ -47,6 +47,11 @@ from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 
+@pytest.fixture(autouse=True)
+def _single_rank_dcp_group(monkeypatch):
+    monkeypatch.setattr(attn_utils, "get_dcp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
+
+
 def _make_kv_cache_tensor(size: int, layer_names: list[str], page_size: int = 0) -> KVCacheTensor:
     """Build a KVCacheTensor; vLLM #51718 renamed shared_by -> layers on main."""
     if vllm_version_is("0.28.0"):
@@ -770,6 +775,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
             num_scheduled_tokens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
             seq_lens_np=np.array([2, 3, 0, 0], dtype=np.int32),
+            num_computed_tokens_np=np.zeros(4, dtype=np.int32),
             is_prefilling_np=np.array([True, True, False, False]),
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=torch.arange(8, dtype=torch.int32),
@@ -1183,3 +1189,178 @@ def test_attn_state_mla_spec_and_metadata_wrappers(monkeypatch):
     assert forwarded["positions"].tolist() == [0, 1]
     assert forwarded["is_prefilling"] is True
     assert module.build_attn_metadata is stub
+
+
+@pytest.mark.parametrize("for_cudagraph_capture", [False, True])
+@pytest.mark.parametrize("with_cpu_lengths", [False, True])
+@pytest.mark.parametrize(
+    "seq_lengths,query_lengths,prefilling,threshold,expected",
+    [
+        ([257, 400], [1, 100], [False, True], 1, [[129, 128], [172, 128]]),
+        # Fresh prefill has no computed context.
+        ([257, 100], [1, 100], [False, True], 1, [[129, 128], [0, 0]]),
+        ([260], [4], [False], 4, [[132, 128]]),
+        ([257], [1], [True], 1, [[128, 128]]),
+    ],
+)
+def test_build_attn_metadata_prepares_shared_dcp_before_backend(
+    monkeypatch,
+    for_cudagraph_capture,
+    with_cpu_lengths,
+    seq_lengths,
+    query_lengths,
+    prefilling,
+    threshold,
+    expected,
+):
+    from vllm_ascend.attention.context_parallel.common_cp import DCPMetadataBuilderMixin
+
+    class InspectBuilder(DCPMetadataBuilderMixin):
+        def inspect(self, common):
+            # No per-batch builder state exists yet: MRV2 must provide the metadata.
+            assert not hasattr(self, "seq_lens")
+            metadata = self._require_dcp_metadata(common)
+            assert metadata.num_computed_tokens_of_dcp.tolist() == expected
+            return common
+
+        def build(self, common_prefix_len, common_attn_metadata, **kwargs):
+            return self.inspect(common_attn_metadata)
+
+        def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
+            return self.inspect(common_attn_metadata)
+
+    builder = InspectBuilder.__new__(InspectBuilder)
+    builder.dcp_size = 2
+    builder.cp_local_block_size = 128
+    builder.decode_threshold = threshold
+    builder.pcp_enabled = False
+    builder.dcp_enabled = True
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=threshold - 1) if threshold > 1 else None,
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=128),
+        model_config=SimpleNamespace(use_mla=True),
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils, "get_dcp_group", lambda: SimpleNamespace(world_size=2, rank_in_group=0))
+    other_builder = SimpleNamespace(
+        build=lambda common_prefix_len, common_attn_metadata: common_attn_metadata,
+        build_for_cudagraph_capture=lambda common: common,
+    )
+    groups = [
+        SimpleNamespace(layer_names=["mla"], get_metadata_builder=lambda _: builder),
+        SimpleNamespace(layer_names=["other"], get_metadata_builder=lambda _: other_builder),
+    ]
+    num_reqs = len(seq_lengths)
+    num_tokens = sum(query_lengths)
+    query_start_loc = torch.tensor([0, *np.cumsum(query_lengths)], dtype=torch.int32)
+    lengths = np.array(seq_lengths, dtype=np.int32)
+    result = attn_utils.build_attn_metadata(
+        attn_groups=[groups],
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        query_start_loc_gpu=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        max_query_len=max(query_lengths),
+        seq_lens=torch.from_numpy(lengths),
+        seq_lens_np=lengths if with_cpu_lengths else None,
+        num_computed_tokens_cpu=torch.from_numpy(lengths - np.array(query_lengths)),
+        seq_lens_cpu_upper_bound=torch.full((num_reqs,), 8192, dtype=torch.int32),
+        max_seq_len=8192,
+        block_tables=(torch.zeros((num_reqs, 4), dtype=torch.int32),),
+        slot_mappings=(torch.zeros(num_tokens, dtype=torch.int64),),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())]),
+        is_prefilling=torch.tensor(prefilling),
+        for_cudagraph_capture=for_cudagraph_capture,
+    )
+    common = result["mla"]
+    assert common.context_parallel_metadata.query_lens_cpu.tolist() == query_lengths
+    assert common.context_parallel_metadata.max_query_len == max(query_lengths)
+    assert lengths.tolist() == seq_lengths
+    assert result["other"] is common
+    assert attn_utils._build_dcp_metadata(common, config, 2, 0) is common.context_parallel_metadata
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_common_dcp_metadata_supplies_gqa_causal_mask(monkeypatch, rank):
+    from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPMetadataBuilder
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=2),
+        model_config=SimpleNamespace(use_mla=False),
+    )
+    lengths = torch.tensor([7, 3], dtype=torch.int32)
+    common = SimpleNamespace(
+        context_parallel_metadata=None,
+        num_reqs=2,
+        num_actual_tokens=6,
+        max_query_len=3,
+        query_start_loc_cpu=torch.tensor([0, 3, 6], dtype=torch.int32),
+        _seq_lens_cpu=None,
+        seq_lens_cpu=lengths,
+        num_computed_tokens_cpu=lengths - 3,
+        seq_lens=lengths,
+        is_prefilling=torch.tensor([False, False]),
+        causal=True,
+    )
+    metadata = attn_utils._build_dcp_metadata(common, config, 2, rank)
+    common.context_parallel_metadata = metadata
+    mask = metadata.dcp_mtp_attn_mask
+    assert mask is not None
+    for req, seq_len in enumerate(lengths.tolist()):
+        keys = [position for position in range(seq_len) if (position // 2) % 2 == rank]
+        for query in range(3):
+            assert mask[req, query, : len(keys)].tolist() == [key > seq_len - 3 + query for key in keys]
+            assert not mask[req, query, len(keys) :].any()
+    builder = AscendAttentionDCPMetadataBuilder.__new__(AscendAttentionDCPMetadataBuilder)
+    result = builder._build_backend_metadata(
+        common,
+        block_table=torch.zeros((2, 2), dtype=torch.int32),
+        query_lens=torch.tensor([3, 3]),
+        seq_lens=lengths,
+        num_decodes=2,
+        num_prefills=0,
+    )
+    assert result["decode_meta"].dcp_mtp_attn_mask is mask
+    common.causal = False
+    common.context_parallel_metadata = None
+    assert attn_utils._build_dcp_metadata(common, config, 2, rank).dcp_mtp_attn_mask is None
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_common_metadata_preserves_supplied_draft_metadata(monkeypatch, dcp_size):
+    from vllm_ascend.attention.utils import AscendDCPMetadata
+
+    supplied = AscendDCPMetadata(
+        num_computed_tokens_of_dcp=torch.tensor([[129, 128]]),
+        query_lens_cpu=torch.tensor([1]),
+        max_query_len=1,
+        draft_cp_seq_len=torch.tensor([129]),
+    )
+    monkeypatch.setattr(attn_utils, "get_dcp_group", lambda: SimpleNamespace(world_size=dcp_size, rank_in_group=0))
+
+    def unexpected_config():
+        pytest.fail("Supplied metadata must not be reconstructed")
+
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", unexpected_config)
+    builder = SimpleNamespace(build=lambda common_prefix_len, common_attn_metadata: common_attn_metadata)
+    result = attn_utils.build_attn_metadata(
+        attn_groups=[[SimpleNamespace(layer_names=["layer"], get_metadata_builder=lambda _: builder)]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([257], dtype=torch.int32),
+        seq_lens_np=np.array([257], dtype=np.int32),
+        max_seq_len=8192,
+        block_tables=(torch.zeros((1, 2), dtype=torch.int32),),
+        slot_mappings=(torch.zeros(1, dtype=torch.int64),),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())]),
+        model_specific_attn_metadata=SimpleNamespace(
+            get_extra_common_attn_kwargs=lambda *_: {"context_parallel_metadata": supplied},
+            get_extra_attn_kwargs=lambda *_: {},
+        ),
+    )
+    assert result["layer"].context_parallel_metadata is supplied
+    assert supplied.draft_cp_seq_len.tolist() == [129]

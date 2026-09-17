@@ -39,22 +39,11 @@ def test_mla_dcp_extends_v1_backend() -> None:
     assert {"cp_seq_len", "dcp_mtp_attn_mask"} <= dcp_fields
 
 
-def test_mla_dcp_builds_missing_metadata_for_mixed_batch() -> None:
+def test_mla_dcp_requires_runner_metadata() -> None:
     builder = AscendMlaDCPMetadataBuilder.__new__(AscendMlaDCPMetadataBuilder)
-    builder.dcp_size = 2
-    builder.cp_local_block_size = 128
-    builder.num_decodes = 1
-    builder.seq_lens = torch.tensor([257, 400], dtype=torch.int32)
-    builder.query_lens = torch.tensor([1, 100], dtype=torch.int32)
-    common = SimpleNamespace(context_parallel_metadata=None, max_query_len=100)
-
-    metadata = builder._require_dcp_metadata(common)
-
-    assert metadata.num_computed_tokens_of_dcp.tolist() == [[129, 128], [172, 128]]
-    assert metadata.query_lens_cpu.tolist() == [1, 100]
-    assert metadata.max_query_len == 100
-    assert builder.seq_lens.tolist() == [257, 400]
-    assert common.context_parallel_metadata is metadata
+    common = SimpleNamespace(context_parallel_metadata=None)
+    with pytest.raises(AssertionError, match="DCP metadata must be populated"):
+        builder._require_dcp_metadata(common)
 
 
 def test_mla_dcp_preserves_runner_metadata() -> None:

@@ -26,10 +26,12 @@ import numpy as np
 import torch
 import vllm
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
+from vllm.distributed import get_dcp_group
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size, get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -48,6 +50,7 @@ from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    AscendDCPMetadata,
     get_sfa_qsfa_packed_head_dim,
 )
 from vllm_ascend.core.kv_cache_interface import (
@@ -220,6 +223,64 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     return kv_cache_spec
 
 
+def _build_dcp_metadata(
+    common: AscendCommonAttentionMetadata,
+    vllm_config: VllmConfig,
+    dcp_size: int,
+    dcp_rank: int,
+) -> AscendDCPMetadata:
+    """Build request-level DCP metadata alongside the common metadata."""
+    if common.context_parallel_metadata is not None:
+        return common.context_parallel_metadata
+
+    num_computed_tokens = common.num_computed_tokens_cpu
+    is_prefilling = common.is_prefilling
+    assert num_computed_tokens is not None, "MRV2 DCP requires scheduler computed-token counts."
+    assert is_prefilling is not None, "MRV2 DCP requires scheduler prefill/decode state."
+
+    query_lens = common.query_start_loc_cpu.diff()[: common.num_reqs]
+    seq_lens = common.seq_lens_cpu
+    context_lens = torch.where(
+        is_prefilling[: common.num_reqs],
+        num_computed_tokens[: common.num_reqs],
+        seq_lens[: common.num_reqs],
+    )
+    num_decodes = int((~is_prefilling[: common.num_reqs]).sum().item())
+    spec_config = vllm_config.speculative_config
+    interleave = vllm_config.parallel_config.cp_kv_cache_interleave_size
+    local_lengths = get_dcp_local_seq_lens(
+        context_lens,
+        dcp_size=dcp_size,
+        cp_kv_cache_interleave_size=interleave,
+    )
+    metadata = AscendDCPMetadata(
+        num_computed_tokens_of_dcp=local_lengths,
+        query_lens_cpu=query_lens,
+        max_query_len=common.max_query_len,
+    )
+    # Match MRV1: non-MLA speculative attention needs a rank-local causal mask.
+    # MLA implements causality through its history/current attention split.
+    if spec_config and not vllm_config.model_config.use_mla and common.causal and num_decodes:
+        q_lens = query_lens[:num_decodes]
+        k_lens = local_lengths[:num_decodes, dcp_rank]
+        histories = seq_lens[:num_decodes] - q_lens
+        q_indices = torch.arange(int(q_lens.max()), dtype=torch.int32)
+        k_indices = torch.arange(max(1, int(k_lens.max())), dtype=torch.int32)
+        visible_lengths = get_dcp_local_seq_lens(
+            histories[:, None] + q_indices[None, :] + 1,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            cp_kv_cache_interleave_size=interleave,
+        )
+        mask = (
+            (k_indices[None, None, :] >= visible_lengths[:, :, None])
+            & (q_indices[None, :, None] < q_lens[:, None, None])
+            & (k_indices[None, None, :] < k_lens[:, None, None])
+        )
+        metadata.dcp_mtp_attn_mask = mask.to(common.seq_lens.device)
+    return metadata
+
+
 def build_attn_metadata(
     *,
     attn_groups: list[list[AttentionGroup]],
@@ -251,13 +312,16 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
-    # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
-    # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
-    # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
-    # an error.
-    if seq_lens_np is None:
-        seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
-    seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
+    dcp_group = get_dcp_group()
+    if seq_lens_np is not None:
+        seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
+    elif dcp_group.world_size > 1:
+        # Upstream draft calls can omit the exact CPU mirror. A max-length
+        # placeholder or CPU upper bound is not a valid DCP length. Copy once
+        # here (which synchronizes for device inputs), before any backend runs.
+        seq_lens_cpu = seq_lens[:num_reqs].to("cpu")
+    else:
+        seq_lens_cpu = torch.full((num_reqs,), max_seq_len, dtype=torch.int32)
     if seq_lens_cpu_upper_bound is None:
         seq_lens_cpu_upper_bound = seq_lens_cpu
 
@@ -310,12 +374,21 @@ def build_attn_metadata(
             attn_state=attn_state,
             graph_pad_size=graph_pad_size,
             num_input_tokens=num_input_tokens,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
             is_prefilling=common_is_prefilling,
             max_seq_len=max_seq_len,
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             **common_attn_metadata_extra_kwargs,
         )
+
+        if dcp_group.world_size > 1 and common_attn_metadata.context_parallel_metadata is None:
+            common_attn_metadata.context_parallel_metadata = _build_dcp_metadata(
+                common_attn_metadata,
+                get_current_vllm_config(),
+                dcp_group.world_size,
+                dcp_group.rank_in_group,
+            )
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
