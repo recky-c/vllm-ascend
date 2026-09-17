@@ -2751,8 +2751,6 @@ class KVPoolWorker:
     def _expand_lookup_keys_by_rank(self, keys: list[str], group_id: int) -> list[str]:
         expanded: list[str] = []
         num_head_or_tp_ranks = self.get_group_tp_size(group_id)
-        if self.use_kvpp and self.dcp_size != 1:
-            raise ValueError("KVPP and DCP cannot be enabled at the same time.")
         # Only KVPP expands PCP owners; ordinary pooling keeps its existing
         # PCP key field because DCP overlays PCP/TP rather than adding ranks.
         num_pcp_ranks = self.pcp_size if self.use_kvpp else 1

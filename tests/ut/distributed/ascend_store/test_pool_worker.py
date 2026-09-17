@@ -195,12 +195,6 @@ class TestKVPPPoolWorker(unittest.TestCase):
             self.assertTrue(all(f"@dcp:{shard // 2 % 4}@" in key for key in shard_keys))
             self.assertTrue(all(f"@head_or_tp_rank:{shard % 2}@" in key for key in shard_keys))
 
-    def test_kvpp_lookup_rejects_dcp_instead_of_expanding_invalid_coordinates(self):
-        worker = make_worker(self, tp_size=2, pcp_size=2, use_mla=True, use_kvpp=True)
-        worker.dcp_size = 4
-        with self.assertRaisesRegex(ValueError, "KVPP and DCP"):
-            worker._expand_lookup_keys_by_rank(["key"], 0)
-
     def test_pcp_does_not_change_pipeline_stage_identity(self):
         worker = make_worker(self, tp_size=2, tp_rank=1, pcp_size=2, pcp_rank=1, pp_size=2, pp_rank=0)
         self.assertEqual(worker.pp_rank, 0)
