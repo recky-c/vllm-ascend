@@ -156,10 +156,11 @@ class KVPoolWorker:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
-        self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
 
         self.pcp_size = get_pcp_group().world_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.pp_rank = (parallel_config.rank // (self.tp_size * self.pcp_size)) % self.pp_size
+        self.kvpp_rank = self.pcp_rank * self.tp_size + self.tp_rank
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
         self.model_name = model_config.model.split("/")[-1]
@@ -193,14 +194,14 @@ class KVPoolWorker:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
-        cp_scale = self.pcp_size * self.dcp_size
-        self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
+        # PCP replicates KV; only DCP shards tokens. KVPP requires DCP=1.
+        self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
         if not isinstance(requested_hash_block_size, int):
             requested_hash_block_size = None
         self.hash_block_size = (
             requested_hash_block_size if requested_hash_block_size is not None else min(self.original_block_size)
-        ) * cp_scale
+        ) * self.dcp_size
         for group_block_size in self.grouped_block_size:
             assert group_block_size % self.hash_block_size == 0, "block_size must be divisible by hash_block_size"
         self.block_size = self.grouped_block_size[0]
@@ -814,7 +815,9 @@ class KVPoolWorker:
         self.kv_caches = kv_caches
         if self.use_kvpp:
             owners = map_kvpp_layers_to_owners(self.vllm_config, kv_caches.keys())
-            kv_caches = {name: caches for name, caches in kv_caches.items() if owners.get(name) in (None, self.tp_rank)}
+            kv_caches = {
+                name: caches for name, caches in kv_caches.items() if owners.get(name) in (None, self.kvpp_rank)
+            }
             self.kv_caches = kv_caches
         self.group_kv_cache_families: dict[int, str] = {
             group_id: get_group_cache_family(self.kv_cache_group_families, group_id)
@@ -2746,18 +2749,23 @@ class KVPoolWorker:
         return f"{key[:value_start]}{value}{key[value_end:]}"
 
     def _expand_lookup_keys_by_rank(self, keys: list[str], group_id: int) -> list[str]:
-        # All-rank KV pool lookup currently assumes PCP=1.
         expanded: list[str] = []
         num_head_or_tp_ranks = self.get_group_tp_size(group_id)
-        # Keep each rank shard's block/layer keys contiguous to match
-        # lookup_scheduler()'s [rank_shard][block] result slicing.
+        # Only KVPP expands PCP owners; ordinary pooling keeps its existing
+        # PCP key field because DCP overlays PCP/TP rather than adding ranks.
+        num_pcp_ranks = self.pcp_size if self.use_kvpp else 1
+        # Keep each rank shard's keys contiguous for lookup_scheduler().
         for pp_rank in range(self.pp_size):
-            for dcp_rank in range(self.dcp_size):
-                for head_or_tp_rank in range(num_head_or_tp_ranks):
-                    for key in keys:
-                        rank_key = self._replace_key_field(key, "dcp", dcp_rank)
-                        rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
-                        expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
+            for pcp_rank in range(num_pcp_ranks):
+                for dcp_rank in range(self.dcp_size):
+                    for head_or_tp_rank in range(num_head_or_tp_ranks):
+                        for key in keys:
+                            rank_key = key
+                            if self.use_kvpp:
+                                rank_key = self._replace_key_field(rank_key, "pcp", pcp_rank)
+                            rank_key = self._replace_key_field(rank_key, "dcp", dcp_rank)
+                            rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
+                            expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
         return expanded
 
     def _expand_lookup_key_variants(self, key: str, group_id: int, include_all_ranks: bool) -> list[str]:

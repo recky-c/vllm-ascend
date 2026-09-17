@@ -1511,6 +1511,26 @@ class TestKVPPConfig(TestBase):
         with self.assertRaisesRegex(ValueError, "enable_kvpp"):
             KVPPConfig.from_vllm_config(config)
 
+    def test_pooling_rejects_mrv1_pcp_and_kvpp_dcp(self):
+        from types import SimpleNamespace
+
+        from tests.ut.kvpp_utils import make_kvpp_config
+        from vllm_ascend.platform import _validate_parallel_config
+
+        for use_v2, pcp, dcp, message in ((False, 2, 1, "PCP"), (True, 2, 2, "KVPP and DCP")):
+            with self.subTest(use_v2=use_v2, pcp=pcp, dcp=dcp):
+                config = make_kvpp_config(2)
+                config.use_v2_model_runner = use_v2
+                config.parallel_config.prefill_context_parallel_size = pcp
+                config.parallel_config.decode_context_parallel_size = dcp
+                config.kv_transfer_config = SimpleNamespace(
+                    kv_connector="AscendStoreConnector",
+                    kv_role="kv_producer",
+                    kv_connector_extra_config={"backend": "memcache", "use_layerwise": False, "load_async": True},
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    _validate_parallel_config(config)
+
     def test_supported_configuration_and_restrictions(self):
         from tests.ut.kvpp_utils import make_kvpp_config
         from vllm_ascend.ascend_config import KVPPConfig
