@@ -180,6 +180,27 @@ class TestKVPPPoolWorker(unittest.TestCase):
         worker.m_store.exists.return_value = [1] * 8
         self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"]), 32)
 
+    def test_non_kvpp_lookup_preserves_original_pcp_key_and_rank_order(self):
+        worker = make_worker(self, tp_size=2, num_kv_heads=2, pcp_size=2, pcp_rank=1, pp_size=2)
+        # Exercise the shared lookup with DCP overlaying PCP x TP.
+        worker.dcp_size = 4
+        worker.m_store.exists.return_value = [1] * 32
+        self.assertEqual(worker.lookup_scheduler(32, ["h0", "h1"]), 32)
+        keys = worker.m_store.exists.call_args.args[0]
+        self.assertEqual(len(keys), 32)
+        self.assertTrue(all("@pcp:1@" in key for key in keys))
+        for shard in range(16):
+            shard_keys = keys[shard * 2 : shard * 2 + 2]
+            self.assertTrue(all(f"@pp_rank:{shard // 8}" in key for key in shard_keys))
+            self.assertTrue(all(f"@dcp:{shard // 2 % 4}@" in key for key in shard_keys))
+            self.assertTrue(all(f"@head_or_tp_rank:{shard % 2}@" in key for key in shard_keys))
+
+    def test_kvpp_lookup_rejects_dcp_instead_of_expanding_invalid_coordinates(self):
+        worker = make_worker(self, tp_size=2, pcp_size=2, use_mla=True, use_kvpp=True)
+        worker.dcp_size = 4
+        with self.assertRaisesRegex(ValueError, "KVPP and DCP"):
+            worker._expand_lookup_keys_by_rank(["key"], 0)
+
     def test_pcp_does_not_change_pipeline_stage_identity(self):
         worker = make_worker(self, tp_size=2, tp_rank=1, pcp_size=2, pcp_rank=1, pp_size=2, pp_rank=0)
         self.assertEqual(worker.pp_rank, 0)

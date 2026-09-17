@@ -2751,16 +2751,26 @@ class KVPoolWorker:
     def _expand_lookup_keys_by_rank(self, keys: list[str], group_id: int) -> list[str]:
         expanded: list[str] = []
         num_head_or_tp_ranks = self.get_group_tp_size(group_id)
+        context_ranks: list[tuple[int | None, int]]
+        if self.use_kvpp:
+            if self.dcp_size != 1:
+                raise ValueError("KVPP and DCP cannot be enabled at the same time.")
+            context_ranks = [(pcp_rank, 0) for pcp_rank in range(self.pcp_size)]
+        else:
+            # Preserve ordinary pooling lookup; DCP overlays PCP/TP, so do
+            # not introduce an independent PCP dimension into this path.
+            context_ranks = [(None, dcp_rank) for dcp_rank in range(self.dcp_size)]
         # Keep each rank shard's keys contiguous for lookup_scheduler().
         for pp_rank in range(self.pp_size):
-            for pcp_rank in range(self.pcp_size):
-                for dcp_rank in range(self.dcp_size):
-                    for head_or_tp_rank in range(num_head_or_tp_ranks):
-                        for key in keys:
-                            rank_key = self._replace_key_field(key, "pcp", pcp_rank)
-                            rank_key = self._replace_key_field(rank_key, "dcp", dcp_rank)
-                            rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
-                            expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
+            for pcp_rank, dcp_rank in context_ranks:
+                for head_or_tp_rank in range(num_head_or_tp_ranks):
+                    for key in keys:
+                        rank_key = key
+                        if pcp_rank is not None:
+                            rank_key = self._replace_key_field(rank_key, "pcp", pcp_rank)
+                        rank_key = self._replace_key_field(rank_key, "dcp", dcp_rank)
+                        rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
+                        expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
         return expanded
 
     def _expand_lookup_key_variants(self, key: str, group_id: int, include_all_ranks: bool) -> list[str]:
