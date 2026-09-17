@@ -1432,6 +1432,15 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
 class AscendSFAPCPDCPImpl(AscendSFADCPImpl, AscendSFAPCPImpl):
     """Composes DCP attention with PCP gathered-token cache writes."""
 
+    def _get_sfa_kv_slot_mapping(
+        self,
+        attn_metadata: M,
+    ) -> torch.Tensor:
+        assert isinstance(attn_metadata, AscendSFADCPMetadata)
+        assert attn_metadata.dcp_context is not None
+        # PCP cache writes use the gathered-token layout, including DCP padding.
+        return attn_metadata.dcp_context.slot_mapping
+
     def _start_dcp_query_gather(
         self,
         ql_nope: torch.Tensor,

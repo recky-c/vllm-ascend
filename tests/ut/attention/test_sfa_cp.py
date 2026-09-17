@@ -649,3 +649,20 @@ def test_sfa_dcp_split_uses_builder_config_without_current_context(is_consumer, 
     assert gather.call_count == int(result.num_prefills > 0)
     assert common.slot_mapping is slots
     assert common.block_table_tensor is blocks
+
+
+@pytest.mark.parametrize("impl_cls", [AscendSFADCPImpl, AscendSFAPCPDCPImpl])
+def test_sfa_dcp_cache_slots_follow_token_layout(impl_cls):
+    impl = impl_cls.__new__(impl_cls)
+    metadata = AscendSFADCPMetadata.__new__(AscendSFADCPMetadata)
+    metadata.num_input_tokens = 2
+    slots = torch.tensor([3200, -1, 3201, -1], dtype=torch.int32)
+    metadata.dcp_context = SimpleNamespace(slot_mapping=slots)
+
+    result = impl._get_sfa_kv_slot_mapping(metadata)
+
+    if impl_cls is AscendSFAPCPDCPImpl:
+        assert result is slots
+        assert result.tolist() == [3200, -1, 3201, -1]
+    else:
+        assert result.tolist() == [3200, -1]
