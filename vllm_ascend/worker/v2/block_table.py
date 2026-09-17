@@ -27,6 +27,16 @@ from vllm_ascend.ops.triton.v2.block_table.compute_slot_mappings import (
 from vllm_ascend.utils import vllm_version_is
 
 
+SLOT_MAPPING_DTYPE = torch.int32
+
+
+def validate_slot_mapping_capacity(num_blocks: int, block_sizes: list[int]) -> None:
+    """Check physical KV capacity before allocating int32 slot mappings."""
+    max_slot = max((num_blocks * size - 1 for size in block_sizes), default=-1)
+    if max_slot > torch.iinfo(SLOT_MAPPING_DTYPE).max:
+        raise ValueError(f"Ascend slot mappings require int32, but the KV cache can address slot {max_slot}.")
+
+
 class AscendBlockTables(BlockTables):
     """Block table for Ascend NPUs."""
 
@@ -89,7 +99,7 @@ class AscendBlockTables(BlockTables):
         self.slot_mappings: torch.Tensor = torch.zeros(
             self.num_kv_cache_groups,
             self.max_num_batched_tokens,
-            dtype=torch.int32,
+            dtype=SLOT_MAPPING_DTYPE,
             device=self.device,
         )
 

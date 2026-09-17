@@ -33,6 +33,13 @@ void store_kv_block_metadata(
     const at::Tensor &group_key_cache_idx,
     int64_t block_size)
 {
+    TORCH_CHECK(slot_mapping_npu.scalar_type() == at::kInt,
+                "store_kv_block_metadata: slot_mapping must be int32, got ",
+                slot_mapping_npu.scalar_type());
+    TORCH_CHECK(group_len.scalar_type() == at::kInt &&
+                group_key_idx.scalar_type() == at::kInt &&
+                group_key_cache_idx.scalar_type() == at::kInt,
+                "store_kv_block_metadata: group tensors must be int32.");
     TORCH_CHECK(slot_mapping_npu.numel() > 0, "Tensor slot_mapping_npu is empty.");
     TORCH_CHECK(block_size > 0, "block_size must be positive, but got ", block_size);
 

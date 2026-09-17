@@ -102,3 +102,20 @@ def test_myops(num_tokens, num_head, block_size, num_blocks, count):
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
+
+
+@pytest.mark.parametrize("invalid_arg", [0, 1, 2, 3])
+def test_store_kv_block_metadata_rejects_int64(invalid_arg):
+    tensors = [torch.zeros(4, dtype=torch.int32, device="npu") for _ in range(4)]
+    tensors[invalid_arg] = tensors[invalid_arg].to(torch.int64)
+    with pytest.raises(RuntimeError, match="int32"):
+        torch.ops._C_ascend.store_kv_block_metadata(*tensors, 128)
+
+
+def test_store_kv_block_metadata_int32_slots():
+    slots = torch.tensor([3200, 3201, -1, 3328], dtype=torch.int32, device="npu")
+    groups = [torch.full_like(slots, -99) for _ in range(3)]
+    torch.ops._C_ascend.store_kv_block_metadata(slots, *groups, 128)
+    assert groups[0].cpu().tolist() == [2, 1, 0, 0]
+    assert groups[1].cpu().tolist() == [0, 3, 0, 0]
+    assert groups[2].cpu().tolist() == [3200, 3328, 0, 0]

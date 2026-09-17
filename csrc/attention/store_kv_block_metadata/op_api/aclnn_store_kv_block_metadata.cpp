@@ -53,6 +53,10 @@ aclnnStatus aclnnStoreKvBlockMetadataGetWorkspaceSize(
     CHECK_RET(groupLen != nullptr, ACLNN_ERR_INNER_NULLPTR);
     CHECK_RET(groupKeyIdx != nullptr, ACLNN_ERR_INNER_NULLPTR);
     CHECK_RET(groupKeyCacheIdx != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    CHECK_RET(slotMapping->GetDataType() == op::DataType::DT_INT32, ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(groupLen->GetDataType() == op::DataType::DT_INT32, ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(groupKeyIdx->GetDataType() == op::DataType::DT_INT32, ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(groupKeyCacheIdx->GetDataType() == op::DataType::DT_INT32, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(blockSize > 0, ACLNN_ERR_PARAM_INVALID);
 
     auto slotMappingContiguous = l0op::Contiguous(slotMapping, uniqueExecutor.get());

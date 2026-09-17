@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2 import states as states_module
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, _prepare_pcp_inputs_to_capture
+from vllm_ascend.worker.v2.block_table import validate_slot_mapping_capacity
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -493,7 +494,7 @@ def test_prepare_slot_mappings_pads_each_pcp_rank_for_full_decode_graph() -> Non
         num_tokens=4,
         is_prefilling_np=np.array([False, False, False, False]),
     )
-    manager._gathered_kv_slot_mappings = torch.full((1, 16), -99, dtype=torch.int64)
+    manager._gathered_kv_slot_mappings = torch.full((1, 16), -99, dtype=torch.int32)
     compact_slot_mappings = manager._gathered_kv_slot_mappings[:, :8]
     compact_slot_mappings.copy_(torch.tensor([[10, 11, 12, 13, 20, 21, 22, 23]]))
 
@@ -1039,3 +1040,42 @@ def test_dummy_attention_context_uses_current_batch(pcp_rank, has_stale_batch):
     assert manager._global_batch is saved_batch
     assert manager._hidden_restore_idx is saved_indices
     manager._block_tables.gather_block_tables.assert_not_called()
+
+
+def test_pcp_slot_buffers_use_int32_for_gather_and_dummy():
+    def init_buffers(manager, **kwargs):
+        manager._global_batch_slot_mappings = torch.empty((1, 4), dtype=torch.int64)
+        manager._gathered_kv_slot_mappings = torch.empty((1, 8), dtype=torch.int64)
+        manager._pad_slot_id = torch.tensor(-1, dtype=torch.int64)
+        manager.pcp_world_size = 2
+
+    with patch.object(PCPManager, "__init__", init_buffers):
+        manager = AscendPCPManager(2, 0, torch.device("cpu"))
+
+    assert manager._global_batch_slot_mappings.dtype == torch.int32
+    assert manager._gathered_kv_slot_mappings.dtype == torch.int32
+    assert manager._pad_slot_id.dtype == torch.int32
+    manager._global_batch_slot_mappings.copy_(torch.tensor([[3200, 3201, -1, 3203]]))
+    manager._padded_gather_idx = torch.tensor([3, 0, 1, 2])
+    manager._gathered_kv_write_mask = torch.tensor([True, True, False, True])
+    buffer_ptr = manager._gathered_kv_slot_mappings.data_ptr()
+
+    gathered = manager._convert_to_gathered_slot_mappings(manager._global_batch_slot_mappings)
+    assert gathered.tolist() == [[3203, 3200, -1, -1]]
+    assert gathered.dtype == torch.int32
+    assert gathered.data_ptr() == buffer_ptr
+
+    dummy = manager.get_dummy_slot_mappings(2)
+    assert dummy.tolist() == [[-1, -1, -1, -1]]
+    assert dummy.dtype == torch.int32
+    assert dummy.data_ptr() == buffer_ptr
+
+
+@pytest.mark.parametrize("num_blocks,block_sizes", [(0, []), (1, [128]), (2**24, [128])])
+def test_slot_capacity_accepts_int32_range(num_blocks, block_sizes):
+    validate_slot_mapping_capacity(num_blocks, block_sizes)
+
+
+def test_slot_capacity_rejects_overflow_in_any_group():
+    with pytest.raises(ValueError, match="require int32"):
+        validate_slot_mapping_capacity(2**24 + 1, [64, 128])

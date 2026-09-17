@@ -30,6 +30,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.block_table import SLOT_MAPPING_DTYPE
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
 
@@ -76,6 +77,18 @@ class AscendPCPManager(PCPManager):
             dcp_rank=dcp_rank,
             cp_interleave=cp_interleave,
         )
+
+        # Allocate once, before capture: normal, dummy and graph paths share
+        # these buffers. Do not convert uninitialized upstream buffer contents.
+        if self._global_batch_slot_mappings is not None:
+            self._global_batch_slot_mappings = torch.empty_like(
+                self._global_batch_slot_mappings, dtype=SLOT_MAPPING_DTYPE
+            )
+        if self._gathered_kv_slot_mappings is not None:
+            self._gathered_kv_slot_mappings = torch.empty_like(
+                self._gathered_kv_slot_mappings, dtype=SLOT_MAPPING_DTYPE
+            )
+        self._pad_slot_id = self._pad_slot_id.to(SLOT_MAPPING_DTYPE)
 
         # vLLM #53515 made the PCP-local buffers persistent and uses them for
         # graph capture. Preserve that ownership while providing the extra CPU
