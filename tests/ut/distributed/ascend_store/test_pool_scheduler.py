@@ -97,6 +97,18 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(scheduler.hash_block_size, 16)
         self.assertEqual(scheduler.cache_transfer_granularity, 16)
 
+    def test_pooling_without_kvpp_preserves_dcp_block_scaling(self):
+        for use_v2 in (False, True):
+            with self.subTest(use_v2=use_v2):
+                config = self._make_config(extra_config={"backend": "memcache"})
+                config.additional_config = {}
+                config.use_v2_model_runner = use_v2
+                config.parallel_config.decode_context_parallel_size = 2
+                scheduler = KVPoolScheduler(config, use_layerwise=False)
+                self.assertEqual(scheduler.grouped_block_size, [32])
+                self.assertEqual(scheduler.hash_block_size, 32)
+                self.assertEqual(scheduler.cache_transfer_granularity, 32)
+
     def test_mooncake_layerwise_rejects_tp_mismatch(self):
         config = self._make_config(
             kv_role="kv_consumer",
