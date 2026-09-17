@@ -29,6 +29,7 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
     AscendSFAMetadataBuilder,
+    PreprocessType,
     SFAForwardContext,
 )
 from vllm_ascend.weight_switch import (
@@ -651,26 +652,69 @@ def test_sfa_dcp_split_uses_builder_config_without_current_context(is_consumer, 
     assert common.block_table_tensor is blocks
 
 
-@pytest.mark.parametrize("enable_c8", [False, True])
-@pytest.mark.parametrize("num_prefills", [0, 1])
-def test_sfa_pcp_dcp_full_slots_only_for_deferred_c8_prefill(enable_c8, num_prefills):
-    impl = AscendSFAPCPDCPImpl.__new__(AscendSFAPCPDCPImpl)
-    impl.enable_sparse_sfa_c8 = enable_c8
-    metadata = AscendSFADCPMetadata.__new__(AscendSFADCPMetadata)
-    metadata.num_input_tokens = 2
-    metadata.num_prefills = num_prefills
+@pytest.mark.parametrize(
+    "enable_c8,pcp_size,has_dcp,num_prefills,has_dsa,expect_full",
+    [
+        (True, 2, True, 1, False, True),
+        (False, 2, True, 1, False, False),
+        (True, 2, True, 0, False, False),
+        (True, 1, True, 1, False, False),
+        (True, 2, False, 1, False, False),
+        (True, 2, True, 1, True, False),
+    ],
+)
+def test_sfa_forward_selects_full_slots_only_for_pcp_dcp_c8_prefill(
+    enable_c8, pcp_size, has_dcp, num_prefills, has_dsa, expect_full
+):
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    hidden = torch.zeros(2, 4)
     full_slots = torch.tensor([3200, -1, 3201, -1], dtype=torch.int32)
-    metadata.dcp_context = SimpleNamespace(slot_mapping=full_slots)
-    local_slots = impl._get_sfa_kv_slot_mapping(metadata)
-    assert local_slots.tolist() == [3200, -1]
-    expected = (None, None)
-
-    with patch.object(AscendSFADCPImpl, "_store_parallel_kv", return_value=expected) as store:
-        result = impl._store_parallel_kv(
-            None, None, None, None, [], None, local_slots, metadata, False
-        )
-
-    assert result is expected
-    expected_slots = full_slots if enable_c8 and num_prefills else local_slots
-    assert store.call_args.args[6] is expected_slots
-    assert store.call_args.args[7] is metadata
+    local_slots = full_slots[:2]
+    metadata = SimpleNamespace(
+        cos=None,
+        sin=None,
+        num_input_tokens=2,
+        num_decode_tokens=0,
+        num_prefills=num_prefills,
+        attn_state=AscendAttentionState.DecodeOnly,
+        dcp_context=SimpleNamespace(slot_mapping=full_slots) if has_dcp else None,
+        dsa_cp_context=SimpleNamespace() if has_dsa else None,
+    )
+    impl.enable_sparse_sfa_c8 = enable_c8
+    impl.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size)
+    )
+    impl.qk_rope_head_dim = 1
+    impl.q_lora_rank = 1
+    impl.kv_lora_rank = 2
+    impl.g_proj = None
+    impl.layer_name = "layer"
+    impl.layerwise_kv_cache_hook = None
+    impl.preprocess_type = PreprocessType.NATIVE
+    impl.has_indexer = False
+    impl.skip_topk = True
+    impl._compose_sfa_kv_cache = lambda cache: cache
+    impl._get_sfa_kv_slot_mapping = lambda _: local_slots
+    impl._get_indexer_attn_metadata = lambda: None
+    impl._get_parallel_forward_context = lambda *_: SFAForwardContext([2], [2], local_slots, 2)
+    impl._prepare_native_hidden_states = lambda x, _: x
+    impl.fused_qkv_a_proj = lambda x: (x,)
+    impl.q_a_layernorm = torch.nn.Identity()
+    impl.exec_kv = lambda *_: (hidden, hidden, hidden)
+    impl._prepare_kv_for_parallel = lambda *_: (None, [])
+    impl._q_proj_and_k_up_proj = lambda _: (hidden, hidden)
+    impl.rope_single = lambda x, *_: x
+    impl._record_query_gather_context = lambda *_: None
+    impl._store_parallel_kv = Mock(return_value=(hidden, hidden))
+    impl._get_indexcache_topk_indices = lambda _: None
+    impl._execute_sparse_flash_attention_process = lambda *_: hidden
+    impl._v_up_proj = lambda x: x
+    impl._finalize_o_proj = lambda x, output, _: output.copy_(x)
+    with (
+        patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector"),
+        patch("vllm_ascend.attention.sfa_v1.notify_kv_cache_written"),
+        patch("vllm_ascend.attention.sfa_v1.record_attention_compute_start"),
+        patch("vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector"),
+    ):
+        impl.forward("layer", hidden, (hidden,), metadata, torch.empty_like(hidden))
+    assert impl._store_parallel_kv.call_args.args[6] is (full_slots if expect_full else local_slots)

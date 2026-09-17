@@ -1432,35 +1432,6 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
 class AscendSFAPCPDCPImpl(AscendSFADCPImpl, AscendSFAPCPImpl):
     """Composes DCP attention with PCP gathered-token cache writes."""
 
-    def _store_parallel_kv(
-        self,
-        k_pe: torch.Tensor | None,
-        k_nope: torch.Tensor | None,
-        knope_scale: torch.Tensor | None,
-        fused_kv_no_split: torch.Tensor | None,
-        kv_ag_handles: list[torch.distributed.Work],
-        kv_cache: tuple[torch.Tensor, ...] | None,
-        slot_mapping_sfa: torch.Tensor,
-        attn_metadata: M,
-        full_gather_o_proj_enabled: bool,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if self.enable_sparse_sfa_c8 and self._has_prefill(attn_metadata):
-            assert isinstance(attn_metadata, AscendSFADCPMetadata)
-            assert attn_metadata.dcp_context is not None
-            # Deferred C8 writes must cover the PCP-gathered KV rows.
-            slot_mapping_sfa = attn_metadata.dcp_context.slot_mapping
-        return super()._store_parallel_kv(
-            k_pe,
-            k_nope,
-            knope_scale,
-            fused_kv_no_split,
-            kv_ag_handles,
-            kv_cache,
-            slot_mapping_sfa,
-            attn_metadata,
-            full_gather_o_proj_enabled,
-        )
-
     def _start_dcp_query_gather(
         self,
         ql_nope: torch.Tensor,

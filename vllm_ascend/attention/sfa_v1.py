@@ -1712,6 +1712,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata,
             )
 
+            write_slots = self._get_sfa_kv_slot_mapping(attn_metadata)
+            dcp_context = getattr(attn_metadata, "dcp_context", None)
+            if (
+                self.enable_sparse_sfa_c8
+                and self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+                and dcp_context is not None
+                and getattr(attn_metadata, "dsa_cp_context", None) is None
+                and attn_metadata.num_prefills > 0
+            ):
+                # C8 prefill writes follow the full PCP-gathered DCP slot layout.
+                write_slots = dcp_context.slot_mapping
+
             (
                 k_pe,
                 k_nope,
@@ -1722,7 +1734,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 fused_kv_no_split,
                 kv_ag_handles,
                 kv_cache,
-                self._get_sfa_kv_slot_mapping(attn_metadata),
+                write_slots,
                 attn_metadata,
                 parallel_context.gather_full_o_proj,
             )
