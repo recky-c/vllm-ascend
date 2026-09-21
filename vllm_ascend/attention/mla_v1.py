@@ -46,6 +46,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
+from vllm_ascend.kvpp_config import KVPPConfig, get_kvpp_offload_config
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.quantization.methods.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.quantization.methods.w8a8_static import AscendW8A8LinearMethod
@@ -709,6 +710,10 @@ class AscendMLAImpl(MLAAttentionImpl):
     ):
         self.vllm_config = get_current_vllm_config()
         self.layerwise_kv_cache_hook: Any = None
+        self.kvpp_offload = (
+            KVPPConfig.from_vllm_config(self.vllm_config).size > 1
+            and get_kvpp_offload_config(self.vllm_config) is not None
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1571,6 +1576,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             handle = torch.npu.graph_task_group_end(stream)
             graph_params.handles[num_tokens].append(handle)
         else:
+            if self.kvpp_offload:
+                record_attention_compute_start()
             attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope, **common_kwargs)
 
         if self.head_padding > 0:
@@ -1657,7 +1664,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         decode_preprocess_res = None
         prefill_preprocess_res = None
-        if has_prefill:
+        if has_prefill or (self.kvpp_offload and has_decode):
             wait_for_kv_layer_from_connector(layer_name)
         if self.layerwise_kv_cache_hook is not None and (has_decode or has_prefill):
             # Q/KV projections above run on the compute stream while the
@@ -1741,6 +1748,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
+            if self.kvpp_offload:
+                wait_for_kv_layer_from_connector(layer_name)
             if self.layerwise_kv_cache_hook is not None:
                 self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
             decode_preprocess_res, prefill_preprocess_res = DeviceOperator.mla_preprocess_only_decode(

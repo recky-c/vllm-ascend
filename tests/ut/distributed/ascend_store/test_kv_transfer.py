@@ -370,6 +370,47 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
         self.assertFalse(save_finished[0].is_set())
         self.assertTrue(load_finished[1].is_set())
 
+    def test_cancel_interrupts_save_and_attention_dependencies(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        for dependency in ("save", "attention"):
+            with self.subTest(dependency=dependency):
+                thread, loaded, saved, _ = self._make_thread()
+                entered = threading.Event()
+                cancelled = threading.Event()
+
+                def check(entered=entered, cancelled=cancelled):
+                    entered.set()
+                    if cancelled.is_set():
+                        raise RuntimeError("offload cancelled")
+
+                thread.check_dependencies = check
+                transfer = LayerTransferTask(
+                    layer_id=1,
+                    block_ranges=[],
+                    shared_block_data=SharedBlockData(
+                        block_ids_arr=np.asarray([0]),
+                        block_gvas_arr=np.asarray([100]),
+                        req_ids=["r1"],
+                        is_last_chunks=[False],
+                    ),
+                )
+                task = LayerLoadTask(
+                    wait_for_save_layer=0 if dependency == "save" else None,
+                    transfer_tasks=[] if dependency == "save" else [transfer],
+                    layer_id=1,
+                    attention_start_gate=threading.Event(),
+                )
+                thread.request_queue.put(task)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(thread._handle_request, task)
+                    self.assertTrue(entered.wait(timeout=2))
+                    cancelled.set()
+                    with self.assertRaisesRegex(RuntimeError, "offload cancelled"):
+                        future.result(timeout=2)
+                self.assertFalse(loaded[1].is_set())
+                thread.m_store.store.batch_copy.assert_not_called()
+
 
 class TestKVCacheStoreSendingThread(unittest.TestCase):
     def _make_thread(self, exists_result=None, kv_role="kv_producer", enable_kv_event=False):

@@ -283,7 +283,7 @@ The initial vLLM Ascend implementation requires:
 | DCP | Disabled when KVPP is enabled |
 | DSA-CP | Deferred pending SP validation |
 | Speculative decoding | Fixed-step MTP in eager mode |
-| KV connectors and offload | Disabled |
+| KV connectors and offload | Adapted Mooncake producer connectors; experimental Memcache layerwise producer path below |
 | MemFabric protocol | MTE |
 
 Unsupported combinations fail during configuration or cache initialization
@@ -338,3 +338,104 @@ vLLM Ascend:
 - MemFabric MTE transport:
   `vllm_ascend/distributed/kv_transfer/kv_pool/memfabric_mte_transport.py`
 - MLA attention integration: `vllm_ascend/attention/mla_v1.py`
+
+
+## Experimental P-side layerwise offload
+
+The direct `AscendStoreConnector` Memcache producer path can compose its
+layerwise H2D loads with KVPP. This implementation requires Model Runner V1,
+eager execution, PP=1, no speculative decoding, and the existing non-hybrid
+MLA/SFA KVPP model constraints. `MultiConnector` and Remote D2H composition are
+not enabled by this change. End-to-end accuracy and overlap measurements are
+required before production use.
+
+Use `kv_role: "kv_producer"` with these connector extra settings:
+
+```json
+{
+  "backend": "memcache",
+  "use_layerwise": true,
+  "layerwise_num_shared_buffers": 3,
+  "layerwise_prefetch_layers": 3
+}
+```
+
+The owner buffer count defaults to three per compatible cache layout; it can
+be increased. The prefetch window is fixed at three including the current
+layer. Do not set `layerwise_independent_layers`: KVPP owns the allocation plan.
+Each rank has a separate owner H2D buffer pool and two non-owner receive buffers
+per layout. Block-count planning accounts for both pools before allocation.
+
+| Current attention | KVPP transfer | Offload H2D |
+| --- | --- | --- |
+| L | L+1 | L+2 |
+| L+1 | L+2 | L+3 |
+
+Startup enqueues layers 0 and 1 without an attention-start gate. At each layer,
+the connector submits through L+2 in global execution order, including empty
+non-owner reuse tasks. Only owner ranks execute H2D for their layers. The KVPP
+communication worker waits for the layer's load/reuse event before publishing
+peer readiness or pushing data. The compute thread does not wait for future
+H2D while launching the next KVPP transfer. Completion events remain visible to
+both consumers until the next forward.
+
+D2H deliberately retains AscendStore's existing single-writer protocol. Its
+writer saves every computed layer, including non-owner layers received through
+KVPP, and publishes the shared Memcache object after its final write. It does
+not duplicate saves on every TP rank. Distributing these writes among KVPP
+owners would additionally require a cross-owner object publication protocol.
+A receive buffer is not reused until its preceding layer's save and compute
+have completed. Reuse dependencies come from the actual KVPP tensor aliases,
+not the original all-layer offload layout.
+
+All managed layers, including layer 0, restore their history from host across
+chunked prefill steps. Read leases are released at the end of the forward even
+on ranks that do not own the last layer.
+
+### Initial device smoke validation
+
+A TP=2, KVPP=2 DeepSeek-V2-Lite-W8A8 device smoke compared the baseline,
+layerwise offload, and their KVPP composition. Two 1162-1163-token prompts
+with a 512-token prefill chunk size produced identical 12-token continuations
+in all three configurations. Each token was obtained by a separate producer
+prefill request with the previously generated tokens appended; this did not
+exercise a complete P/D deployment or continuous decode on D.
+
+Real Memcache copy instrumentation recorded owner-only H2D on rank 0 for
+layers 0-13 and rank 1 for layers 14-26, with no transfer errors. D2H retained
+the single-writer protocol. The smoke used current Python sources and existing
+remote native libraries whose KVPP kernel sources matched; unrelated native
+operators differed. Full-build validation, concurrent workloads, SFA models,
+and profiler measurements of overlap and performance remain outstanding.
+
+
+### Composition boundaries and regression coverage
+
+MLA short extends classified as decode still advance the connector pipeline.
+Both native preprocess and MLAPO/FA-quant preprocess wait for the layerwise
+load before the KVPP hook and cache writes. Eager decode also records the
+attention-start event, allowing the L+2 host load to make progress.
+
+Offload allocation rotates complete layer bundles. Main-only layers and layers
+with an Indexer have separate pools, and all components of a bundle share one
+reuse predecessor. With enough layers of both kinds, B=3 uses up to ten Main
+slots and five Indexer slots per rank. This is deliberately more conservative
+than independently rotating each component; budget planning uses those same
+physical allocations.
+
+Failed H2D or D2H operations propagate to both load-event consumers. Aborting
+an active offload forward signals cancellation before the KVPP future is
+drained. CPU save/attention/load waits observe that signal; the worker must be
+restarted after cancellation rather than reusing partially updated cache.
+This does not interrupt an already-blocked device synchronization or a failed
+process-group operation. Forced-attention dummy runs are explicitly rejected
+for the combined configuration because they lack a connector load lifecycle.
+Normal eager dummy runs remain supported.
+
+The focused unit regression set covers configuration, allocation, two complete
+threaded forwards, both MLA decode preprocess paths, cancellation and dummy
+boundaries. The two-card `test_kvpp_layerwise_offload.py` component smoke uses
+36 layers, an Indexer on alternating layers, three forwards and exact tensor
+comparisons. It exercises real NPU copies, fences and MemFabric MTE, with an
+in-memory host-store substitute. It does not validate Memcache GVA publication,
+model token accuracy, a full P/D deployment or performance.

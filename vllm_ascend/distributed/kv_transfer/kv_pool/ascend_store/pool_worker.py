@@ -78,6 +78,8 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
+from vllm_ascend.kvpp_config import KVPP_OFFLOAD_PREFETCH_DISTANCE, KVPPConfig, get_kvpp_offload_config
+from vllm_ascend.v1.core.kv_cache_placement import get_kvpp_layer_owners
 
 # Read lease TTL (ms) for the layerwise load path. batch_add_lease acquires a
 # read lease before batch_copy(G2L); the lease must cover the asynchronous
@@ -121,7 +123,28 @@ class KVPoolWorker:
         self._init_backend(parallel_config, extra_config)
         self._init_kv_events(vllm_config)
         self._init_state_vars()
+        self.kvpp_offload = (
+            get_kvpp_offload_config(vllm_config) is not None and KVPPConfig.from_vllm_config(vllm_config).size > 1
+        )
         self._init_layerwise_config()
+        self._kvpp_offload_cancelled = threading.Event()
+        self.kvpp_layer_owners: dict[int, int] = {}
+        if self.kvpp_offload:
+            assert kv_cache_config is not None
+            owners = get_kvpp_layer_owners(vllm_config, get_layerwise_kv_cache_specs(kv_cache_config))
+            self.kvpp_layer_owners = {self._extract_physical_layer_index(name): owner for name, owner in owners.items()}
+            self.kvpp_rank = self.tp_rank % KVPPConfig.from_vllm_config(vllm_config).size
+            # Use the actual planner aliases, including non-owner receive
+            # buffers: their D2H consumers must finish before the next push.
+            self.prefetch_layer_map = {}
+            for tensor in kv_cache_config.kv_cache_tensors:
+                layers = sorted({self._extract_physical_layer_index(name) for name in tensor.shared_by})
+                for previous, current in zip(layers, layers[1:]):
+                    existing = self.prefetch_layer_map.setdefault(current, previous)
+                    if existing != previous:
+                        raise ValueError("KVPP offload main and indexer buffers have different reuse lifetimes.")
+            self.layerwise_offload = True
+            self.independent_layers = []
 
     def _init_parallelism_info(self, model_config, parallel_config) -> None:
         self.local_rank = envs.LOCAL_RANK
@@ -367,7 +390,7 @@ class KVPoolWorker:
                         effective_num_layers,
                     )
                     self.num_layers = effective_num_layers
-            if self.use_gva_layerwise:
+            if self.use_gva_layerwise and not getattr(self, "kvpp_offload", False):
                 self._layerwise_reuse_layout = build_layerwise_reuse_layout(
                     get_layerwise_kv_cache_specs(self.kv_cache_config),
                     base_layers,
@@ -525,6 +548,7 @@ class KVPoolWorker:
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
+                    check_dependencies=(self._raise_if_kvpp_offload_failed if self.kvpp_offload else None),
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -872,6 +896,13 @@ class KVPoolWorker:
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
+            if getattr(self, "kvpp_offload", False):
+                self._raise_if_kvpp_offload_failed()
+                assert self.layer_load_finished_events is not None
+                # Prior forward consumed every queued layer. Keep completion
+                # events set for both compute and KVPP until this boundary.
+                for event in self.layer_load_finished_events:
+                    event.clear()
             self.next_layer_to_submit = 0
             # Transfer threads receive these lists by reference. Give every
             # step fresh lists so a late clear of a previous step cannot drop
@@ -880,10 +911,12 @@ class KVPoolWorker:
             self.layer_load_tasks = [[] for _ in range(self.num_layers)]
             reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
-        if len(metadata.requests) == 0:
+        if len(metadata.requests) == 0 and not getattr(self, "kvpp_offload", False):
             return
         if self.use_layerwise:
             self.process_layer_data(metadata.requests)
+            if getattr(self, "kvpp_offload", False):
+                self._submit_kvpp_layer_loads(1, gate=None)
             return
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -1668,6 +1701,52 @@ class KVPoolWorker:
             for group_id, layer_idx_in_group in group_layers:
                 self._process_load_for_layer_batch(requests, physical_layer, group_id, layer_idx_in_group)
         self._build_shared_load_data()
+        if getattr(self, "kvpp_offload", False):
+            # All ranks still retain reuse tasks, but only an owner performs
+            # H2D. D2H keeps the existing single-writer Memcache publication
+            # protocol; non-owner writer buffers are protected by the same gate.
+            for layer_id, owner in self.kvpp_layer_owners.items():
+                if owner != self.kvpp_rank:
+                    self.layer_load_tasks[layer_id] = []
+            # Lease cleanup is performed after the whole forward, including
+            # ranks whose last owned layer precedes the model's final layer.
+            self.kv_recv_thread.final_layer_id = -1
+
+    def _submit_kvpp_layer_loads(self, last_layer: int, gate: Any) -> None:
+        assert self.kv_recv_thread is not None
+        while self.next_layer_to_submit <= min(last_layer, self.num_layers - 1):
+            layer_id = self.next_layer_to_submit
+            self.kv_recv_thread.add_request(
+                LayerLoadTask(
+                    wait_for_save_layer=self.prefetch_layer_map.get(layer_id),
+                    transfer_tasks=self.layer_load_tasks[layer_id],
+                    layer_id=layer_id,
+                    attention_start_gate=gate,
+                )
+            )
+            self.next_layer_to_submit += 1
+
+    def abort_kvpp_offload(self) -> None:
+        # Fail closed: an interrupted forward cannot reuse its partial cache.
+        self._kvpp_offload_cancelled.set()
+
+    def _raise_if_kvpp_offload_failed(self) -> None:
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.raise_if_failed()
+        if self.kv_send_thread is not None:
+            self.kv_send_thread.raise_if_failed()
+        if self._kvpp_offload_cancelled.is_set():
+            raise RuntimeError("KVPP layerwise offload was aborted; restart the worker before reuse.")
+
+    def _wait_for_kvpp_layer(self, layer_id: int) -> None:
+        assert self.layer_load_finished_events is not None
+        self._raise_if_kvpp_offload_failed()
+        while not self.layer_load_finished_events[layer_id].wait(timeout=0.1):
+            self._raise_if_kvpp_offload_failed()
+        self._raise_if_kvpp_offload_failed()
+
+    def wait_for_kvpp_cache(self, layer_name: str) -> None:
+        self._wait_for_kvpp_layer(self._extract_physical_layer_index(layer_name))
 
     def _submit_ready_layer_loads(self) -> None:
         assert self.kv_recv_thread is not None
@@ -1704,7 +1783,12 @@ class KVPoolWorker:
         assert self.layer_load_finished_events is not None
         assert self.kv_recv_thread is not None
         self.kv_recv_thread.raise_if_failed()
-        reset_attention_compute_start_gate()
+        gate = reset_attention_compute_start_gate()
+        if getattr(self, "kvpp_offload", False):
+            self._submit_kvpp_layer_loads(self.current_layer + KVPP_OFFLOAD_PREFETCH_DISTANCE, gate)
+            self._wait_for_kvpp_layer(self.current_layer)
+            # KVPP reads this same completion from a background thread.
+            return
         self._submit_ready_layer_loads()
         should_wait = bool(self.layer_load_tasks[self.current_layer]) or self.current_layer in self.prefetch_layer_map
         if not should_wait:
@@ -1748,6 +1832,16 @@ class KVPoolWorker:
                 if self.layer_save_finished_events[layer_id].is_set():
                     self.layer_save_finished_events[layer_id].clear()
 
+        if getattr(self, "kvpp_offload", False) and self.current_layer == self.num_layers - 1:
+            keys = list(
+                dict.fromkeys(key for request in connector_metadata.requests for key in (request.load_keys or ()))
+            )
+            if keys:
+                self.m_store.batch_remove_lease(keys)
+            assert self.kv_recv_thread is not None
+            for request in connector_metadata.requests:
+                if request.is_last_chunk and request.load_spec is not None and request.load_spec.can_load:
+                    self.kv_recv_thread.set_finished_request(request.req_id)
         self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):

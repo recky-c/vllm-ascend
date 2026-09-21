@@ -899,3 +899,20 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKVPPDummyAttentionBoundary(unittest.TestCase):
+    @patch("vllm_ascend.worker.model_runner_v1.get_kvpp_offload_config")
+    def test_only_combined_forced_attention_is_rejected(self, offload_config):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.vllm_config = MagicMock()
+        runner.kvpp_size = 2
+        offload_config.return_value = object()
+        self.assertFalse(runner._should_build_dummy_attn_metadata())
+        with self.assertRaisesRegex(ValueError, "forced attention"):
+            runner._should_build_dummy_attn_metadata(force_attention=True)
+        runner.kvpp_size = 1
+        self.assertTrue(runner._should_build_dummy_attn_metadata(force_attention=True))
+        runner.kvpp_size = 2
+        offload_config.return_value = None
+        self.assertTrue(runner._should_build_dummy_attn_metadata(force_attention=True))

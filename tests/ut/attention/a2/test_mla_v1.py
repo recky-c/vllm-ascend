@@ -997,6 +997,84 @@ class TestAscendMLAImpl(TestBase):
         )
         self.impl.fa_quant_layer = False
 
+    @patch("vllm_ascend.attention.mla_v1.notify_kv_cache_written")
+    @patch("vllm_ascend.attention.mla_v1.wait_for_kv_layer_from_connector")
+    @patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad", side_effect=lambda x, _: x)
+    def test_kvpp_offload_short_extend_loads_before_native_cache_write(self, gather, wait, notify):
+        self.impl.fused_qkv_a_proj = None
+        self.impl.kv_a_proj_with_mqa.return_value = (torch.zeros(1, 64),)
+        metadata = MagicMock(num_decodes=1, num_prefills=0)
+        for enabled in (False, True):
+            with self.subTest(offload=enabled):
+                order = []
+                self.impl.kvpp_offload = enabled
+                self.impl.layerwise_kv_cache_hook = MagicMock()
+                wait.side_effect = lambda _, order=order: order.append("load")
+                self.impl.layerwise_kv_cache_hook.wait_for_layer.side_effect = lambda _, order=order: order.append(
+                    "kvpp"
+                )
+                self.impl.mla_preprocess_decode = MagicMock(
+                    side_effect=lambda *args, order=order: order.append("write")
+                )
+                self.impl._mla_preprocess("model.layers.0.attn", torch.zeros(1, 64), [], metadata, False)
+                self.assertEqual(order, (["load"] if enabled else []) + ["kvpp", "write"])
+
+    @patch("vllm_ascend.attention.mla_v1.wait_for_kv_layer_from_connector")
+    @patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad", side_effect=lambda x, _: x)
+    def test_kvpp_offload_fused_decode_waits_before_cache_write(self, gather, wait):
+        self.impl.kvpp_offload = True
+        metadata = MagicMock(num_decodes=1, num_prefills=0, num_decode_tokens=1, num_actual_tokens=1)
+        for fa_quant, mlapo in ((True, False), (False, True)):
+            with self.subTest(fa_quant=fa_quant, mlapo=mlapo):
+                order = []
+                self.impl.fa_quant_layer = fa_quant
+                self.impl.enable_mlapo = mlapo
+                self.impl.layerwise_kv_cache_hook = MagicMock()
+                wait.side_effect = lambda _, order=order: order.append("load")
+                self.impl.layerwise_kv_cache_hook.wait_for_layer.side_effect = lambda _, order=order: order.append(
+                    "kvpp"
+                )
+
+                def cache_write(*args, order=order):
+                    order.append("write")
+                    raise RuntimeError("cache write reached")
+
+                with (
+                    patch("vllm_ascend.attention.mla_v1._EXTRA_CTX", num_tokens=1),
+                    patch(
+                        "vllm_ascend.attention.mla_v1.DeviceOperator.mla_preprocess_only_decode",
+                        side_effect=cache_write,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "cache write reached"),
+                ):
+                    self.impl.forward(
+                        "model.layers.0.attn",
+                        torch.zeros(1, 64),
+                        [],
+                        metadata,
+                        output=torch.zeros(1, 64),
+                    )
+                self.assertEqual(order, ["load", "kvpp", "write"])
+
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1.record_attention_compute_start")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2")
+    def test_kvpp_offload_decode_opens_prefetch_gate_before_attention(self, attention, gate, context):
+        self.impl.enable_kv_nz = False
+        self.impl._v_up_proj = MagicMock()
+        context.return_value = MagicMock(capturing=False)
+        metadata = MagicMock()
+        q_nope = torch.zeros(1, self.impl.num_heads, self.impl.kv_lora_rank)
+        q_pe = torch.zeros(1, self.impl.num_heads, self.impl.qk_rope_head_dim)
+        for enabled in (False, True):
+            with self.subTest(offload=enabled):
+                order = []
+                self.impl.kvpp_offload = enabled
+                gate.side_effect = lambda order=order: order.append("gate")
+                attention.side_effect = lambda *args, order=order, **kwargs: (order.append("attention"), None)
+                self.impl._forward_decode(q_nope, q_pe, q_nope, q_pe, 16, metadata)
+                self.assertEqual(order, (["gate"] if enabled else []) + ["attention"])
+
     def test_init(self):
         self.assertEqual(self.impl.num_heads, 256)
         self.assertEqual(self.impl.head_size, 1024)
@@ -1021,7 +1099,7 @@ class TestAscendMLAImpl(TestBase):
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     def test_init_head_padding_for_non_power_of_two(self, mock_get_current_vllm_config):
         """Test head padding computation for num_heads that are not power of 2 (e.g. GLM-4.7-Flash with 20 heads)."""
-        mock_get_current_vllm_config.return_value = MagicMock()
+        mock_get_current_vllm_config.return_value = MagicMock(additional_config={})
         kwargs = {
             "kv_lora_rank": 32,
             "qk_nope_head_dim": 64,
@@ -1479,7 +1557,7 @@ class TestAscendMLAImpl(TestBase):
     @patch("torch_npu.npu_fused_infer_attention_score")
     def test_forward_prefill_non_power_of_two_heads(self, mock_fia, mock_device_operator, mock_get_current_vllm_config):
         """Test prefill with non-power-of-2 heads uses concat instead of query_rope/key_rope kwargs."""
-        mock_get_current_vllm_config.return_value = MagicMock()
+        mock_get_current_vllm_config.return_value = MagicMock(additional_config={})
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 32,
@@ -1825,7 +1903,7 @@ class TestAscendMLAImpl(TestBase):
         self, mock_fia, mock_update, mock_load, mock_get_current_vllm_config
     ):
         """Test prefill context with non-power-of-2 heads uses concat for query and key."""
-        mock_get_current_vllm_config.return_value = MagicMock()
+        mock_get_current_vllm_config.return_value = MagicMock(additional_config={})
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 32,
@@ -2108,7 +2186,7 @@ class TestAscendMLAImpl(TestBase):
         self, mock_npu_fused_infer_attention_score_v2, mock_get_forward_context, mock_get_current_vllm_config
     ):
         """Test decode with non-power-of-2 heads pads to next power of 2 and slices output."""
-        mock_get_current_vllm_config.return_value = MagicMock()
+        mock_get_current_vllm_config.return_value = MagicMock(additional_config={})
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 256,
@@ -2182,7 +2260,7 @@ class TestAscendMLAImpl(TestBase):
         self, mock_npu_fused_infer_attention_score_v2, mock_get_forward_context, mock_get_current_vllm_config
     ):
         """Test normal decode (BNSD_NBSD) with non-power-of-2 heads pads q and slices output."""
-        mock_get_current_vllm_config.return_value = MagicMock()
+        mock_get_current_vllm_config.return_value = MagicMock(additional_config={})
         num_heads = 20
         kwargs = {
             "kv_lora_rank": 256,

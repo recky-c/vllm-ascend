@@ -14,6 +14,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.kvpp_config import KVPPConfig, get_kvpp_offload_config
+
 _NUM_SHARED_BUFFERS = "layerwise_num_shared_buffers"
 _PREFETCH_LAYERS = "layerwise_prefetch_layers"
 _INDEPENDENT_LAYERS = "layerwise_independent_layers"
@@ -283,6 +285,11 @@ def apply_layerwise_kv_cache_plan(
     """Rewrite logical layer tensors to use shared physical KV buffers."""
     extra_config = get_gva_layerwise_config(vllm_config.kv_transfer_config)
     if extra_config is None:
+        return
+
+    if KVPPConfig.from_vllm_config(vllm_config).size > 1 and get_kvpp_offload_config(vllm_config) is not None:
+        # KVPP placement already planned separate owner and peer buffer pools
+        # before block-count selection. Do not merge its aliases a second time.
         return
 
     old_tensors = kv_cache_config.kv_cache_tensors

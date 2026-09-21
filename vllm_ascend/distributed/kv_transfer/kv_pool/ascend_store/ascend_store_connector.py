@@ -226,6 +226,13 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self.connector_worker.start_load_kv(metadata)
 
+    def abort_kvpp_offload(self) -> None:
+        self.connector_worker.abort_kvpp_offload()
+
+    def wait_for_kvpp_cache(self, layer_name: str) -> None:
+        """Wait in KVPP's communication worker without consuming the event."""
+        self.connector_worker.wait_for_kvpp_cache(layer_name)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return

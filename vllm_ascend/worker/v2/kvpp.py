@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -52,7 +53,9 @@ class KVPPExecutionPlan:
                     raise ValueError(f"KVPP execution layer {layer_name} has no KV cache owner.")
                 layer_index = extract_layer_index(layer_name)
                 if layer_index in claimed_indices:
-                    raise ValueError(f"KVPP received multiple executable attention layers for transformer layer {layer_index}.")
+                    raise ValueError(
+                        f"KVPP received multiple executable attention layers for transformer layer {layer_index}."
+                    )
                 claimed_indices.add(layer_index)
                 cache_bundles[layer_name] = tuple(cache_layers_by_index[layer_index])
 
@@ -77,19 +80,13 @@ def get_kvpp_managed_group_index(
     layer_owners: dict[str, int],
 ) -> int:
     managed_layers = set(layer_owners)
-    configured_layers = {
-        layer_name
-        for group in kv_cache_groups
-        for layer_name in group.layer_names
-    }
+    configured_layers = {layer_name for group in kv_cache_groups for layer_name in group.layer_names}
     missing_layers = managed_layers - configured_layers
     if missing_layers:
         raise ValueError(f"KVPP-owned cache layers are missing from KV cache groups: {sorted(missing_layers)}.")
 
     managed_group_indices = {
-        index
-        for index, group in enumerate(kv_cache_groups)
-        if managed_layers.intersection(group.layer_names)
+        index for index, group in enumerate(kv_cache_groups) if managed_layers.intersection(group.layer_names)
     }
     if len(managed_group_indices) != 1:
         raise ValueError(
@@ -117,25 +114,17 @@ def _active_pages(
             "capacity bound never introduces a device-to-host synchronization."
         )
     table_columns = block_table.shape[1]
-    host_lengths = torch.as_tensor(
-        seq_lens, dtype=torch.int64, device="cpu"
-    ).flatten()
+    host_lengths = torch.as_tensor(seq_lens, dtype=torch.int64, device="cpu").flatten()
     pages_per_request_host = torch.div(
         host_lengths + block_size - 1,
         block_size,
         rounding_mode="floor",
     ).clamp_(min=0, max=table_columns)
-    count_upper_bound = min(
-        num_blocks, int(pages_per_request_host.sum().item())
-    )
+    count_upper_bound = min(num_blocks, int(pages_per_request_host.sum().item()))
     lengths = host_lengths.to(device=block_table.device)
     table = block_table[: lengths.shape[0]].to(dtype=torch.int64)
-    columns = torch.arange(
-        table.shape[1], dtype=torch.int64, device=block_table.device
-    )
-    pages_per_request = torch.div(
-        lengths + block_size - 1, block_size, rounding_mode="floor"
-    )
+    columns = torch.arange(table.shape[1], dtype=torch.int64, device=block_table.device)
+    pages_per_request = torch.div(lengths + block_size - 1, block_size, rounding_mode="floor")
     covered = columns.unsqueeze(0) < pages_per_request.unsqueeze(1)
     valid = covered & (table >= 0) & (table < num_blocks)
     sentinel = torch.full_like(table, num_blocks)
@@ -176,15 +165,17 @@ class KVPPScheduler:
         block_size: int,
         transport: MemFabricMTEKVPPTransport,
         execution_layers: tuple[str, ...] | None = None,
+        wait_for_cache: Callable[[str], None] | None = None,
+        abort_cache: Callable[[], None] | None = None,
     ) -> None:
         self.group = group
         self.layer_owners = layer_owners
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.transport = transport
-        self.plan = KVPPExecutionPlan.build(
-            self.layer_owners, execution_layers
-        )
+        self._wait_for_cache = wait_for_cache
+        self._abort_cache = abort_cache
+        self.plan = KVPPExecutionPlan.build(self.layer_owners, execution_layers)
         self._phase = KVPPPhase.IDLE
         self._next_layer_index = 0
         self._selected_pages: KVPPActivePages | None = None
@@ -203,9 +194,7 @@ class KVPPScheduler:
             self._comm_stream = torch.npu.Stream()
             # One transfer may be in flight. Serializing jobs also preserves
             # point-to-point notification order when layer ownership changes.
-            self._executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="kvpp-prefetch"
-            )
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvpp-prefetch")
 
     def _validate_plan_across_ranks(self) -> None:
         """Fail before transport setup if ranks disagree on bundle layout."""
@@ -225,11 +214,7 @@ class KVPPScheduler:
             signature,
             group=self.group.cpu_group,
         )
-        mismatched_ranks = [
-            rank
-            for rank, peer_signature in enumerate(peer_signatures)
-            if peer_signature != signature
-        ]
+        mismatched_ranks = [rank for rank, peer_signature in enumerate(peer_signatures) if peer_signature != signature]
         if mismatched_ranks:
             raise RuntimeError(
                 "KVPP execution plans differ across ranks; refusing to start "
@@ -246,9 +231,7 @@ class KVPPScheduler:
         block_table: torch.Tensor,
         seq_lens: Any,
     ) -> None:
-        active_pages = _active_pages(
-            block_table, seq_lens, self.block_size, self.num_blocks
-        )
+        active_pages = _active_pages(block_table, seq_lens, self.block_size, self.num_blocks)
         self._begin_forward(active_pages)
 
     def _begin_forward(self, active_pages: KVPPActivePages) -> None:
@@ -275,6 +258,8 @@ class KVPPScheduler:
 
     def abort_batch(self) -> None:
         """Drain in-flight work and reset state after a failed/short forward."""
+        if self._abort_cache is not None and self._phase is not KVPPPhase.IDLE:
+            self._abort_cache()
         if self._transfer_future is not None:
             with suppress(BaseException):
                 self._transfer_future.result()
@@ -309,10 +294,7 @@ class KVPPScheduler:
 
     def wait_for_layer(self, layer_name: str) -> None:
         """Order cache use, then prefetch the next layer before attention."""
-        if (
-            self._phase is not KVPPPhase.LAYER_ENTERED
-            or self._current_layer != layer_name
-        ):
+        if self._phase is not KVPPPhase.LAYER_ENTERED or self._current_layer != layer_name:
             raise RuntimeError(f"No pending KVPP transfer for layer {layer_name}.")
         if self._pending_layer != layer_name:
             raise RuntimeError(f"No pending KVPP prefetch for layer {layer_name}.")
@@ -322,9 +304,7 @@ class KVPPScheduler:
             # because this layer was prefetched while the preceding layer
             # was executing.
             layer_index = extract_layer_index(layer_name)
-            with torch.profiler.record_function(
-                f"kvpp.wait.previous_layer.layer_{layer_index}"
-            ):
+            with torch.profiler.record_function(f"kvpp.wait.previous_layer.layer_{layer_index}"):
                 self._transfer_future.result()
         self._phase = KVPPPhase.LAYER_WAITED
         # The current transfer is remotely visible now. Its buffer is read by
@@ -344,10 +324,7 @@ class KVPPScheduler:
         before this attention. Compute-stream ordering protects reuse when the
         buffer cycles back two layers later.
         """
-        if (
-            self._phase is not KVPPPhase.LAYER_WAITED
-            or self._current_layer != layer_name
-        ):
+        if self._phase is not KVPPPhase.LAYER_WAITED or self._current_layer != layer_name:
             raise RuntimeError(f"KVPP attention for layer {layer_name} finished before its transfer was consumed.")
 
         self._current_layer = None
@@ -371,9 +348,7 @@ class KVPPScheduler:
         scratch_ready.record(torch.npu.current_stream())
         pages = self._selected_pages
         assert pages is not None
-        self._transfer_future = self._executor.submit(
-            self._run_prefetch, layer_name, pages, scratch_ready
-        )
+        self._transfer_future = self._executor.submit(self._run_prefetch, layer_name, pages, scratch_ready)
 
     def _run_prefetch(
         self,
@@ -395,10 +370,13 @@ class KVPPScheduler:
         done_tag = ready_tag + 1
         token = torch.ones(1, dtype=torch.uint8, device="cpu")
 
-        with torch.profiler.record_function(
-            f"kvpp.comm_total.layer_{layer_index}"
-        ):
+        with torch.profiler.record_function(f"kvpp.comm_total.layer_{layer_index}"):
             scratch_ready.synchronize()
+            if self._wait_for_cache is not None:
+                # Owner waits for H2D; peers wait for their previous buffer
+                # consumer/save. Never block the compute thread while starting
+                # the next layer: its H2D may depend on current attention.
+                self._wait_for_cache(layer_name)
 
             if local_rank != owner_rank:
                 dist.send(
@@ -413,16 +391,12 @@ class KVPPScheduler:
                     group=self.group.cpu_group,
                     tag=done_tag,
                 )
-                with torch.profiler.record_function(
-                    f"kvpp.transport_receive.layer_{layer_index}"
-                ):
+                with torch.profiler.record_function(f"kvpp.transport_receive.layer_{layer_index}"):
                     with torch.npu.stream(self._comm_stream):
-                        receive_completion = (
-                            self.transport.receive_active_bundle(
-                                self.plan.cache_bundles[layer_name],
-                                pages,
-                                self._comm_stream,
-                            )
+                        receive_completion = self.transport.receive_active_bundle(
+                            self.plan.cache_bundles[layer_name],
+                            pages,
+                            self._comm_stream,
                         )
                     receive_completion.wait()
                 return
@@ -437,9 +411,7 @@ class KVPPScheduler:
                     tag=ready_tag,
                 )
 
-            with torch.profiler.record_function(
-                f"kvpp.transport_push.layer_{layer_index}"
-            ):
+            with torch.profiler.record_function(f"kvpp.transport_push.layer_{layer_index}"):
                 with torch.npu.stream(self._comm_stream):
                     completion = self.transport.push_active_bundle(
                         self.plan.cache_bundles[layer_name],

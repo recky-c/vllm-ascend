@@ -60,29 +60,17 @@ def test_owner_plan_keeps_mtp_cache_replicated():
 
 
 def test_owner_plan_allows_non_last_pp_stage_without_mtp_cache():
-    target_layers = [
-        f"model.layers.{index}.self_attn.attn" for index in range(2)
-    ]
+    target_layers = [f"model.layers.{index}.self_attn.attn" for index in range(2)]
 
-    owners = get_kvpp_layer_owners(
-        _config(mtp=True, pipeline_parallel_size=2), target_layers
-    )
+    owners = get_kvpp_layer_owners(_config(mtp=True, pipeline_parallel_size=2), target_layers)
 
     assert owners == {target_layers[0]: 0, target_layers[1]: 1}
 
 
 def test_owner_plan_order_is_stable_for_reordered_cache_names():
-    attn_layers = [
-        f"model.layers.{index}.self_attn.attn" for index in range(3)
-    ]
-    indexer_layers = [
-        f"model.layers.{index}.self_attn.indexer.k_cache" for index in range(3)
-    ]
-    names = [
-        name
-        for layer_names in zip(attn_layers, indexer_layers)
-        for name in layer_names
-    ]
+    attn_layers = [f"model.layers.{index}.self_attn.attn" for index in range(3)]
+    indexer_layers = [f"model.layers.{index}.self_attn.indexer.k_cache" for index in range(3)]
+    names = [name for layer_names in zip(attn_layers, indexer_layers) for name in layer_names]
 
     forward = get_kvpp_layer_owners(_config(), names)
     reverse = get_kvpp_layer_owners(_config(), reversed(names))
@@ -97,9 +85,7 @@ def test_allocation_keeps_two_scratch_caches_per_layout():
     group = KVCacheGroupSpec(layer_names, spec)
     owners = dict.fromkeys(layer_names, 1)
 
-    allocation_groups, scratch_aliases = _get_allocation_groups(
-        [group], worker_spec, owners, kvpp_rank=0
-    )
+    allocation_groups, scratch_aliases = _get_allocation_groups([group], worker_spec, owners, kvpp_rank=0)
 
     assert allocation_groups[0].layer_names == layer_names[:2]
     assert scratch_aliases == {
@@ -137,9 +123,7 @@ def _pp_placement_fixture(*, mtp: bool):
 def test_pp0_placement_is_local_and_mtp_free():
     config, global_group, pp0_spec, _ = _pp_placement_fixture(mtp=True)
 
-    groups = get_kv_cache_groups_for_worker(
-        config, [global_group], pp0_spec, worker_index=0
-    )
+    groups = get_kv_cache_groups_for_worker(config, [global_group], pp0_spec, worker_index=0)
     assert groups is not None
     local_layers = groups[0].layer_names
 
@@ -153,9 +137,7 @@ def test_pp1_placement_replicates_mtp_on_every_kvpp_rank():
     mtp_name = "model.layers.8.mtp_block.self_attn.attn"
 
     for worker_index, kvpp_rank in ((8, 0), (9, 1)):
-        groups = get_kv_cache_groups_for_worker(
-            config, [global_group], pp1_spec, worker_index
-        )
+        groups = get_kv_cache_groups_for_worker(config, [global_group], pp1_spec, worker_index)
         assert groups is not None
         # MTP must be allocated in full on every KVPP rank.
         assert mtp_name in groups[0].layer_names
@@ -170,16 +152,13 @@ def test_mtp_never_enters_owners_or_scratch_aliases():
     pp_local = project_kv_cache_groups_to_worker([global_group], pp1_spec)
 
     owners = get_kvpp_layer_owners(config, pp1_spec)
-    _, scratch_aliases = _get_allocation_groups(
-        pp_local, pp1_spec, owners, kvpp_rank=0
-    )
+    _, scratch_aliases = _get_allocation_groups(pp_local, pp1_spec, owners, kvpp_rank=0)
 
     assert mtp_name not in owners
     assert mtp_name not in scratch_aliases
 
 
 def test_projection_keeps_group_index_positions():
-    config = _config()
     target_names = [f"model.layers.{i}.self_attn.attn" for i in range(8)]
     mtp_name = "model.layers.8.mtp_block.self_attn.attn"
     spec = _spec()
@@ -205,9 +184,7 @@ def test_allocation_rejects_foreign_layers_after_projection():
     owners = {layer_names[0]: 0, layer_names[1]: 1}
 
     with pytest.raises(ValueError, match="outside the current PP stage"):
-        _get_allocation_groups(
-            [foreign_group], local_spec, owners, kvpp_rank=0
-        )
+        _get_allocation_groups([foreign_group], local_spec, owners, kvpp_rank=0)
 
 
 def test_worker_kvpp_rank_is_explicit_tp_then_kvpp_reduction():
@@ -218,6 +195,55 @@ def test_worker_kvpp_rank_is_explicit_tp_then_kvpp_reduction():
     assert ranks == [0, 1, 2, 3, 0, 1, 2, 3]
 
     with pytest.raises(ValueError, match="divisible"):
-        _get_worker_kvpp_rank(
-            _config(kvpp_size=3, tensor_parallel_size=8), worker_index=0
-        )
+        _get_worker_kvpp_rank(_config(kvpp_size=3, tensor_parallel_size=8), worker_index=0)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_offload_owner_buffers_are_separate_from_peer_scratch(rank):
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(12)]
+    spec = _spec()
+    owners = {name: i // 6 for i, name in enumerate(names)}
+    groups, aliases = _get_allocation_groups(
+        [KVCacheGroupSpec(names, spec)],
+        dict.fromkeys(names, spec),
+        owners,
+        rank,
+        owner_buffer_count=3,
+    )
+    assert len(groups[0].layer_names) == 5
+    assert sorted(name for members in aliases.values() for name in members) == sorted(names)
+    for members in aliases.values():
+        assert len({owners[name] == rank for name in members}) == 1
+        positions = [names.index(name) for name in members]
+        expected_stride = 3 if owners[members[0]] == rank else 2
+        assert all(b - a == expected_stride for a, b in zip(positions, positions[1:]))
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("owner_buffers", [3, 4])
+def test_offload_sparse_indexer_preserves_one_reuse_dependency(rank, owner_buffers):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    main = [f"model.layers.{i}.self_attn.attn" for i in range(24)]
+    indexer = [f"model.layers.{i}.self_attn.indexer.k_cache" for i in range(0, 24, 2)]
+    main_spec = _spec()
+    indexer_spec = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16)
+    specs = dict.fromkeys(main, main_spec) | dict.fromkeys(indexer, indexer_spec)
+    config = _config(num_hidden_layers=24)
+    owners = get_kvpp_layer_owners(config, specs)
+    group = KVCacheGroupSpec(list(reversed(specs)), UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs))
+    groups, aliases = _get_allocation_groups([group], specs, owners, rank, owner_buffers)
+    assert len(groups[0].layer_names) == 3 * (owner_buffers + 2)
+    assert sorted(name for members in aliases.values() for name in members) == sorted(specs)
+    predecessors = {}
+    for members in aliases.values():
+        assert len({owners[name] == rank for name in members}) == 1
+        layers = [int(name.split(".")[2]) for name in members]
+        assert all((i % 2) == (layers[0] % 2) for i in layers)
+        for previous, current in zip(layers, layers[1:]):
+            assert predecessors.setdefault(current, previous) == previous
+    # Main and optional indexer rotate as one bundle, even across several reuse cycles.
+    for members in aliases.values():
+        if members[0].endswith(".indexer.k_cache"):
+            main_members = [name.replace(".indexer.k_cache", ".attn") for name in members]
+            assert aliases[main_members[0]] == main_members

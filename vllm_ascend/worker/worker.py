@@ -71,6 +71,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     get_host_device_memory_usage_ratio,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.kvpp_config import KVPPConfig
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -542,7 +543,9 @@ class NPUWorker(WorkerBase):
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
 
         extra_config = get_gva_layerwise_config(self.vllm_config.kv_transfer_config)
-        if extra_config is not None:
+        # KVPP's platform planner already counts physical owner/peer buffers.
+        # Scaling the budget again for offload would overallocate HBM.
+        if extra_config is not None and KVPPConfig.from_vllm_config(self.vllm_config).size == 1:
             memory_info = getattr(self, "_gva_layerwise_memory_info", None)
             if memory_info is None:
                 num_layers = self.model_config.get_num_layers(self.parallel_config)
@@ -941,7 +944,7 @@ class NPUWorker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         extra_config = get_gva_layerwise_config(self.vllm_config.kv_transfer_config)
-        if extra_config is not None:
+        if extra_config is not None and KVPPConfig.from_vllm_config(self.vllm_config).size == 1:
             self._gva_layerwise_memory_info = self._get_layerwise_kv_cache_memory_info(
                 kv_cache_spec,
                 extra_config,

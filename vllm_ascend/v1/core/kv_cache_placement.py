@@ -11,7 +11,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.kvpp_config import KVPPConfig
+from vllm_ascend.kvpp_config import KVPP_OFFLOAD_MIN_BUFFERS, KVPPConfig, get_kvpp_offload_config
 
 
 def project_kv_cache_groups_to_worker(
@@ -26,17 +26,12 @@ def project_kv_cache_groups_to_worker(
     """
     projected_groups: list[KVCacheGroupSpec] = []
     for group in global_groups:
-        worker_layer_names = [
-            layer_name for layer_name in group.layer_names if layer_name in worker_spec
-        ]
+        worker_layer_names = [layer_name for layer_name in group.layer_names if layer_name in worker_spec]
         group_spec = group.kv_cache_spec
         if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
             group_spec = UniformTypeKVCacheSpecs(
                 block_size=group_spec.block_size,
-                kv_cache_specs={
-                    layer_name: group_spec.kv_cache_specs[layer_name]
-                    for layer_name in worker_layer_names
-                },
+                kv_cache_specs={layer_name: group_spec.kv_cache_specs[layer_name] for layer_name in worker_layer_names},
             )
         projected_groups.append(
             KVCacheGroupSpec(
@@ -48,9 +43,7 @@ def project_kv_cache_groups_to_worker(
     return projected_groups
 
 
-def _get_replicated_mtp_layers(
-    vllm_config: VllmConfig, local_layer_names: Iterable[str]
-) -> set[str]:
+def _get_replicated_mtp_layers(vllm_config: VllmConfig, local_layer_names: Iterable[str]) -> set[str]:
     """Find MTP KV-cache layers within the current PP stage's local layers.
 
     This helper only selects MTP names from ``local_layer_names``; it does not
@@ -69,16 +62,10 @@ def _get_replicated_mtp_layers(
             "KVPP with MTP requires num_hidden_layers and a positive num_nextn_predict_layers in the model config."
         )
     mtp_end = mtp_start + num_mtp_layers
-    return {
-        layer_name
-        for layer_name in local_layer_names
-        if mtp_start <= extract_layer_index(layer_name) < mtp_end
-    }
+    return {layer_name for layer_name in local_layer_names if mtp_start <= extract_layer_index(layer_name) < mtp_end}
 
 
-def get_kvpp_layer_owners(
-    vllm_config: VllmConfig, local_layer_names: Iterable[str]
-) -> dict[str, int]:
+def get_kvpp_layer_owners(vllm_config: VllmConfig, local_layer_names: Iterable[str]) -> dict[str, int]:
     """Partition PP-local Target KV layers across KVPP ranks.
 
     ``local_layer_names`` must already be PP-local (typically the keys of the
@@ -89,9 +76,7 @@ def get_kvpp_layer_owners(
     # Workers are separate Python processes and may receive layer names from
     # sets or differently ordered dictionaries. Keep both owner insertion
     # order and per-layer cache-bundle order identical on every rank.
-    local_layer_names = tuple(
-        sorted(local_layer_names, key=lambda name: (extract_layer_index(name), name))
-    )
+    local_layer_names = tuple(sorted(local_layer_names, key=lambda name: (extract_layer_index(name), name)))
     replicated_layers = _get_replicated_mtp_layers(vllm_config, local_layer_names)
     layers_by_index: dict[int, list[str]] = defaultdict(list)
     for layer_name in local_layer_names:
@@ -100,7 +85,9 @@ def get_kvpp_layer_owners(
 
     layer_indices = sorted(layers_by_index)
     if len(layer_indices) < kvpp_size:
-        raise ValueError(f"KVPP size ({kvpp_size}) exceeds the number of KV cache layer bundles ({len(layer_indices)}).")
+        raise ValueError(
+            f"KVPP size ({kvpp_size}) exceeds the number of KV cache layer bundles ({len(layer_indices)})."
+        )
 
     base, remainder = divmod(len(layer_indices), kvpp_size)
     owners: dict[str, int] = {}
@@ -128,11 +115,47 @@ def _get_worker_kvpp_rank(
     tp_size = parallel_config.tensor_parallel_size
     kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size
     if tp_size % kvpp_size != 0:
-        raise ValueError(
-            f"tensor_parallel_size ({tp_size}) must be divisible by kvpp_size ({kvpp_size})."
-        )
+        raise ValueError(f"tensor_parallel_size ({tp_size}) must be divisible by kvpp_size ({kvpp_size}).")
     tp_rank = worker_index % tp_size
     return tp_rank % kvpp_size
+
+
+def _get_offload_buffer_aliases(
+    layer_names: list[str],
+    worker_spec: dict[str, KVCacheSpec],
+    owners: dict[str, int],
+    kvpp_rank: int,
+    owner_buffer_count: int,
+) -> dict[str, list[str]]:
+    """Rotate whole layer bundles so every component has one reuse predecessor."""
+    layers: dict[int, list[str]] = defaultdict(list)
+    for name in sorted(layer_names):
+        layers[extract_layer_index(name)].append(name)
+
+    aliases: dict[str, list[str]] = {}
+    for owned, buffer_count in ((False, 2), (True, owner_buffer_count)):
+        layouts: list[tuple[tuple[tuple[bool, KVCacheSpec], ...], list[list[str]]]] = []
+        for layer_index in sorted(layers):
+            names = layers[layer_index]
+            bundle_owners = {owners[name] for name in names}
+            if len(bundle_owners) != 1:
+                raise ValueError(f"KVPP layer {layer_index} has inconsistent cache component owners.")
+            if (owners[names[0]] == kvpp_rank) != owned:
+                continue
+            signature = tuple((name.endswith(".indexer.k_cache"), worker_spec[name]) for name in names)
+            for layout, bundles in layouts:
+                if layout == signature:
+                    bundles.append(names)
+                    break
+            else:
+                layouts.append((signature, [names]))
+        for _, bundles in layouts:
+            num_buffers = min(buffer_count, len(bundles))
+            for slot in range(num_buffers):
+                members = bundles[slot::num_buffers]
+                for component, representative in enumerate(members[0]):
+                    aliases[representative] = [bundle[component] for bundle in members]
+    return aliases
 
 
 def _get_allocation_groups(
@@ -140,19 +163,16 @@ def _get_allocation_groups(
     worker_spec: dict[str, KVCacheSpec],
     owners: dict[str, int],
     kvpp_rank: int,
+    owner_buffer_count: int | None = None,
 ) -> tuple[list[KVCacheGroupSpec], dict[str, list[str]]]:
     """Per-KVPP-rank allocation view over PP-local logical groups.
 
-    Target layers owned by this rank stay persistent; other owners' layers map
-    onto two alternating scratch caches per layout. Layers absent from
+    Target layers owned by this rank stay persistent, or use owner_buffer_count
+    buffers with host offload; other owners' layers use two scratch buffers per
+    layout. Layers absent from
     ``owners`` (replicated MTP) are allocated in full on every KVPP rank.
     """
-    foreign_names = [
-        name
-        for group in logical_groups
-        for name in group.layer_names
-        if name not in worker_spec
-    ]
+    foreign_names = [name for group in logical_groups for name in group.layer_names if name not in worker_spec]
     if foreign_names:
         raise ValueError(
             "KVPP placement received cache layers outside the current PP "
@@ -169,25 +189,35 @@ def _get_allocation_groups(
         allocation_names = [
             name
             for name in local_names
-            if name not in owners or owners[name] == kvpp_rank
+            if name not in owners or (owners[name] == kvpp_rank and owner_buffer_count is None)
         ]
-        scratch_layout_groups: list[list[str]] = []
-        for name in managed_names:
-            if owners[name] == kvpp_rank:
+        if owner_buffer_count is not None:
+            aliases = _get_offload_buffer_aliases(managed_names, worker_spec, owners, kvpp_rank, owner_buffer_count)
+            scratch_aliases.update(aliases)
+            allocation_names.extend(aliases)
+            for layer_name in allocation_names:
+                allocation_spec[layer_name] = worker_spec[layer_name]
+            continue
+        # Owner H2D buffers and peer receive buffers must never alias each
+        # other: H2D is two layers ahead, while peer transfer is one ahead.
+        for owned, buffer_count in ((False, 2), (True, owner_buffer_count)):
+            if buffer_count is None:
                 continue
-            for layout_names in scratch_layout_groups:
-                if worker_spec[name] == worker_spec[layout_names[0]]:
-                    layout_names.append(name)
-                    break
-            else:
-                scratch_layout_groups.append([name])
-        for layout_names in scratch_layout_groups:
-            scratch_names = layout_names[:2]
-            allocation_names.extend(scratch_names)
-            for scratch_index, scratch_name in enumerate(scratch_names):
-                scratch_aliases[scratch_name] = layout_names[
-                    scratch_index :: len(scratch_names)
-                ]
+            layout_groups: list[list[str]] = []
+            for name in managed_names:
+                if (owners[name] == kvpp_rank) != owned:
+                    continue
+                for layout_names in layout_groups:
+                    if worker_spec[name] == worker_spec[layout_names[0]]:
+                        layout_names.append(name)
+                        break
+                else:
+                    layout_groups.append([name])
+            for layout_names in layout_groups:
+                scratch_names = layout_names[:buffer_count]
+                allocation_names.extend(scratch_names)
+                for scratch_index, scratch_name in enumerate(scratch_names):
+                    scratch_aliases[scratch_name] = layout_names[scratch_index :: len(scratch_names)]
         for layer_name in allocation_names:
             allocation_spec[layer_name] = worker_spec[layer_name]
 
@@ -215,8 +245,15 @@ def get_kv_cache_groups_for_worker(
     pp_local_groups = project_kv_cache_groups_to_worker(global_groups, worker_spec)
     owners = get_kvpp_layer_owners(vllm_config, worker_spec)
     kvpp_rank = _get_worker_kvpp_rank(vllm_config, worker_index)
+    offload = get_kvpp_offload_config(vllm_config)
     allocation_groups, _ = _get_allocation_groups(
-        pp_local_groups, worker_spec, owners, kvpp_rank
+        pp_local_groups,
+        worker_spec,
+        owners,
+        kvpp_rank,
+        owner_buffer_count=(
+            offload.get("layerwise_num_shared_buffers", KVPP_OFFLOAD_MIN_BUFFERS) if offload is not None else None
+        ),
     )
     return allocation_groups
 
@@ -240,8 +277,15 @@ def finalize_kv_cache_config(
     pp_local_groups = project_kv_cache_groups_to_worker(global_groups, worker_spec)
     owners = get_kvpp_layer_owners(vllm_config, worker_spec)
     kvpp_rank = _get_worker_kvpp_rank(vllm_config, worker_index)
+    offload = get_kvpp_offload_config(vllm_config)
     _, scratch_aliases = _get_allocation_groups(
-        pp_local_groups, worker_spec, owners, kvpp_rank
+        pp_local_groups,
+        worker_spec,
+        owners,
+        kvpp_rank,
+        owner_buffer_count=(
+            offload.get("layerwise_num_shared_buffers", KVPP_OFFLOAD_MIN_BUFFERS) if offload is not None else None
+        ),
     )
     for tensor in kv_cache_config.kv_cache_tensors:
         expanded_names: list[str] = []

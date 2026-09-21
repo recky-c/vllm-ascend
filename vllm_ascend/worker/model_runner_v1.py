@@ -136,6 +136,9 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
+    MemFabricMTEKVPPTransport,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     allocate_kv_offload_topk_profile_buffers,
@@ -143,11 +146,13 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
     update_sparse_kv_offload_metadata,
 )
+from vllm_ascend.distributed.parallel_state import get_kvpp_group
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
+from vllm_ascend.kvpp_config import KVPPConfig, get_kvpp_offload_config
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
@@ -190,11 +195,6 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     vllm_version_is,
 )
-from vllm_ascend.distributed.parallel_state import get_kvpp_group
-from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
-    MemFabricMTEKVPPTransport,
-)
-from vllm_ascend.kvpp_config import KVPPConfig
 from vllm_ascend.v1.core.kv_cache_placement import (
     get_kvpp_layer_owners,
 )
@@ -3202,7 +3202,14 @@ class NPUModelRunner(GPUModelRunner):
         """
         # If force_attention is True, we always capture attention, Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
-        return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
+        build_metadata = force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
+        if (
+            build_metadata
+            and self.kvpp_size > 1
+            and get_kvpp_offload_config(self.vllm_config) is not None
+        ):
+            raise ValueError("KVPP layerwise offload does not support dummy runs with forced attention.")
+        return build_metadata
 
     @torch.inference_mode()
     def _dummy_run(
@@ -3847,6 +3854,14 @@ class NPUModelRunner(GPUModelRunner):
             block_size=block_size,
             transport=transport,
             execution_layers=tuple(kvpp_impls),
+            wait_for_cache=(
+                get_kv_transfer_group().wait_for_kvpp_cache
+                if get_kvpp_offload_config(self.vllm_config) is not None else None
+            ),
+            abort_cache=(
+                get_kv_transfer_group().abort_kvpp_offload
+                if get_kvpp_offload_config(self.vllm_config) is not None else None
+            ),
         )
         managed_kv_caches = {
             layer_name: kv_caches[layer_name]

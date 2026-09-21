@@ -49,6 +49,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_tp_mismatch_info,
     normalize_block_ids_by_group,
 )
+from vllm_ascend.kvpp_config import KVPPConfig, get_kvpp_offload_config
 
 
 class KVPoolScheduler:
@@ -215,6 +216,10 @@ class KVPoolScheduler:
                     self.num_layers,
                     vllm_config.kv_transfer_config.kv_connector_extra_config,
                 ).has_layer_reuse
+        if get_kvpp_offload_config(vllm_config) is not None and KVPPConfig.from_vllm_config(vllm_config).size > 1:
+            # Even a rank with no local reuse participates in a pipeline where
+            # peer buffers are recycled. Preserve partial KV across chunks.
+            self.layerwise_offload = True
         self.model_name = model_config.model.split("/")[-1]
 
         # Keep this in sync with pool_worker.py because it affects GVA allocation size.

@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import (
     KVPPActivePages,
@@ -14,12 +15,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.memfabric_mte_transport import 
 )
 from vllm_ascend.worker.v2.kvpp import (
     KVPPExecutionPlan,
-    KVPPPhase,
     KVPPScheduler,
     _active_pages,
     get_kvpp_managed_group_index,
 )
-from vllm.model_executor.models.utils import extract_layer_index
 
 
 def test_managed_group_allows_replicated_mtp_groups():
@@ -55,10 +54,7 @@ def test_managed_group_rejects_target_layers_across_groups():
 def test_memfabric_store_url_isolated_per_kvpp_group(ranks, expected):
     group = SimpleNamespace(ranks=ranks, world_size=4)
 
-    assert (
-        _store_url_for_kvpp_group("tcp://127.0.0.1:18008", group)
-        == expected
-    )
+    assert _store_url_for_kvpp_group("tcp://127.0.0.1:18008", group) == expected
 
 
 def test_memfabric_store_url_rejects_noncontiguous_group():
@@ -76,8 +72,7 @@ def test_active_pages_uses_only_pages_covered_by_sequence_lengths():
     pages = _active_pages(block_table, seq_lens, block_size=4, num_blocks=10)
 
     assert pages.page_ids.tolist() == [2, 4, 7, 8, 10, 10, 10, 10]
-    assert pages.valid_mask.tolist() == [True, True, True, True, False, False,
-                                        False, False]
+    assert pages.valid_mask.tolist() == [True, True, True, True, False, False, False, False]
     assert pages.page_ids.device == block_table.device
     assert pages.valid_mask.device == block_table.device
     assert pages.count_upper_bound == 4
@@ -138,9 +133,7 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
     owner._layers = {"layer": (KVPPBufferMetadata(2000, 16, 16),)}
     owner._anchors = {"layer": owner_anchor}
     owner._device_layers = {
-        "layer": _MTEDeviceBufferMetadata(
-            torch.tensor([0]), torch.tensor([16]), torch.tensor([16]), 16
-        )
+        "layer": _MTEDeviceBufferMetadata(torch.tensor([0]), torch.tensor([16]), torch.tensor([16]), 16)
     }
     owner._local_metadata = KVPPMTEPeerMetadata(8000, 1024, 0)
     owner._peer_metadata = [
@@ -173,9 +166,7 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
     consumer._layers = {"layer": (KVPPBufferMetadata(1000, 16, 16),)}
     consumer._anchors = {"layer": consumer_anchor}
     consumer._device_layers = {
-        "layer": _MTEDeviceBufferMetadata(
-            torch.tensor([0]), torch.tensor([16]), torch.tensor([16]), 16
-        )
+        "layer": _MTEDeviceBufferMetadata(torch.tensor([0]), torch.tensor([16]), torch.tensor([16]), 16)
     }
     consumer._local_metadata = KVPPMTEPeerMetadata(8000, 1024, 1)
     consumer._peer_metadata = [
@@ -183,9 +174,7 @@ def test_mte_owner_stages_and_consumer_unpacks_same_active_pages(monkeypatch):
         consumer._local_metadata,
     ]
 
-    consumer.receive_active_bundle(
-        ("layer",), _active_page_tensor(2, 3, 7), stream
-    )
+    consumer.receive_active_bundle(("layer",), _active_page_tensor(2, 3, 7), stream)
     assert calls == [
         (
             consumer_anchor,
@@ -214,14 +203,11 @@ def test_mte_builds_one_device_batch_for_masked_pages_and_multiple_buffers(
     monkeypatch.setattr(
         torch,
         "_assert_async",
-        lambda *args, **kwargs: pytest.fail(
-            "MTE capacity validation must not launch a device assertion"
-        ),
+        lambda *args, **kwargs: pytest.fail("MTE capacity validation must not launch a device assertion"),
     )
     calls = []
 
-    def copy_op(anchor, local_offsets, staging_offsets, lengths,
-                staging_base, source_rank, destination_rank, shm_id):
+    def copy_op(anchor, local_offsets, staging_offsets, lengths, staging_base, source_rank, destination_rank, shm_id):
         calls.append(
             (
                 tuple(local_offsets.tolist()),
@@ -619,9 +605,7 @@ def test_sfa_execution_layers_bundle_main_and_indexer_caches():
         attn_layers[0]: (attn_layers[0], indexer_layers[0]),
         attn_layers[1]: (attn_layers[1], indexer_layers[1]),
     }
-    context.begin_forward(
-        torch.tensor([[7, 2]], dtype=torch.int32), torch.tensor([5])
-    )
+    context.begin_forward(torch.tensor([[7, 2]], dtype=torch.int32), torch.tensor([5]))
     context.enter_layer(attn_layers[0])
     context.wait_for_layer(attn_layers[0])
     assert context._pending_layer == attn_layers[1]
@@ -702,22 +686,15 @@ def test_sfa_cache_bundle_rejects_mismatched_owners():
 def _local_owners(layer_names, kvpp_size=2):
     """Small helper mirroring placement owner semantics in UTs."""
     names = sorted(layer_names)
-    return {
-        name: index * kvpp_size // len(names)
-        for index, name in enumerate(names)
-    }
+    return {name: index * kvpp_size // len(names) for index, name in enumerate(names)}
 
 
 def test_pp_execution_plan_contains_only_local_stage_layers():
     pp0_layers = tuple(f"model.layers.{i}.self_attn.attn" for i in range(30))
     pp1_layers = tuple(f"model.layers.{i}.self_attn.attn" for i in range(30, 60))
 
-    pp0_plan = KVPPExecutionPlan.build(
-        _local_owners(pp0_layers), pp0_layers
-    )
-    pp1_plan = KVPPExecutionPlan.build(
-        _local_owners(pp1_layers), pp1_layers
-    )
+    pp0_plan = KVPPExecutionPlan.build(_local_owners(pp0_layers), pp0_layers)
+    pp1_plan = KVPPExecutionPlan.build(_local_owners(pp1_layers), pp1_layers)
 
     assert set(pp0_plan.layers) == set(pp0_layers)
     assert set(pp1_plan.layers) == set(pp1_layers)
@@ -757,3 +734,106 @@ def test_sfa_bundle_uses_global_layer_index_within_pp_stage():
     assert scheduler.plan.cache_bundles[attn_layer] == (attn_layer, indexer_layer)
     assert extract_layer_index(attn_layer) == 35
 
+
+def test_offload_wait_runs_in_background_and_does_not_block_current_attention(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import nullcontext
+    from threading import Event
+
+    h2d_ready = Event()
+    next_load_waiting = Event()
+    pushes = []
+
+    def wait_for_cache(layer):
+        if layer == "layer.1":
+            next_load_waiting.set()
+            assert h2d_ready.wait(timeout=5), "compute could not release H2D gate"
+
+    transport = MagicMock()
+    transport.push_active_bundle.side_effect = lambda bundle, *args: (
+        pushes.append(bundle),
+        SimpleNamespace(wait=lambda: None),
+    )[1]
+    monkeypatch.setattr(torch.npu, "Event", MagicMock)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: object())
+    monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext())
+    monkeypatch.setattr("vllm_ascend.worker.v2.kvpp.dist.recv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("vllm_ascend.worker.v2.kvpp.dist.send", lambda *args, **kwargs: None)
+    context = KVPPScheduler(
+        group=SimpleNamespace(rank_in_group=0, world_size=2, ranks=[0, 1], cpu_group=None),
+        layer_owners={"layer.0": 0, "layer.1": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=transport,
+        wait_for_cache=wait_for_cache,
+    )
+    context._comm_stream = object()
+    context._executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        context.begin_forward(torch.tensor([[1, 2]], dtype=torch.int32), [5])
+        context.enter_layer("layer.0")
+        context.wait_for_layer("layer.0")
+        assert next_load_waiting.wait(timeout=5)
+        assert pushes == [("layer.0",)]
+        assert not context._transfer_future.done()
+        # The current attention may now start and release the offload gate.
+        h2d_ready.set()
+        context.leave_layer("layer.0")
+        context.enter_layer("layer.1")
+        context.wait_for_layer("layer.1")
+        context.leave_layer("layer.1")
+        context.finish_forward()
+        assert pushes == [("layer.0",), ("layer.1",)]
+    finally:
+        h2d_ready.set()
+        context.close()
+
+
+def test_offload_failure_prevents_owner_push():
+    transport = MagicMock()
+
+    def failed_load(layer):
+        raise RuntimeError("offload copy failed")
+
+    context = KVPPScheduler(
+        group=SimpleNamespace(rank_in_group=0, world_size=2, ranks=[0, 1], cpu_group=None),
+        layer_owners={"layer.0": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=transport,
+        wait_for_cache=failed_load,
+    )
+    context._comm_stream = object()
+    with pytest.raises(RuntimeError, match="offload copy failed"):
+        context._run_prefetch("layer.0", _active_page_tensor(1), MagicMock())
+    transport.push_active_bundle.assert_not_called()
+
+
+def test_abort_cancels_offload_dependency_before_draining_future():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    entered = Event()
+    cancelled = Event()
+
+    def pending_cache_wait():
+        entered.set()
+        assert cancelled.wait(timeout=2), "abort waited for a dependency without cancelling it"
+        raise RuntimeError("offload aborted")
+
+    context = KVPPScheduler(
+        group=SimpleNamespace(world_size=1),
+        layer_owners={"layer.0": 0},
+        num_blocks=10,
+        block_size=4,
+        transport=MagicMock(),
+        abort_cache=cancelled.set,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        context.begin_forward(torch.tensor([[1]], dtype=torch.int32), [1])
+        context._transfer_future = executor.submit(pending_cache_wait)
+        assert entered.wait(timeout=2)
+        context.abort_batch()
+        assert cancelled.is_set()
+        assert context.selected_pages is None
+        assert context._transfer_future is None

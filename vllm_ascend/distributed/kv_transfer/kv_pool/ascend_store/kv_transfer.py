@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -1483,6 +1484,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
         group_builders: list[LayerBatchBuilder] | None = None,
+        check_dependencies: Callable[[], None] | None = None,
     ):
         super().__init__(
             m_store,
@@ -1495,6 +1497,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             name="KVCacheStoreLayerRecvingThread",
         )
         self.get_event = get_event
+        self.check_dependencies = check_dependencies
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
@@ -1542,6 +1545,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         while time.perf_counter() < deadline:
             pass
 
+    def _wait_for_dependency(self, event: Any) -> None:
+        check = getattr(self, "check_dependencies", None)
+        while True:
+            if check is not None:
+                check()
+            if event.wait(timeout=0.1 if check is not None else 10):
+                if check is not None:
+                    check()
+                return
+
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
     ):
@@ -1549,14 +1562,18 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
         attention_start_gate = data.attention_start_gate
+        check = getattr(self, "check_dependencies", None)
+        if check is not None:
+            check()
 
         if wait_for_save is not None:
-            while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
-                logger.info("Layerwise %d save wait timed out, keep waiting before load", wait_for_save)
+            self._wait_for_dependency(self.layer_save_finished_events[wait_for_save])
             # Non-saving TP ranks have no D2H task to synchronize the event.
             # Their CPU save-finished signal only means the event was recorded;
             # wait for the NPU work before reusing the local HBM buffer.
             self.sync_save_events[wait_for_save].synchronize()
+            if check is not None:
+                check()
             logger.debug("Layer save event cleared: layer %d", wait_for_save)
             self.layer_save_finished_events[wait_for_save].clear()
 
@@ -1587,8 +1604,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return
 
         if attention_start_gate is not None:
-            while not attention_start_gate.wait(timeout=10):
-                logger.info("Layerwise %d load waits for attention compute start", layer_id)
+            self._wait_for_dependency(attention_start_gate)
 
         all_load_keys: list[str] = []
         all_req_ids: set[str] = set()
@@ -1607,6 +1623,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             all_addrs.append(req_meta.addr_array)
             all_sizes.append(req_meta.size_array)
 
+        if check is not None:
+            check()
         self._stagger_h2d_submit(layer_id)
         gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
         addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
@@ -1629,6 +1647,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             )
         if res != 0:
             raise RuntimeError(f"Layerwise {layer_id} load batch_copy failed with return code {res}")
+        if check is not None:
+            check()
 
         if layer_id == self.final_layer_id and all_load_keys:
             unique_load_keys = list(dict.fromkeys(all_load_keys))
