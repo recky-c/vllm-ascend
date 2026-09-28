@@ -401,6 +401,54 @@ def test_partition_batch_pads_decode_requests_when_tokens_are_already_padded():
     np.testing.assert_array_equal(args[1], np.array([11, 21, 31], dtype=np.int32))
 
 
+@pytest.mark.parametrize("local_tokens,computed_tokens", [(0, 0), (1, 10)])
+def test_sharded_full_decode_pads_empty_and_short_owners(local_tokens, computed_tokens):
+    """A FULL graph keeps the same query and request extent on every PCP rank."""
+    local_batch = _make_local_pcp_batch()
+    local_batch.num_reqs = 1
+    local_batch.num_reqs_after_padding = 2
+    local_batch.num_tokens = local_tokens
+    local_batch.num_tokens_after_padding = 2
+    local_batch.req_ids = ["owner-request"]
+    local_batch.num_scheduled_tokens = np.array([local_tokens], dtype=np.int32)
+    local_batch.num_computed_tokens_np = np.array([computed_tokens], dtype=np.int32)
+    local_batch.is_prefilling_np = np.zeros(1, dtype=np.bool_)
+    local_batch.query_start_loc_np = np.array([0, local_tokens, local_tokens], dtype=np.int32)
+    local_batch.query_start_loc = torch.tensor(local_batch.query_start_loc_np)
+    local_batch.seq_lens = torch.tensor([computed_tokens + local_tokens, 0], dtype=torch.int32)
+    local_batch.seq_lens_cpu_upper_bound = torch.tensor([computed_tokens + local_tokens, 0])
+    local_batch.num_draft_tokens_per_req = None
+
+    global_batch = SimpleNamespace(
+        num_draft_tokens=0,
+        num_scheduled_tokens=np.ones(3, dtype=np.int32),
+        num_tokens=3,
+        num_reqs=3,
+        num_tokens_after_padding=3,
+        num_reqs_after_padding=3,
+        is_prefilling_np=np.zeros(3, dtype=np.bool_),
+    )
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager.shard_decode_requests = True
+    manager._input_buffers = AscendInputBuffers(4, 16, torch.device("cpu"))
+    manager.vllm_config = _make_pcp_config(CUDAGraphMode.FULL_DECODE_ONLY)
+    manager.kv_cache_config = None
+
+    with (
+        patch.object(PCPManager, "partition_batch", return_value=local_batch) as upstream_partition,
+        patch("vllm_ascend.worker.v2.pcp_manager.build_attn_state"),
+        patch("vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu", side_effect=_mock_async_copy_to_cpu),
+    ):
+        result = manager.partition_batch(global_batch, padded_num_tokens=2, padded_num_reqs=2)
+
+    upstream_partition.assert_called_once_with(global_batch, padded_num_tokens=2, padded_num_reqs=2)
+    np.testing.assert_array_equal(result.query_start_loc_np, np.array([0, 1, 2], dtype=np.int32))
+    assert torch.equal(result.query_start_loc, torch.tensor([0, 1, 2], dtype=torch.int32))
+    np.testing.assert_array_equal(result.seq_lens_np, np.array([computed_tokens + local_tokens, 0]))
+    assert result.num_tokens == local_tokens
+    assert result.num_tokens_after_padding == 2
+
+
 def test_partition_batch_keeps_piecewise_request_extent():
     """Token padding in PIECEWISE mode must not create dummy requests."""
     batch = _make_local_pcp_batch()
