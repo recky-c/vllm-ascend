@@ -18,6 +18,7 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -166,6 +167,33 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
+    ) -> BatchExecutionDescriptor:
+        global_num_reqs = num_reqs
+        if self.model_runner.use_pcp_decode_graphs and uniform_token_count == 1:
+            # Upstream dispatch receives the largest PCP-local token count but
+            # the global request count. Ordinary decode has one local request
+            # per token, including when DP redispatch supplies a padded count.
+            num_reqs = num_tokens
+        desc = super().dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+            max_query_len=max_query_len,
+            num_ubatches=num_ubatches,
+        )
+        if desc.cg_mode == CUDAGraphMode.NONE and num_reqs != global_num_reqs:
+            desc = replace(desc, num_reqs=global_num_reqs)
+        return desc
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:

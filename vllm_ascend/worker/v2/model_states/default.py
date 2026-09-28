@@ -88,7 +88,12 @@ class AscendModelState(DefaultModelState):
         is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
         pcp_context = (
-            self.pcp_manager.build_attention_context(input_batch, block_tables, slot_mappings)
+            self.pcp_manager.build_attention_context(
+                input_batch,
+                block_tables,
+                slot_mappings,
+                for_full_graph=cudagraph_mode == CUDAGraphMode.FULL or for_capture,
+            )
             if self.pcp_manager is not None
             else None
         )

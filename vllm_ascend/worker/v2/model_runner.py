@@ -283,14 +283,21 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
-            if self.pcp_manager is not None:
-                assert isinstance(self.pcp_manager, AscendPCPManager)
-                self.pcp_manager.vllm_config = self.vllm_config
-                self.pcp_manager.kv_cache_config = kv_cache_config
-                self.pcp_manager.shard_decode_requests = shard_decode_requests
-                self.model_state.pcp_manager = self.pcp_manager
+            pcp_manager = self.pcp_manager
+            if pcp_manager is not None:
+                assert isinstance(pcp_manager, AscendPCPManager)
+                pcp_manager.vllm_config = self.vllm_config
+                pcp_manager.kv_cache_config = kv_cache_config
+                pcp_manager.shard_decode_requests = shard_decode_requests
+                pcp_manager.use_local_decode_graphs = (
+                    shard_decode_requests
+                    and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+                    and self.speculative_config is None
+                    and self.decode_query_len == 1
+                )
+                self.model_state.pcp_manager = pcp_manager
                 if self.speculator is not None:
-                    self.speculator.pcp_manager = self.pcp_manager
+                    self.speculator.pcp_manager = pcp_manager
 
         # Only target-model layers determine whether FIA is in use. This flag
         # is used for adaptive verification handling.
@@ -409,6 +416,11 @@ class NPUModelRunner(GPUModelRunner):
                 "scheduled locally — a request sent directly to the decode node)."
             )
 
+    @property
+    def use_pcp_decode_graphs(self) -> bool:
+        """Whether graph descriptors use PCP-local decode dimensions."""
+        return self.pcp_manager is not None and self.pcp_manager.use_local_decode_graphs
+
     def prepare_inputs(  # type: ignore[misc]
         self,
         scheduler_output: SchedulerOutput,
@@ -421,7 +433,11 @@ class NPUModelRunner(GPUModelRunner):
         """
         self._check_finegrained_tp_graph_step(batch_desc.cg_mode)
         num_tokens = batch_req_state.num_tokens
-        num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+        sharded_decode_graph = self.use_pcp_decode_graphs and batch_desc.cg_mode == CUDAGraphMode.FULL
+        # The descriptor describes each PCP rank's model input. Retain the
+        # complete global batch for KV slots and sampling; partition_batch
+        # applies the descriptor's token/request padding to the local batch.
+        num_tokens_after_padding = num_tokens if sharded_decode_graph else max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
 
         req_ids = batch_req_state.req_ids
@@ -489,7 +505,7 @@ class NPUModelRunner(GPUModelRunner):
         # Get query_start_loc.
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        num_reqs_padded = num_reqs if sharded_decode_graph else (batch_desc.num_reqs or num_reqs)
         query_start_loc_np = np.empty(self.max_num_reqs + 2, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
@@ -497,7 +513,7 @@ class NPUModelRunner(GPUModelRunner):
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         query_start_loc_np[num_reqs + 1 :] = num_tokens
 
-        if batch_desc.cg_mode == CUDAGraphMode.FULL and not adaptive_verification_manager:
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and not adaptive_verification_manager and not sharded_decode_graph:
             # This is only required for vllm-ascend.
             query_start_loc_np, num_reqs_padded = self._pad_query_start_loc_for_fia(
                 num_tokens_after_padding,
