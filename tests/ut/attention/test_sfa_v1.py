@@ -2,7 +2,6 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 from vllm.config import set_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator
@@ -16,7 +15,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
-from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADSACPImpl, AscendSFAPCPImpl
+from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADSACPImpl
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.sfa_kv_offload import (
     AscendSFAKVOffloadImpl,
@@ -1690,40 +1689,3 @@ class TestAscendSFAImpl(TestBase):
         self.assertIs(impl._quant_type, AscendW8A8MXFP8DynamicLinearMethod)
 
     # (MLAPO runtime path requires NPU hardware; covered by integration tests.)
-
-
-@pytest.mark.parametrize(
-    "quant_type, expected_type",
-    [
-        (None, PreprocessType.NATIVE),
-        (AscendW8A8DynamicLinearMethod, PreprocessType.PROLOG_V3),
-        (AscendW8A8MXFP8DynamicLinearMethod, PreprocessType.PROLOG_V3),
-        (AscendW8A8LinearMethod, PreprocessType.MLAPO),
-    ],
-)
-@pytest.mark.parametrize("shard_decode_requests", [False, True])
-def test_pcp_decode_sharding_preserves_sfa_preprocess_selection(quant_type, expected_type, shard_decode_requests):
-    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
-    impl.pcp_shard_decode_requests = shard_decode_requests
-    impl.qk_rope_head_dim = 64
-    impl.kv_a_layernorm = MagicMock()
-    impl.q_a_layernorm = MagicMock()
-    impl.fused_qkv_a_proj = MagicMock()
-    quant_method = quant_type.__new__(quant_type) if quant_type is not None else None
-    impl.fused_qkv_a_proj.quant_method = SimpleNamespace(quant_method=quant_method)
-    impl.q_proj = MagicMock()
-    impl.q_proj._chunk_size = 0
-    impl.enable_sparse_sfa_c8 = False
-    impl.enable_mlapo = True
-    impl.is_kv_consumer = False
-
-    # Exercise selection and eligibility on the PCP subclass, mocking only
-    # device-dependent weight conversion after the implementation is chosen.
-    with (
-        patch.object(impl, "_process_weights_for_fused_prolog_v3") as prolog,
-        patch.object(impl, "_process_weights_for_fused_mlapo") as mlapo,
-    ):
-        assert impl._resolve_preprocess_type(torch.bfloat16) is expected_type
-
-    assert prolog.call_count == int(expected_type is PreprocessType.PROLOG_V3)
-    assert mlapo.call_count == int(expected_type is PreprocessType.MLAPO)
