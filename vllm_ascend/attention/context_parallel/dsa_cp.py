@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -2256,6 +2257,8 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         self._pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         self._pcp_rank = get_pcp_group().rank_in_group
         self._shard_decode_requests = is_pcp_decode_sharding_enabled(vllm_config)
+        self._graph_global_buffers: dict[str, torch.Tensor] = {}
+        self._graph_global_rope: dict[Any, tuple[torch.Tensor, torch.Tensor]] = {}
         self._hidden_restore_idx_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int64,
@@ -2269,6 +2272,108 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
         return AttentionCGSupport.UNIFORM_BATCH
+
+    def _pad_sharded_graph_context(
+        self,
+        context: "AscendPCPAttentionContext",
+        local_common: AscendCommonAttentionMetadata,
+    ) -> "AscendPCPAttentionContext":
+        """Keep global cache updates fixed for each local decode graph bucket."""
+        batch = context.global_batch
+        max_reqs = self.vllm_config.scheduler_config.max_num_seqs
+        max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        query_len = int(batch.num_scheduled_tokens.max())
+        request_capacity = min(
+            local_common.num_input_tokens // query_len * self._pcp_world_size,
+            max_reqs,
+            max_tokens // query_len,
+        )
+        token_capacity = request_capacity * query_len
+        actual_reqs = request_capacity if batch.is_dummy else batch.num_reqs
+        actual_tokens = token_capacity if batch.is_dummy else batch.num_tokens
+
+        def copy_padded(name, source, size, active, capacity, fill=0):
+            if name not in self._graph_global_buffers:
+                self._graph_global_buffers[name] = source.new_empty((capacity, *source.shape[1:]))
+            target = self._graph_global_buffers[name][:size]
+            target.fill_(fill)
+            target[:active].copy_(source[:active])
+            return target
+
+        positions = copy_padded(
+            "positions", batch.positions, token_capacity, 0 if batch.is_dummy else actual_tokens, max_tokens
+        )
+        seq_lens = copy_padded(
+            "seq_lens",
+            batch.seq_lens,
+            request_capacity,
+            0 if batch.is_dummy else actual_reqs,
+            max_reqs,
+            query_len if batch.is_dummy else 0,
+        )
+        seq_lens_np = np.full(request_capacity, query_len if batch.is_dummy else 0, dtype=np.int32)
+        if not batch.is_dummy:
+            seq_lens_np[:actual_reqs] = batch.seq_lens_np[:actual_reqs]
+        offsets = copy_padded("offsets", batch.query_start_loc, request_capacity + 1, 0, max_reqs + 1)
+        torch.arange(0, token_capacity + 1, query_len, dtype=offsets.dtype, device=offsets.device, out=offsets)
+        global_batch = replace(
+            batch,
+            num_reqs=actual_reqs,
+            num_tokens=actual_tokens,
+            num_reqs_after_padding=request_capacity,
+            num_tokens_after_padding=token_capacity,
+            positions=positions,
+            seq_lens=seq_lens,
+            seq_lens_np=seq_lens_np,
+            seq_lens_cpu_upper_bound=torch.from_numpy(seq_lens_np),
+            query_start_loc=offsets,
+            query_start_loc_np=np.arange(0, token_capacity + 1, query_len, dtype=np.int32),
+            num_scheduled_tokens=np.full(actual_reqs, query_len, dtype=np.int32),
+            num_computed_tokens_np=seq_lens_np[:actual_reqs] - query_len,
+            is_prefilling_np=np.zeros(request_capacity, dtype=np.bool_),
+        )
+        block_tables = tuple(
+            copy_padded(f"table_{i}", table, request_capacity, 0 if batch.is_dummy else actual_reqs, max_reqs)
+            for i, table in enumerate(context.global_block_tables)
+        )
+        if "slots" not in self._graph_global_buffers:
+            self._graph_global_buffers["slots"] = context.global_slot_mappings.new_empty(
+                (context.global_slot_mappings.shape[0], max_tokens)
+            )
+        slot_mappings = self._graph_global_buffers["slots"][:, :token_capacity]
+        slot_mappings.fill_(-1)
+        if not batch.is_dummy:
+            slot_mappings[:, :actual_tokens].copy_(context.global_slot_mappings[:, :actual_tokens])
+        restore_idx = context.hidden_restore_idx
+        if batch.is_dummy:
+            restore_idx = torch.arange(token_capacity, device=positions.device, dtype=torch.int64)
+        return replace(
+            context,
+            global_batch=global_batch,
+            global_block_tables=block_tables,
+            global_slot_mappings=slot_mappings,
+            hidden_restore_idx=restore_idx,
+        )
+
+    def _stabilize_global_rope(self, metadata: dsa_v1.AscendDSAMetadata) -> None:
+        """Refresh global RoPE without aliasing the local decode RoPE cache."""
+        req = dsa_v1._require_req_metadata(metadata)
+        result = {}
+        for key, groups in req.cos._data.items():
+            result[key] = {}
+            for group, pair in groups.items():
+                cache_key = (key, group)
+                if cache_key not in self._graph_global_rope:
+                    self._graph_global_rope[cache_key] = tuple(
+                        value.new_empty((self.vllm_config.scheduler_config.max_num_batched_tokens, *value.shape[1:]))
+                        for value in pair
+                    )
+                result[key][group] = tuple(
+                    buffer[: value.shape[0]].copy_(value)
+                    for buffer, value in zip(self._graph_global_rope[cache_key], pair)
+                )
+        req.cos = RopeDataProxy(result, is_cos=True)
+        req.sin = RopeDataProxy(result, is_cos=False)
 
     def _prepare_graph_pcp_context(
         self,
@@ -2422,14 +2527,16 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         fast_build: bool,
         num_actual_reqs: int | None,
         common_ratio_to_sas_metadata: dict[Any, Any],
+        full_graph_mode: bool = False,
     ) -> dsa_v1.AscendDSAMetadata:
-        if local_common_attn_metadata.num_actual_tokens > 0:
+        if local_common_attn_metadata.num_actual_tokens > 0 or full_graph_mode:
             return super().build(
                 common_prefix_len,
                 local_common_attn_metadata,
                 fast_build,
                 num_actual_reqs=num_actual_reqs,
                 common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+                full_graph_mode=full_graph_mode,
             )
 
         # Empty ranks still participate in the global cache update collectives.
@@ -2443,7 +2550,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             num_prefills=0,
             attn_state=local_common_attn_metadata.attn_state,
             req_metadata=None,
-            hadamard=dsa_v1.AscendDSAMetadataBuilder.hadamard,
+            hadamard=self.hadamard,
         )
 
     def build(
@@ -2460,6 +2567,15 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         assert pcp_context is not None
         assert pcp_cache_group_idx is not None
         assert common_ratio_to_sas_metadata is not None
+        global_batch = pcp_context.global_batch
+        sharded_decode_graph = (
+            self._shard_decode_requests
+            and self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and not bool(global_batch.is_prefilling_np.any())
+            and global_batch.num_tokens == global_batch.num_reqs * int(global_batch.num_scheduled_tokens.max())
+        )
+        if sharded_decode_graph:
+            pcp_context = self._pad_sharded_graph_context(pcp_context, common_attn_metadata)
         pcp_context = self._prepare_graph_pcp_context(pcp_context)
         global_common_attn_metadata = self._build_global_common_attn_metadata(
             pcp_context,
@@ -2484,21 +2600,27 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             num_actual_reqs=pcp_context.global_batch.num_reqs,
             common_ratio_to_sas_metadata={},
             can_use_rope_cache=can_use_rope_cache,
+            full_graph_mode=sharded_decode_graph,
         )
+        if sharded_decode_graph:
+            self._stabilize_global_rope(global_dsa_metadata)
         local_common_attn_metadata = self._build_local_common_attn_metadata(
             pcp_context,
             common_attn_metadata,
         )
         local_common_attn_metadata = self._build_graph_common_attn_metadata(
             local_common_attn_metadata,
-            num_actual_reqs,
+            0 if sharded_decode_graph and common_attn_metadata.num_actual_tokens == 0 else num_actual_reqs,
         )
         local_dsa_metadata = self._build_local_dsa_metadata(
             common_prefix_len,
             local_common_attn_metadata,
             fast_build,
-            num_actual_reqs=num_actual_reqs,
+            num_actual_reqs=(
+                0 if sharded_decode_graph and common_attn_metadata.num_actual_tokens == 0 else num_actual_reqs
+            ),
             common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+            full_graph_mode=sharded_decode_graph,
         )
         return AscendDSAPCPMetadata.from_local_metadata(
             local_dsa_metadata,

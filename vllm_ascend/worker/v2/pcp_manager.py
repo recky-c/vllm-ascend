@@ -62,6 +62,7 @@ class AscendPCPManager(PCPManager):
     _gathered_kv_slot_mappings: torch.Tensor | None
     _pad_slot_id: torch.Tensor
     _sampling_hidden_restored: bool = False
+    shard_decode_requests: bool = False
 
     def __init__(
         self,
@@ -310,6 +311,8 @@ class AscendPCPManager(PCPManager):
     def _partition_speculative_batch_compat(
         self,
         global_batch: AscendInputBatch,
+        padded_num_tokens: int | None = None,
+        padded_num_reqs: int | None = None,
     ) -> AscendInputBatch:
         """Adapt spec decode until upstream PCP supports it natively."""
         global_draft_counts = global_batch.num_draft_tokens_per_req
@@ -327,7 +330,11 @@ class AscendPCPManager(PCPManager):
             num_draft_tokens_per_req=None,
         )
         try:
-            local_batch = super().partition_batch(non_spec_batch)
+            local_batch = super().partition_batch(
+                non_spec_batch,
+                padded_num_tokens=padded_num_tokens,
+                padded_num_reqs=padded_num_reqs,
+            )
         finally:
             self._global_batch = global_batch
         assert isinstance(local_batch, AscendInputBatch)
@@ -351,6 +358,7 @@ class AscendPCPManager(PCPManager):
             dtype=np.int32,
             count=local_batch.num_reqs,
         )
+        local_draft_counts[local_batch.num_scheduled_tokens == 0] = 0
         return replace(  # type: ignore[call-arg]
             local_batch,
             num_draft_tokens=int(local_draft_counts.sum()),
@@ -378,16 +386,32 @@ class AscendPCPManager(PCPManager):
     ) -> AscendInputBatch:
         """Partition the batch and update Ascend-specific local metadata."""
         global_batch = input_batch
+        shard_decode_padding = padded_num_reqs is not None and self.shard_decode_requests
         if global_batch.num_draft_tokens > 0:
-            local_batch = self._partition_speculative_batch_compat(global_batch)
-        else:
-            # padded_num_reqs is accepted for the upstream maybe_partition_pcp_batch
-            # signature but not forwarded: request-shaped padding is done below.
-            local_batch = super().partition_batch(
+            local_batch = self._partition_speculative_batch_compat(
                 global_batch,
-                padded_num_tokens=padded_num_tokens,
+                padded_num_tokens=padded_num_tokens if shard_decode_padding else None,
+                padded_num_reqs=padded_num_reqs if shard_decode_padding else None,
             )
+        else:
+            if shard_decode_padding:
+                local_batch = super().partition_batch(
+                    global_batch,
+                    padded_num_tokens=padded_num_tokens,
+                    padded_num_reqs=padded_num_reqs,
+                )
+            else:
+                local_batch = super().partition_batch(global_batch, padded_num_tokens=padded_num_tokens)
         assert isinstance(local_batch, AscendInputBatch)
+
+        if shard_decode_padding:
+            # FULL decode graphs use a fixed local request shape, including
+            # empty owners. Cover the padded queries while their KV lengths
+            # remain zero and their cache slots remain invalid.
+            query_len = int(global_batch.num_scheduled_tokens.max())
+            if global_batch.num_tokens == global_batch.num_reqs * query_len:
+                local_batch.query_start_loc_np[:] = np.arange(padded_num_reqs + 1, dtype=np.int32) * query_len
+                async_copy_to_gpu(local_batch.query_start_loc_np, out=local_batch.query_start_loc)
 
         # PCP builds the local layout from actual tokens, but a FULL decode
         # graph replays a fixed padded layout on every rank.
