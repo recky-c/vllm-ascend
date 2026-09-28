@@ -351,6 +351,8 @@ class AscendPCPManager(PCPManager):
             dtype=np.int32,
             count=local_batch.num_reqs,
         )
+        # Empty ranks retain a zero-token placeholder request, with no drafts.
+        local_draft_counts[local_batch.num_scheduled_tokens == 0] = 0
         return replace(  # type: ignore[call-arg]
             local_batch,
             num_draft_tokens=int(local_draft_counts.sum()),
