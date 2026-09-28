@@ -295,7 +295,8 @@ def test_sample_tokens_restores_replicated_draft_hidden_states():
 
 def _make_pcp_graph_manager(*, sharded=True):
     manager = ModelAclGraphManager.__new__(ModelAclGraphManager)
-    manager.model_runner = SimpleNamespace(pcp_manager=SimpleNamespace(shard_decode_requests=sharded))
+    manager.model_runner = _make_runner()
+    manager.model_runner.pcp_manager = SimpleNamespace(use_local_decode_graphs=sharded)
     manager.vllm_config = SimpleNamespace(speculative_config=None)
     manager.compilation_config = SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4], max_cudagraph_capture_size=4)
     manager.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
@@ -600,8 +601,14 @@ def test_sample_tokens_spec_pp_broadcasts_draft_tokens():
 
 def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp():
     runner = _make_runner()
-    runner.vllm_config = SimpleNamespace()
-    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2, decode_context_parallel_size=1)
+    )
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={}, cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    runner.speculative_config = None
+    runner.decode_query_len = 1
     runner.pcp_manager = MagicMock(spec=AscendPCPManager)
     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
     runner.speculator = SimpleNamespace()
@@ -640,6 +647,8 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp():
     assert runner.kvpp == "kvpp"
     assert runner.model_state.kvpp_runtime == "kvpp"
     assert runner.pcp_manager.vllm_config is runner.vllm_config
+    assert runner.pcp_manager.use_local_decode_graphs is True
+    assert runner.use_pcp_decode_graphs is True
     assert runner.model_state.pcp_manager is runner.pcp_manager
     assert runner.speculator.pcp_manager is runner.pcp_manager
     runner.init_routed_experts_capturer.assert_called_once_with()
@@ -647,7 +656,9 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp():
 
 def test_initialize_kv_cache_forwards_allocation_context():
     runner = _make_runner()
-    runner.vllm_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1)
+    )
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.pcp_manager = None
     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
@@ -828,7 +839,7 @@ def _run_prepare_inputs(
 def test_sharded_decode_prepares_global_batch_before_local_graph_padding(graph_tokens):
     runner, scheduler_output, batch_state, batch_desc = _prepare_inputs_runner(full_cg=True)
     runner.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
-    runner.pcp_manager = SimpleNamespace(shard_decode_requests=True)
+    runner.pcp_manager = SimpleNamespace(use_local_decode_graphs=True)
     batch_state.num_tokens = 2
     batch_state.num_scheduled_tokens = np.ones(2, dtype=np.int32)
     batch_state.has_prefill = False

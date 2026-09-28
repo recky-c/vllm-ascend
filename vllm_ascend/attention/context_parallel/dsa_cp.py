@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
 import torch
@@ -2261,6 +2261,11 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             dtype=torch.int64,
             device=device,
         )
+        self._global_decode_capacity = min(
+            vllm_config.scheduler_config.max_num_seqs,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+        )
+        self._global_decode_metadata: AscendCommonAttentionMetadata | None = None
         self._global_rope_capacity = vllm_config.scheduler_config.max_num_batched_tokens
         self._global_rope_buffers: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
 
@@ -2272,27 +2277,92 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
     ) -> AttentionCGSupport:
         return AttentionCGSupport.UNIFORM_BATCH
 
-    def _prepare_graph_pcp_context(
+    def _prepare_hidden_restore_idx(
         self,
         pcp_context: "AscendPCPAttentionContext",
-    ) -> "AscendPCPAttentionContext":
-        """Prepare graph-stable DSA tensors without changing the PCP batch layout."""
+        num_tokens_after_padding: int,
+    ) -> torch.Tensor:
+        """Keep global hidden-state restoration stable across graph replays."""
         global_batch = pcp_context.global_batch
         num_actual_tokens = global_batch.num_tokens
 
         # Use the preallocated buffer to keep the address fixed for graph replay.
-        hidden_restore_idx = self._hidden_restore_idx_buffer[: global_batch.num_tokens_after_padding]
+        hidden_restore_idx = self._hidden_restore_idx_buffer[:num_tokens_after_padding]
         hidden_restore_idx[:num_actual_tokens].copy_(pcp_context.hidden_restore_idx[:num_actual_tokens])
         hidden_restore_idx[num_actual_tokens:].zero_()
 
-        # The upstream dummy path only invalidates gathered slot mappings.
-        # DSA also consumes the scheduler-global mapping, so clear it here.
-        if global_batch.is_dummy:
-            pcp_context.global_slot_mappings.fill_(-1)
+        return hidden_restore_idx
 
-        return replace(
-            pcp_context,
-            hidden_restore_idx=hidden_restore_idx,
+    def _pad_global_decode_metadata(
+        self,
+        metadata: AscendCommonAttentionMetadata,
+        local_num_tokens: int,
+        *,
+        is_dummy: bool,
+    ) -> AscendCommonAttentionMetadata:
+        """Give this cache group's global updates a fixed shape per local graph.
+
+        A local bucket T can own up to PCP*T global requests. Only DSA's
+        attention view uses this padding; the manager's canonical batch remains
+        unchanged for sampling and other attention backends.
+        """
+        capacity = self._global_decode_capacity
+        graph_size = min(self._pcp_world_size * local_num_tokens, capacity)
+        num_reqs = metadata.num_reqs
+        assert 0 < metadata.num_actual_tokens == num_reqs <= graph_size
+        if self._global_decode_metadata is None:
+            self._global_decode_metadata = metadata.replace(
+                query_start_loc=torch.arange(capacity + 1, dtype=torch.int32, device=metadata.seq_lens.device),
+                query_start_loc_cpu=torch.arange(capacity + 1, dtype=torch.int32),
+                seq_lens=metadata.seq_lens.new_zeros(capacity),
+                seq_lens_cpu=metadata.seq_lens_cpu.new_zeros(capacity),
+                positions=metadata.positions.new_zeros(capacity),
+                block_table_tensor=metadata.block_table_tensor.new_zeros(
+                    (capacity, *metadata.block_table_tensor.shape[1:])
+                ),
+                slot_mapping=metadata.slot_mapping.new_full((capacity,), -1),
+            )
+        buffers = self._global_decode_metadata
+        positions = buffers.positions[:graph_size]
+        seq_lens = buffers.seq_lens[:graph_size]
+        seq_lens_cpu = buffers.seq_lens_cpu[:graph_size]
+        block_table = buffers.block_table_tensor[:graph_size]
+        slot_mapping = buffers.slot_mapping[:graph_size]
+        positions.zero_()
+        seq_lens.zero_()
+        seq_lens_cpu.zero_()
+        block_table.zero_()
+        slot_mapping.fill_(-1)
+        if is_dummy:
+            seq_lens.fill_(1)
+            seq_lens_cpu.fill_(1)
+        else:
+            positions[:num_reqs].copy_(metadata.positions[:num_reqs])
+            seq_lens[:num_reqs].copy_(metadata.seq_lens[:num_reqs])
+            seq_lens_cpu[:num_reqs].copy_(metadata.seq_lens_cpu[:num_reqs])
+            block_table[:num_reqs].copy_(metadata.block_table_tensor[:num_reqs])
+            slot_mapping[:num_reqs].copy_(metadata.slot_mapping[:num_reqs])
+        num_computed_tokens_cpu = (seq_lens_cpu - 1).clamp_min(0)
+        return metadata.replace(
+            query_start_loc=buffers.query_start_loc[: graph_size + 1],
+            query_start_loc_cpu=buffers.query_start_loc_cpu[: graph_size + 1],
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_upper_bound=seq_lens_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            _seq_lens_cpu=seq_lens_cpu,
+            _num_computed_tokens_cpu=num_computed_tokens_cpu,
+            _num_computed_tokens_cache=None,
+            _token_to_req_indices_cache=None,
+            num_reqs=graph_size,
+            num_actual_tokens=graph_size,
+            num_input_tokens=graph_size,
+            max_query_len=1,
+            positions=positions,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+            is_prefilling=torch.zeros(graph_size, dtype=torch.bool),
+            attn_state=AscendAttentionState.DecodeOnly,
         )
 
     def _copy_global_rope_to_graph_buffers(self, metadata: dsa_v1.AscendDSAMetadata) -> None:
@@ -2421,6 +2491,10 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         local_common_attn_metadata: AscendCommonAttentionMetadata,
     ) -> AscendCommonAttentionMetadata:
         global_batch = pcp_context.global_batch
+        # The upstream dummy path only invalidates gathered slots. DSA also
+        # writes through the canonical global mapping, which must be invalid.
+        if global_batch.is_dummy:
+            pcp_context.global_slot_mappings.fill_(-1)
         num_reqs = global_batch.num_reqs_after_padding
         return AscendCommonAttentionMetadata(
             query_start_loc=global_batch.query_start_loc,
@@ -2512,16 +2586,28 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         if full_graph_mode and common_attn_metadata.num_actual_tokens == 0:
             # The PCP manager keeps a placeholder request on an empty owner.
             num_actual_reqs = 0
-        pcp_context = self._prepare_graph_pcp_context(pcp_context)
         global_common_attn_metadata = self._build_global_common_attn_metadata(
             pcp_context,
             pcp_cache_group_idx,
             common_attn_metadata,
         )
-        global_common_attn_metadata = self._build_graph_common_attn_metadata(
-            global_common_attn_metadata,
-            pcp_context.global_batch.num_reqs,
-            full_graph_mode=full_graph_mode,
+        global_num_actual_reqs = pcp_context.global_batch.num_reqs
+        if full_graph_mode:
+            global_common_attn_metadata = self._pad_global_decode_metadata(
+                global_common_attn_metadata,
+                common_attn_metadata.num_input_tokens,
+                is_dummy=pcp_context.global_batch.is_dummy,
+            )
+            if pcp_context.global_batch.is_dummy:
+                global_num_actual_reqs = global_common_attn_metadata.num_reqs
+        else:
+            global_common_attn_metadata = self._build_graph_common_attn_metadata(
+                global_common_attn_metadata,
+                global_num_actual_reqs,
+            )
+        hidden_restore_idx = self._prepare_hidden_restore_idx(
+            pcp_context,
+            global_common_attn_metadata.num_input_tokens,
         )
         # Owner-local decode positions differ from the global cache-update
         # positions. The local builder must not overwrite the global RoPE
@@ -2534,7 +2620,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             common_prefix_len,
             global_common_attn_metadata,
             fast_build,
-            num_actual_reqs=pcp_context.global_batch.num_reqs,
+            num_actual_reqs=global_num_actual_reqs,
             common_ratio_to_sas_metadata={},
             can_use_rope_cache=can_use_rope_cache,
             full_graph_mode=full_graph_mode,
@@ -2561,7 +2647,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
         return AscendDSAPCPMetadata.from_local_metadata(
             local_dsa_metadata,
             local_common_attn_metadata.num_input_tokens,
-            pcp_context.hidden_restore_idx,
+            hidden_restore_idx,
             global_dsa_metadata,
         )
 

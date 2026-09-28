@@ -57,7 +57,6 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
-from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSAPCPMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
@@ -284,19 +283,21 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 kv_cache_allocation_context=kv_cache_allocation_context,
             )
-            if self.pcp_manager is not None:
-                assert isinstance(self.pcp_manager, AscendPCPManager)
-                self.pcp_manager.vllm_config = self.vllm_config
-                self.pcp_manager.kv_cache_config = kv_cache_config
-                self.pcp_manager.shard_decode_requests = shard_decode_requests
-                self.pcp_manager.requires_global_graph_context = any(
-                    isinstance(group.get_metadata_builder(0), AscendDSAPCPMetadataBuilder)
-                    for groups in self.attn_groups
-                    for group in groups
+            pcp_manager = self.pcp_manager
+            if pcp_manager is not None:
+                assert isinstance(pcp_manager, AscendPCPManager)
+                pcp_manager.vllm_config = self.vllm_config
+                pcp_manager.kv_cache_config = kv_cache_config
+                pcp_manager.shard_decode_requests = shard_decode_requests
+                pcp_manager.use_local_decode_graphs = (
+                    shard_decode_requests
+                    and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+                    and self.speculative_config is None
+                    and self.decode_query_len == 1
                 )
-                self.model_state.pcp_manager = self.pcp_manager
+                self.model_state.pcp_manager = pcp_manager
                 if self.speculator is not None:
-                    self.speculator.pcp_manager = self.pcp_manager
+                    self.speculator.pcp_manager = pcp_manager
 
         # Only target-model layers determine whether FIA is in use. This flag
         # is used for adaptive verification handling.
@@ -415,6 +416,11 @@ class NPUModelRunner(GPUModelRunner):
                 "scheduled locally — a request sent directly to the decode node)."
             )
 
+    @property
+    def use_pcp_decode_graphs(self) -> bool:
+        """Whether graph descriptors use PCP-local decode dimensions."""
+        return self.pcp_manager is not None and self.pcp_manager.use_local_decode_graphs
+
     def prepare_inputs(  # type: ignore[misc]
         self,
         scheduler_output: SchedulerOutput,
@@ -427,15 +433,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         self._check_finegrained_tp_graph_step(batch_desc.cg_mode)
         num_tokens = batch_req_state.num_tokens
-        sharded_decode_graph = (
-            self.pcp_manager is not None
-            and self.pcp_manager.shard_decode_requests
-            and batch_desc.cg_mode == CUDAGraphMode.FULL
-            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
-            and self.decode_query_len == 1
-            and self.speculator is None
-            and not batch_req_state.has_prefill
-        )
+        sharded_decode_graph = self.use_pcp_decode_graphs and batch_desc.cg_mode == CUDAGraphMode.FULL
         # The descriptor describes each PCP rank's model input. Retain the
         # complete global batch for KV slots and sampling; partition_batch
         # applies the descriptor's token/request padding to the local batch.

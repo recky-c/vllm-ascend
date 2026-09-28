@@ -33,7 +33,7 @@ from vllm_ascend.worker.v2 import states as states_module
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, _prepare_pcp_inputs_to_capture
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
-from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext, AscendPCPManager
+from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
     AscendAutoRegressiveSpeculator,
 )
@@ -1034,7 +1034,8 @@ def test_validate_config_pcp_dp_graph_modes(dp_size, cudagraph_mode, allowed):
 
 @pytest.mark.parametrize("pcp_rank", [0, 1])
 @pytest.mark.parametrize("has_stale_batch", [False, True])
-def test_dummy_attention_context_uses_current_batch(pcp_rank, has_stale_batch):
+@pytest.mark.parametrize("for_full_graph,use_local_decode_graphs", [(False, True), (True, False), (True, True)])
+def test_dummy_attention_context_uses_current_batch(pcp_rank, has_stale_batch, for_full_graph, use_local_decode_graphs):
     manager = AscendPCPManager(2, pcp_rank, torch.device("cpu"))
     saved_batch = _make_global_pcp_batch() if has_stale_batch else None
     manager._global_batch = saved_batch
@@ -1048,8 +1049,10 @@ def test_dummy_attention_context_uses_current_batch(pcp_rank, has_stale_batch):
     block_tables = (torch.zeros((2, 1), dtype=torch.int32),) * 2
     slot_mappings = torch.arange(24, dtype=torch.int64).reshape(2, 12)
 
-    context = manager.build_attention_context(dummy, block_tables, slot_mappings)
+    manager.use_local_decode_graphs = use_local_decode_graphs
+    context = manager.build_attention_context(dummy, block_tables, slot_mappings, for_full_graph=for_full_graph)
 
+    assert context.is_full_decode_graph == (for_full_graph and use_local_decode_graphs)
     assert context.global_batch is dummy
     assert context.global_block_tables is block_tables
     start = pcp_rank * 6
@@ -1143,6 +1146,7 @@ def test_sharded_full_decode_uses_fixed_owner_local_graph_layout(
     manager = AscendPCPManager(pcp_size, pcp_rank, torch.device("cpu"), max_num_reqs=8, max_num_tokens=8)
     manager.vllm_config = _make_pcp_config(CUDAGraphMode.FULL_DECODE_ONLY)
     manager.shard_decode_requests = True
+    manager.use_local_decode_graphs = True
     with (
         patch("vllm.v1.worker.gpu.pcp_manager.async_tensor_h2d", side_effect=_mock_async_copy_to_cpu),
         patch("vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu", side_effect=_mock_async_copy_to_cpu),
@@ -1160,70 +1164,6 @@ def test_sharded_full_decode_uses_fixed_owner_local_graph_layout(
     assert local.seq_lens_np[actual:].tolist() == [0] * (graph_size - actual)
     assert manager.global_batch is global_batch
     assert global_batch.num_tokens_after_padding == num_global_reqs
-
-
-@pytest.mark.parametrize("pcp_size,capacity", [(2, 8), (4, 7)])
-def test_global_decode_graph_context_keeps_capture_storage_and_clears_padding(pcp_size, capacity):
-    manager = AscendPCPManager(pcp_size, 0, torch.device("cpu"), max_num_reqs=capacity, max_num_tokens=capacity)
-    manager.vllm_config = _make_pcp_config(CUDAGraphMode.FULL_DECODE_ONLY)
-    manager.shard_decode_requests = True
-    captured = None
-    for local_size, actual_reqs, is_dummy in [(2, 2, True), (2, 3, False), (1, 1, False), (2, 1, True), (2, 3, False)]:
-        batch = _make_decode_graph_batch(actual_reqs, capacity)
-        batch.is_dummy = is_dummy
-        context = AscendPCPAttentionContext(
-            global_batch=batch,
-            global_block_tables=(torch.arange(actual_reqs * 2, dtype=torch.int32).reshape(actual_reqs, 2) + 1,),
-            global_slot_mappings=torch.arange(actual_reqs, dtype=torch.int32).unsqueeze(0) + 10,
-            hidden_restore_idx=torch.arange(actual_reqs, dtype=torch.int64),
-        )
-        with patch("vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu", side_effect=_mock_async_copy_to_cpu):
-            staged = manager._pad_global_context_for_decode_graph(context, local_size)
-        size = min(pcp_size * local_size, capacity)
-        assert staged.is_full_decode_graph
-        assert staged.global_batch.num_tokens_after_padding == staged.global_batch.num_reqs_after_padding == size
-        assert staged.global_batch.query_start_loc.tolist() == list(range(size + 1))
-        assert batch.num_tokens_after_padding == actual_reqs
-        tensors = (
-            staged.global_batch.positions,
-            staged.global_batch.query_start_loc,
-            staged.global_batch.seq_lens,
-            staged.global_block_tables[0],
-            staged.global_slot_mappings,
-            staged.hidden_restore_idx,
-        )
-        if captured is None:
-            captured = tensors
-        assert [t.data_ptr() for t in captured] == [t.data_ptr() for t in tensors]
-        if is_dummy:
-            assert staged.global_batch.num_tokens == staged.global_batch.num_reqs == size
-            assert staged.global_slot_mappings.eq(-1).all()
-        else:
-            assert staged.global_batch.num_tokens == staged.global_batch.num_reqs == actual_reqs
-            assert staged.global_batch.positions[:actual_reqs].tolist() == batch.positions.tolist()
-            assert staged.global_slot_mappings[0].tolist() == list(range(10, 10 + actual_reqs)) + [-1] * (
-                size - actual_reqs
-            )
-            assert staged.global_batch.seq_lens[actual_reqs:].eq(0).all()
-            assert staged.global_batch.seq_lens_np[actual_reqs:].tolist() == [0] * (size - actual_reqs)
-            assert staged.global_block_tables[0][actual_reqs:].eq(0).all()
-            assert staged.hidden_restore_idx[actual_reqs:].eq(0).all()
-
-
-@pytest.mark.parametrize("for_full_graph,requires_global", [(False, True), (True, False), (True, True)])
-def test_attention_context_stages_global_buffers_only_for_dsa_full_graph(for_full_graph, requires_global):
-    manager = AscendPCPManager(2, 0, torch.device("cpu"), max_num_reqs=8, max_num_tokens=8)
-    manager.vllm_config = _make_pcp_config(CUDAGraphMode.FULL_DECODE_ONLY)
-    manager.shard_decode_requests = True
-    manager.requires_global_graph_context = requires_global
-    batch = _make_decode_graph_batch(2, 8)
-    context = AscendPCPAttentionContext(batch, (), torch.empty((0, 2)), torch.arange(2))
-    with (
-        patch.object(manager, "_build_attention_context", return_value=context),
-        patch.object(manager, "_pad_global_context_for_decode_graph", return_value=context) as stage,
-    ):
-        manager.build_attention_context(batch, for_full_graph=for_full_graph)
-    assert stage.call_count == int(for_full_graph and requires_global)
 
 
 def test_replicated_decode_retains_full_graph_query_padding():

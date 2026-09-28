@@ -2000,32 +2000,32 @@ def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool, num_local_
     """Global cache updates and owner-local queries retain distinct graph extents."""
     local_graph_size = 4
     global_graph_size = 8
-    num_global_tokens = global_graph_size if is_dummy else 3
+    num_global_tokens = local_graph_size if is_dummy else (5 if num_local_tokens else 1)
     # An empty owner still has the upstream placeholder request.
     num_local_reqs = max(num_local_tokens, 1)
     local_offsets = torch.arange(local_graph_size + 1, dtype=torch.int32).clamp(max=num_local_tokens)
-    global_offsets = torch.arange(global_graph_size + 1, dtype=torch.int32).clamp(max=num_global_tokens)
+    global_offsets = torch.arange(num_global_tokens + 1, dtype=torch.int32)
     local_seq_lens = torch.zeros(local_graph_size, dtype=torch.int32)
     local_seq_lens[:num_local_tokens] = 8
-    global_seq_lens = torch.zeros(global_graph_size, dtype=torch.int32)
-    global_seq_lens[:num_global_tokens] = 8
+    global_seq_lens = torch.full((num_global_tokens,), 8, dtype=torch.int32)
 
     builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
     builder._pcp_world_size = 2
     builder._pcp_rank = 1
     builder._shard_decode_requests = True
     builder._hidden_restore_idx_buffer = torch.empty(global_graph_size, dtype=torch.int64)
+    builder._global_decode_capacity = global_graph_size
+    builder._global_decode_metadata = None
     builder._global_rope_capacity = global_graph_size
     builder._global_rope_buffers = {}
     builder.model_config = SimpleNamespace(get_head_size=lambda: 512)
 
-    global_slots = torch.arange(global_graph_size, dtype=torch.int64)
-    global_slots[num_global_tokens:] = -1
+    global_slots = torch.arange(num_global_tokens, dtype=torch.int64)
     global_batch = SimpleNamespace(
         num_reqs=num_global_tokens,
-        num_reqs_after_padding=global_graph_size,
+        num_reqs_after_padding=num_global_tokens,
         num_tokens=num_global_tokens,
-        num_tokens_after_padding=global_graph_size,
+        num_tokens_after_padding=num_global_tokens,
         query_start_loc=global_offsets.clone(),
         query_start_loc_np=global_offsets.numpy().copy(),
         seq_lens=global_seq_lens.clone(),
@@ -2034,15 +2034,15 @@ def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool, num_local_
         num_computed_tokens_np=np.full(num_global_tokens, 7, dtype=np.int32),
         num_scheduled_tokens=np.ones(num_global_tokens, dtype=np.int32),
         dcp_local_seq_lens=None,
-        positions=torch.arange(global_graph_size, dtype=torch.int64),
+        positions=torch.arange(num_global_tokens, dtype=torch.int64),
         attn_state="global",
         is_dummy=is_dummy,
         is_prefilling_np=np.zeros(num_global_tokens, dtype=np.bool_),
     )
-    original_restore_idx = torch.arange(global_graph_size, dtype=torch.int64).flip(0)
+    original_restore_idx = torch.arange(num_global_tokens, dtype=torch.int64).flip(0)
     pcp_context = AscendPCPAttentionContext(
         global_batch=global_batch,
-        global_block_tables=(torch.arange(global_graph_size, dtype=torch.int32).view(-1, 1),),
+        global_block_tables=(torch.arange(num_global_tokens, dtype=torch.int32).view(-1, 1),),
         global_slot_mappings=global_slots.unsqueeze(0),
         hidden_restore_idx=original_restore_idx,
         is_full_decode_graph=True,
@@ -2102,8 +2102,8 @@ def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool, num_local_
     assert actual.global_dsa_metadata is global_metadata
     assert actual.hidden_restore_idx.shape == (global_graph_size,)
     assert actual.hidden_restore_idx.data_ptr() == builder._hidden_restore_idx_buffer.data_ptr()
-    expected_restore_idx = original_restore_idx.clone()
-    expected_restore_idx[num_global_tokens:] = 0
+    expected_restore_idx = torch.zeros(global_graph_size, dtype=torch.int64)
+    expected_restore_idx[:num_global_tokens] = original_restore_idx
     assert torch.equal(actual.hidden_restore_idx, expected_restore_idx)
 
     global_call = builder._global_metadata_builder.build.call_args
@@ -2113,7 +2113,16 @@ def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool, num_local_
     assert global_common.num_input_tokens == global_graph_size
     assert torch.equal(global_common.query_start_loc, torch.arange(global_graph_size + 1, dtype=torch.int32))
     assert torch.equal(global_common.query_start_loc_cpu, global_common.query_start_loc)
-    assert global_call.kwargs["num_actual_reqs"] == num_global_tokens
+    assert global_call.kwargs["num_actual_reqs"] == (global_graph_size if is_dummy else num_global_tokens)
+    assert global_batch.num_tokens_after_padding == global_batch.num_reqs_after_padding == num_global_tokens
+    assert torch.equal(global_batch.query_start_loc, global_offsets)
+    if is_dummy:
+        assert global_common.slot_mapping.eq(-1).all()
+    else:
+        assert torch.equal(global_common.positions[:num_global_tokens], global_batch.positions)
+        assert global_common.slot_mapping[num_global_tokens:].eq(-1).all()
+        assert global_common.seq_lens[num_global_tokens:].eq(0).all()
+        assert global_common.block_table_tensor[num_global_tokens:].eq(0).all()
     assert global_call.kwargs["full_graph_mode"] is True
     assert global_call.kwargs["can_use_rope_cache"] is False
 
@@ -2131,6 +2140,75 @@ def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool, num_local_
     assert local_call.kwargs["num_actual_reqs"] == num_local_tokens
     assert local_call.kwargs["full_graph_mode"] is True
     assert local_call.kwargs["common_ratio_to_sas_metadata"] is shared_local_metadata
+
+
+@pytest.mark.parametrize("pcp_size,capacity", [(2, 8), (4, 7)])
+def test_pcp_global_decode_metadata_keeps_capture_storage_and_clears_padding(pcp_size, capacity):
+    builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
+    builder._pcp_world_size = pcp_size
+    builder._global_decode_capacity = capacity
+    builder._global_decode_metadata = None
+    builder._hidden_restore_idx_buffer = torch.empty(capacity, dtype=torch.int64)
+    captured_pointers = None
+    for local_size, actual_reqs, is_dummy in [(2, 2, True), (2, 3, False), (1, 1, False), (2, 1, True), (2, 3, False)]:
+        positions = torch.arange(actual_reqs, dtype=torch.int64) * 10 + 10
+        seq_lens = positions.to(torch.int32) + 1
+        offsets = torch.arange(actual_reqs + 1, dtype=torch.int32)
+        block_table = torch.arange(actual_reqs * 2, dtype=torch.int32).reshape(actual_reqs, 2) + 1
+        slots = torch.arange(actual_reqs, dtype=torch.int64) + 10
+        common = AscendCommonAttentionMetadata(
+            query_start_loc=offsets,
+            query_start_loc_cpu=offsets.clone(),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            num_computed_tokens_cpu=seq_lens - 1,
+            num_reqs=actual_reqs,
+            num_actual_tokens=actual_reqs,
+            max_query_len=1,
+            max_seq_len=128,
+            block_table_tensor=block_table,
+            slot_mapping=slots,
+            positions=positions,
+            num_input_tokens=actual_reqs,
+            is_prefilling=torch.zeros(actual_reqs, dtype=torch.bool),
+        )
+        context = AscendPCPAttentionContext(
+            global_batch=SimpleNamespace(num_tokens=actual_reqs, is_dummy=is_dummy),
+            global_block_tables=(block_table,),
+            global_slot_mappings=slots.unsqueeze(0),
+            hidden_restore_idx=torch.arange(actual_reqs, dtype=torch.int64),
+            is_full_decode_graph=True,
+        )
+        staged = builder._pad_global_decode_metadata(common, local_size, is_dummy=is_dummy)
+        hidden_restore_idx = builder._prepare_hidden_restore_idx(context, staged.num_input_tokens)
+        size = min(pcp_size * local_size, capacity)
+        assert staged.num_actual_tokens == staged.num_reqs == staged.num_input_tokens == size
+        assert staged.query_start_loc.tolist() == list(range(size + 1))
+        assert staged._seq_lens_cpu is staged.seq_lens_cpu
+        assert staged._num_computed_tokens_cpu is staged.num_computed_tokens_cpu
+        assert common.num_actual_tokens == common.num_reqs == common.num_input_tokens == actual_reqs
+        tensors = (
+            staged.positions,
+            staged.query_start_loc,
+            staged.seq_lens,
+            staged.block_table_tensor,
+            staged.slot_mapping,
+            hidden_restore_idx,
+        )
+        pointers = [tensor.data_ptr() for tensor in tensors]
+        if captured_pointers is None:
+            captured_pointers = pointers
+        assert pointers == captured_pointers
+        if is_dummy:
+            assert staged.slot_mapping.eq(-1).all()
+            assert staged.seq_lens.eq(1).all()
+        else:
+            assert staged.positions[:actual_reqs].tolist() == positions.tolist()
+            assert staged.slot_mapping.tolist() == list(range(10, 10 + actual_reqs)) + [-1] * (size - actual_reqs)
+            assert staged.seq_lens[actual_reqs:].eq(0).all()
+            assert staged.seq_lens_cpu[actual_reqs:].eq(0).all()
+            assert staged.block_table_tensor[actual_reqs:].eq(0).all()
+        assert hidden_restore_idx[actual_reqs:].eq(0).all()
 
 
 def test_pcp_global_rope_graph_buffers_refresh_without_aliasing_local_rope():

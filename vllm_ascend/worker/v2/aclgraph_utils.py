@@ -178,15 +178,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
         global_num_reqs = num_reqs
-        pcp_manager = self.model_runner.pcp_manager
-        if (
-            pcp_manager is not None
-            and pcp_manager.shard_decode_requests
-            and self.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
-            and self.vllm_config.speculative_config is None
-            and self.decode_query_len == 1
-            and uniform_token_count == 1
-        ):
+        if self.model_runner.use_pcp_decode_graphs and uniform_token_count == 1:
             # Upstream dispatch receives the largest PCP-local token count but
             # the global request count. Ordinary decode has one local request
             # per token, including when DP redispatch supplies a padded count.
