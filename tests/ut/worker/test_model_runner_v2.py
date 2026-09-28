@@ -1,6 +1,4 @@
-import ast
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -13,6 +11,7 @@ from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -294,35 +293,48 @@ def test_sample_tokens_restores_replicated_draft_hidden_states():
     assert runner.execute_model_state is restored_state
 
 
-def test_prepare_inputs_preserves_pcp_tokens_and_forwards_graph_padding():
-    source_path = Path(__file__).parents[3] / "vllm_ascend" / "worker" / "v2" / "model_runner.py"
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    padding_assignments = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "num_tokens_after_padding" for target in node.targets)
-    ]
-    partition_calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "maybe_partition_pcp_batch"
-    ]
+def _make_pcp_graph_manager(*, sharded=True):
+    manager = ModelAclGraphManager.__new__(ModelAclGraphManager)
+    manager.model_runner = SimpleNamespace(pcp_manager=SimpleNamespace(shard_decode_requests=sharded))
+    manager.vllm_config = SimpleNamespace(speculative_config=None)
+    manager.compilation_config = SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4], max_cudagraph_capture_size=4)
+    manager.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    manager.decode_query_len = 1
+    manager.max_num_reqs = 4
+    manager.varlen_decode = False
+    manager.lora_capture_cases = [0]
+    manager.ubatch_runner = None
+    manager._candidates = {}
+    manager._capture_descs = {}
+    manager._lora_dispatch_map = {}
+    manager._graphs_captured = True
+    manager._init_candidates()
+    return manager
 
-    # prepare_inputs keeps the real global PCP batch when it is larger than the
-    # graph descriptor, and forwards the whole descriptor (upstream vLLM #53867
-    # changed maybe_partition_pcp_batch from padded_num_tokens to a
-    # BatchExecutionDescriptor).
-    assert len(padding_assignments) == 1
-    assert ast.unparse(padding_assignments[0].value) == "max(num_tokens, batch_desc.num_tokens)"
 
-    assert len(partition_calls) == 1
-    partition_call = partition_calls[0]
-    batch_desc_kw = next(keyword.value for keyword in partition_call.keywords if keyword.arg == "batch_desc")
-    assert isinstance(batch_desc_kw, ast.Name)
-    assert batch_desc_kw.id == "batch_desc"
+@pytest.mark.parametrize("global_reqs,local_tokens", [(4, 2), (3, 2), (2, 1), (1, 1), (3, 4)])
+def test_pcp_full_decode_dispatch_uses_local_request_count(global_reqs, local_tokens):
+    manager = _make_pcp_graph_manager()
+    desc = manager.dispatch(global_reqs, local_tokens, uniform_token_count=1, num_active_loras=0, max_query_len=1)
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.num_tokens == local_tokens
+    assert desc.num_reqs == local_tokens
+
+
+@pytest.mark.parametrize("uniform_token_count,local_tokens", [(1, 5), (None, 2)])
+def test_pcp_decode_dispatch_keeps_global_requests_on_eager_fallback(uniform_token_count, local_tokens):
+    manager = _make_pcp_graph_manager()
+    desc = manager.dispatch(7, local_tokens, uniform_token_count, num_active_loras=0)
+    assert desc.cg_mode == CUDAGraphMode.NONE
+    assert desc.num_reqs == 7
+    assert desc.num_tokens == local_tokens
+
+
+def test_replicated_pcp_dispatch_keeps_global_request_constraint():
+    manager = _make_pcp_graph_manager(sharded=False)
+    desc = manager.dispatch(4, 2, uniform_token_count=1, num_active_loras=0)
+    assert desc.cg_mode == CUDAGraphMode.NONE
+    assert desc.num_reqs == 4
 
 
 @pytest.mark.parametrize("num_reqs,num_tokens", [(4, 4), (2, 6)])
@@ -778,6 +790,8 @@ def _run_prepare_inputs(
     *,
     prefill_inputs=None,
     combine_tokens=None,
+    make_batch=None,
+    partition=None,
 ):
     batch = SimpleNamespace(positions=torch.zeros(4, dtype=torch.int32))
 
@@ -799,15 +813,49 @@ def _run_prepare_inputs(
             "vllm_ascend.worker.v2.model_runner.expand_idx_mapping",
             return_value=(torch.tensor([0, 1], dtype=torch.int32), torch.zeros(2, dtype=torch.int32)),
         ),
-        patch("vllm_ascend.worker.v2.model_runner.AscendInputBatch", return_value=batch),
+        patch("vllm_ascend.worker.v2.model_runner.AscendInputBatch", side_effect=make_batch, return_value=batch),
         patch.object(
             vllm_model_runner,
             "pcp",
-            SimpleNamespace(maybe_partition_pcp_batch=_partition),
+            SimpleNamespace(maybe_partition_pcp_batch=partition or _partition),
         ),
         patch("vllm_ascend.worker.v2.model_runner.update_cos_sin"),
     ):
         return runner.prepare_inputs(scheduler_output, batch_req_state, batch_desc), batch
+
+
+@pytest.mark.parametrize("graph_tokens", [1, 4])
+def test_sharded_decode_prepares_global_batch_before_local_graph_padding(graph_tokens):
+    runner, scheduler_output, batch_state, batch_desc = _prepare_inputs_runner(full_cg=True)
+    runner.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    runner.pcp_manager = SimpleNamespace(shard_decode_requests=True)
+    batch_state.num_tokens = 2
+    batch_state.num_scheduled_tokens = np.ones(2, dtype=np.int32)
+    batch_state.has_prefill = False
+    batch_state.is_prefilling_np = np.zeros(2, dtype=np.bool_)
+    batch_state.num_computed_prefill_tokens_np = batch_state.prefill_len_np.copy()
+    scheduler_output.num_scheduled_tokens = {"r0": 1, "r1": 1}
+    batch_desc.num_tokens = graph_tokens
+    batch_desc.num_reqs = graph_tokens
+    partition = Mock(side_effect=lambda manager, batch, **kwargs: batch)
+
+    batch, _ = _run_prepare_inputs(
+        runner,
+        scheduler_output,
+        batch_state,
+        batch_desc,
+        make_batch=AscendInputBatch,
+        partition=partition,
+    )
+
+    assert batch.num_tokens == batch.num_tokens_after_padding == 2
+    assert batch.num_reqs == batch.num_reqs_after_padding == 2
+    assert batch.input_ids.shape == batch.positions.shape == (2,)
+    assert batch.seq_lens.shape == (2,)
+    assert batch.logits_indices.tolist() == [0, 1]
+    np.testing.assert_array_equal(batch.query_start_loc_np, [0, 1, 2])
+    assert batch.query_start_loc.tolist() == [0, 1, 2]
+    partition.assert_called_once_with(runner.pcp_manager, batch, batch_desc=batch_desc)
 
 
 def test_prepare_inputs_common_path():

@@ -324,6 +324,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.use_mla_rope = static_forward_context[layer_names[0]].impl.use_mla_rope if layer_names else True
         self.cos_cache = None
         self.sin_cache = None
+        # KV gathering consumes padded rank-local RoPE, independently of the
+        # decode query RoPE cache. Allocate to capacity once so graph buckets
+        # keep the same backing storage throughout this builder's lifetime.
+        self._pcp_rope_capacity = scheduler_config.max_num_batched_tokens
+        self._pcp_kv_cos: torch.Tensor | None = None
+        self._pcp_kv_sin: torch.Tensor | None = None
 
         self.chunk_seq_lens: torch.Tensor = None
         self.cu_seq_lens_cpu: torch.Tensor = None
@@ -476,6 +482,39 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     ):
         self.num_actual_tokens = common_attn_metadata.num_actual_tokens
 
+    def _get_pcp_kv_cos_and_sin(
+        self,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage padded rank-local KV RoPE without aliasing the query cache."""
+        num_tokens = positions.shape[0]
+        if num_tokens > self._pcp_rope_capacity:
+            raise RuntimeError(
+                f"PCP MLA RoPE token count exceeds the metadata buffer: {num_tokens} > {self._pcp_rope_capacity}."
+            )
+
+        cos, sin = get_cos_and_sin_mla(positions)
+        expected_shape = (self._pcp_rope_capacity, *cos.shape[1:])
+        if self._pcp_kv_cos is None or self._pcp_kv_sin is None:
+            self._pcp_kv_cos = cos.new_empty(expected_shape)
+            self._pcp_kv_sin = sin.new_empty(expected_shape)
+        elif (
+            self._pcp_kv_cos.shape != expected_shape
+            or self._pcp_kv_cos.dtype != cos.dtype
+            or self._pcp_kv_cos.device != cos.device
+        ):
+            raise RuntimeError(
+                "PCP MLA RoPE metadata changed after its graph-stable buffers "
+                f"were allocated: buffer={tuple(self._pcp_kv_cos.shape)}, "
+                f"input={tuple(cos.shape)}."
+            )
+
+        assert self._pcp_kv_cos is not None
+        assert self._pcp_kv_sin is not None
+        self._pcp_kv_cos[:num_tokens].copy_(cos)
+        self._pcp_kv_sin[:num_tokens].copy_(sin)
+        return self._pcp_kv_cos[:num_tokens], self._pcp_kv_sin[:num_tokens]
+
     def build(
         self,
         common_prefix_len: int,
@@ -551,7 +590,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             assert expanded_slot_mapping is not None
             self._finalize_pcp_metadata(metadata, expanded_slot_mapping)
             if self.pcp_shard_decode_requests:
-                metadata.pcp_cos, metadata.pcp_sin = get_cos_and_sin_mla(common_attn_metadata.positions.long())
+                metadata.pcp_cos, metadata.pcp_sin = self._get_pcp_kv_cos_and_sin(common_attn_metadata.positions.long())
         return metadata
 
     def _finalize_pcp_metadata(

@@ -25,6 +25,7 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import override_forward_context
 from vllm.v1.attention.backend import AttentionCGSupport
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import (
     AscendDSACPImpl,
     AscendDSACPLayerMetadata,
@@ -54,6 +55,7 @@ from vllm_ascend.models.deepseek_v4.indexer import (
     AscendIndexerMetadata,
     IndexerOverlapPlan,
 )
+from vllm_ascend.ops.rope_dsv4 import RopeDataProxy
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     DeviceMetadataTask,
@@ -1876,6 +1878,7 @@ def test_pcp_metadata_builds_from_manager_global_view():
     builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
     builder._pcp_world_size = 2
     builder._pcp_rank = 1
+    builder._shard_decode_requests = False
     builder._hidden_restore_idx_buffer = torch.empty(8, dtype=torch.int64)
     builder.model_config = SimpleNamespace(get_head_size=lambda: 512)
 
@@ -1988,154 +1991,239 @@ def test_pcp_metadata_builds_from_manager_global_view():
     assert build_local.call_args.kwargs["num_actual_reqs"] == 2
 
 
-@pytest.mark.parametrize("is_dummy", [True, False], ids=["capture", "replay"])
-def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool):
-    """Cover the fixed graph metadata contract during capture and replay."""
-    graph_size = 4
-    num_actual_reqs = graph_size if is_dummy else 2
-    num_actual_tokens = num_actual_reqs
-    query_start_loc = (
-        torch.arange(graph_size + 1, dtype=torch.int32)
-        if is_dummy
-        else torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32)
-    )
-    expected_query_start_loc = torch.arange(graph_size + 1, dtype=torch.int32)
-    seq_lens = torch.ones(graph_size, dtype=torch.int32) if is_dummy else torch.tensor([8, 9, 0, 0], dtype=torch.int32)
+@pytest.mark.parametrize(
+    ("is_dummy", "num_local_tokens"),
+    [(True, 4), (False, 2), (False, 0)],
+    ids=["capture", "replay", "empty-owner"],
+)
+def test_pcp_graph_metadata_builds_fixed_decode_shape(is_dummy: bool, num_local_tokens: int):
+    """Global cache updates and owner-local queries retain distinct graph extents."""
+    local_graph_size = 4
+    global_graph_size = 8
+    num_global_tokens = global_graph_size if is_dummy else 3
+    # An empty owner still has the upstream placeholder request.
+    num_local_reqs = max(num_local_tokens, 1)
+    local_offsets = torch.arange(local_graph_size + 1, dtype=torch.int32).clamp(max=num_local_tokens)
+    global_offsets = torch.arange(global_graph_size + 1, dtype=torch.int32).clamp(max=num_global_tokens)
+    local_seq_lens = torch.zeros(local_graph_size, dtype=torch.int32)
+    local_seq_lens[:num_local_tokens] = 8
+    global_seq_lens = torch.zeros(global_graph_size, dtype=torch.int32)
+    global_seq_lens[:num_global_tokens] = 8
 
     builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
     builder._pcp_world_size = 2
     builder._pcp_rank = 1
-    builder._hidden_restore_idx_buffer = torch.empty(8, dtype=torch.int64)
+    builder._shard_decode_requests = True
+    builder._hidden_restore_idx_buffer = torch.empty(global_graph_size, dtype=torch.int64)
+    builder._global_rope_capacity = global_graph_size
+    builder._global_rope_buffers = {}
     builder.model_config = SimpleNamespace(get_head_size=lambda: 512)
 
-    global_slot_mappings = (
-        torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
-        if is_dummy
-        else torch.tensor([[10, 11, -1, -1]], dtype=torch.int64)
-    )
+    global_slots = torch.arange(global_graph_size, dtype=torch.int64)
+    global_slots[num_global_tokens:] = -1
     global_batch = SimpleNamespace(
-        num_reqs=num_actual_reqs,
-        num_reqs_after_padding=graph_size,
-        num_tokens=num_actual_tokens,
-        num_tokens_after_padding=graph_size,
-        query_start_loc=query_start_loc.clone(),
-        query_start_loc_np=query_start_loc.numpy().copy(),
-        seq_lens=seq_lens.clone(),
-        seq_lens_np=seq_lens.numpy().copy(),
-        seq_lens_cpu_upper_bound=seq_lens.clone(),
-        num_computed_tokens_np=np.arange(num_actual_reqs, dtype=np.int32),
-        num_scheduled_tokens=np.ones(num_actual_reqs, dtype=np.int32),
+        num_reqs=num_global_tokens,
+        num_reqs_after_padding=global_graph_size,
+        num_tokens=num_global_tokens,
+        num_tokens_after_padding=global_graph_size,
+        query_start_loc=global_offsets.clone(),
+        query_start_loc_np=global_offsets.numpy().copy(),
+        seq_lens=global_seq_lens.clone(),
+        seq_lens_np=global_seq_lens.numpy().copy(),
+        seq_lens_cpu_upper_bound=global_seq_lens.clone(),
+        num_computed_tokens_np=np.full(num_global_tokens, 7, dtype=np.int32),
+        num_scheduled_tokens=np.ones(num_global_tokens, dtype=np.int32),
         dcp_local_seq_lens=None,
-        positions=torch.arange(graph_size, dtype=torch.int64),
+        positions=torch.arange(global_graph_size, dtype=torch.int64),
         attn_state="global",
         is_dummy=is_dummy,
-        is_prefilling_np=np.zeros(num_actual_reqs, dtype=np.bool_),
+        is_prefilling_np=np.zeros(num_global_tokens, dtype=np.bool_),
     )
-    original_hidden_restore_idx = (
-        torch.tensor([3, 1, 2, 0], dtype=torch.int64) if is_dummy else torch.tensor([1, 0, 7, 6], dtype=torch.int64)
-    )
+    original_restore_idx = torch.arange(global_graph_size, dtype=torch.int64).flip(0)
     pcp_context = AscendPCPAttentionContext(
         global_batch=global_batch,
-        global_block_tables=(torch.arange(graph_size, dtype=torch.int32).view(-1, 1),),
-        global_slot_mappings=global_slot_mappings,
-        hidden_restore_idx=original_hidden_restore_idx,
+        global_block_tables=(torch.arange(global_graph_size, dtype=torch.int32).view(-1, 1),),
+        global_slot_mappings=global_slots.unsqueeze(0),
+        hidden_restore_idx=original_restore_idx,
+        is_full_decode_graph=True,
     )
-
-    local_slot_mapping = (
-        torch.arange(20, 20 + 2 * graph_size, dtype=torch.int64)
-        if is_dummy
-        else torch.tensor([20, 21, -1, -1, 30, 31, -1, -1], dtype=torch.int64)
-    )
+    gathered_slots = torch.arange(2 * local_graph_size, dtype=torch.int64)
+    gathered_slots[local_graph_size + num_local_tokens :] = -1
+    expected_local_slots = gathered_slots.view(2, local_graph_size)[1].clone()
+    if is_dummy:
+        expected_local_slots.fill_(-1)
     local_common = AscendCommonAttentionMetadata(
-        query_start_loc=query_start_loc.clone(),
-        query_start_loc_cpu=query_start_loc.clone(),
-        seq_lens=seq_lens.clone(),
-        seq_lens_cpu=seq_lens.clone(),
-        seq_lens_cpu_upper_bound=seq_lens.clone(),
-        num_reqs=graph_size,
-        num_actual_tokens=num_actual_tokens,
+        query_start_loc=local_offsets.clone(),
+        query_start_loc_cpu=local_offsets.clone(),
+        seq_lens=local_seq_lens,
+        seq_lens_cpu=local_seq_lens.clone(),
+        seq_lens_cpu_upper_bound=local_seq_lens.clone(),
+        num_reqs=local_graph_size,
+        num_actual_tokens=num_local_tokens,
         max_query_len=1,
         max_seq_len=16,
-        block_table_tensor=torch.zeros((graph_size, 1), dtype=torch.int32),
-        slot_mapping=local_slot_mapping,
-        positions=torch.arange(graph_size, dtype=torch.int64),
+        block_table_tensor=torch.zeros((local_graph_size, 1), dtype=torch.int32),
+        slot_mapping=gathered_slots,
+        positions=torch.arange(local_graph_size, dtype=torch.int64),
         attn_state="local",
-        num_input_tokens=graph_size,
-        is_prefilling=torch.zeros(graph_size, dtype=torch.bool),
+        num_input_tokens=local_graph_size,
+        is_prefilling=torch.zeros(local_graph_size, dtype=torch.bool),
     )
+    rope = {"config": {"default": (torch.ones(global_graph_size, 1), torch.zeros(global_graph_size, 1))}}
     global_metadata = AscendDSAMetadata(
-        num_actual_tokens=num_actual_tokens,
-        num_decodes=graph_size,
-        num_decode_tokens=num_actual_tokens,
+        num_actual_tokens=global_graph_size,
+        num_decodes=global_graph_size,
+        num_decode_tokens=global_graph_size,
         num_prefills=0,
+        req_metadata=SimpleNamespace(cos=RopeDataProxy(rope), sin=RopeDataProxy(rope, is_cos=False)),
     )
     local_metadata = AscendDSAMetadata(
-        num_actual_tokens=num_actual_tokens,
-        num_decodes=graph_size,
-        num_decode_tokens=num_actual_tokens,
+        num_actual_tokens=local_graph_size,
+        num_decodes=local_graph_size,
+        num_decode_tokens=local_graph_size,
         num_prefills=0,
+        req_metadata=object(),
     )
-    builder._global_metadata_builder = SimpleNamespace(
-        build=MagicMock(return_value=global_metadata),
-    )
+    builder._global_metadata_builder = SimpleNamespace(build=MagicMock(return_value=global_metadata))
     shared_local_metadata = {"local": True}
-
-    with patch.object(
-        AscendDSAMetadataBuilder,
-        "build",
-        autospec=True,
-        return_value=local_metadata,
-    ) as build_local:
+    with patch.object(AscendDSAMetadataBuilder, "build", autospec=True, return_value=local_metadata) as build_local:
         actual = builder.build(
             0,
             local_common,
             pcp_context=pcp_context,
             pcp_cache_group_idx=0,
-            num_actual_reqs=num_actual_reqs,
+            num_actual_reqs=num_local_reqs,
             common_ratio_to_sas_metadata=shared_local_metadata,
         )
 
-    expected_global_slots = (
-        torch.full((1, graph_size), -1, dtype=torch.int64)
-        if is_dummy
-        else torch.tensor([[10, 11, -1, -1]], dtype=torch.int64)
-    )
-    expected_local_slots = (
-        torch.full((graph_size,), -1, dtype=torch.int64)
-        if is_dummy
-        else torch.tensor([30, 31, -1, -1], dtype=torch.int64)
-    )
-    expected_restore_idx = original_hidden_restore_idx if is_dummy else torch.tensor([1, 0, 0, 0], dtype=torch.int64)
-
+    assert actual.num_actual_tokens == local_graph_size
+    assert actual.req_metadata is local_metadata.req_metadata
+    assert actual.local_num_tokens_after_padding == local_graph_size
     assert actual.global_dsa_metadata is global_metadata
-    assert actual.local_num_tokens_after_padding == graph_size
-    assert torch.equal(actual.hidden_restore_idx, expected_restore_idx)
+    assert actual.hidden_restore_idx.shape == (global_graph_size,)
     assert actual.hidden_restore_idx.data_ptr() == builder._hidden_restore_idx_buffer.data_ptr()
+    expected_restore_idx = original_restore_idx.clone()
+    expected_restore_idx[num_global_tokens:] = 0
+    assert torch.equal(actual.hidden_restore_idx, expected_restore_idx)
 
     global_call = builder._global_metadata_builder.build.call_args
     global_common = global_call.args[1]
-    assert global_common.num_reqs == graph_size
-    assert global_common.num_actual_tokens == num_actual_tokens
-    assert global_common.num_input_tokens == graph_size
-    assert torch.equal(global_common.query_start_loc, expected_query_start_loc)
-    assert torch.equal(global_common.query_start_loc_cpu, expected_query_start_loc)
-    assert torch.equal(global_common.seq_lens, seq_lens)
-    assert torch.equal(global_common.slot_mapping, expected_global_slots[0])
-    assert global_call.kwargs["num_actual_reqs"] == num_actual_reqs
-    assert global_call.kwargs["can_use_rope_cache"] is True
-    assert global_call.kwargs["common_ratio_to_sas_metadata"] == {}
+    assert global_common.num_reqs == global_graph_size
+    assert global_common.num_actual_tokens == global_graph_size
+    assert global_common.num_input_tokens == global_graph_size
+    assert torch.equal(global_common.query_start_loc, torch.arange(global_graph_size + 1, dtype=torch.int32))
+    assert torch.equal(global_common.query_start_loc_cpu, global_common.query_start_loc)
+    assert global_call.kwargs["num_actual_reqs"] == num_global_tokens
+    assert global_call.kwargs["full_graph_mode"] is True
+    assert global_call.kwargs["can_use_rope_cache"] is False
 
+    # In particular, the empty owner must invoke the normal builder to refresh
+    # SAS/QLI metadata consumed by the graph captured with nonempty queries.
     local_call = build_local.call_args
     built_local_common = local_call.args[2]
-    assert built_local_common.num_reqs == graph_size
-    assert built_local_common.num_actual_tokens == num_actual_tokens
-    assert built_local_common.num_input_tokens == graph_size
-    assert torch.equal(built_local_common.query_start_loc, expected_query_start_loc)
-    assert torch.equal(built_local_common.query_start_loc_cpu, expected_query_start_loc)
-    assert torch.equal(built_local_common.seq_lens, seq_lens)
+    assert built_local_common.num_reqs == local_graph_size
+    assert built_local_common.num_actual_tokens == local_graph_size
+    assert built_local_common.num_input_tokens == local_graph_size
+    assert torch.equal(built_local_common.query_start_loc, torch.arange(local_graph_size + 1, dtype=torch.int32))
+    assert torch.equal(built_local_common.query_start_loc_cpu, built_local_common.query_start_loc)
+    assert torch.equal(built_local_common.seq_lens, local_seq_lens)
     assert torch.equal(built_local_common.slot_mapping, expected_local_slots)
-    assert local_call.kwargs["num_actual_reqs"] == num_actual_reqs
+    assert local_call.kwargs["num_actual_reqs"] == num_local_tokens
+    assert local_call.kwargs["full_graph_mode"] is True
     assert local_call.kwargs["common_ratio_to_sas_metadata"] is shared_local_metadata
+
+
+def test_pcp_global_rope_graph_buffers_refresh_without_aliasing_local_rope():
+    builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
+    builder._global_rope_capacity = 8
+    builder._global_rope_buffers = {}
+    captured_cos = captured_sin = None
+    for num_tokens, value in [(4, 1), (8, 2), (4, 3)]:
+        source_cos = torch.full((num_tokens, 1, 1, 2), float(value))
+        source_sin = -source_cos
+        rope = {"config": {"default": (source_cos, source_sin)}}
+        metadata = SimpleNamespace(req_metadata=SimpleNamespace(cos=RopeDataProxy(rope)))
+        builder._copy_global_rope_to_graph_buffers(metadata)
+        cos, sin = metadata.req_metadata.cos._data["config"]["default"]
+        if captured_cos is None:
+            captured_cos, captured_sin = cos, sin
+        assert cos.data_ptr() == captured_cos.data_ptr()
+        assert sin.data_ptr() == captured_sin.data_ptr()
+        assert cos.data_ptr() != source_cos.data_ptr()
+        assert sin.data_ptr() != source_sin.data_ptr()
+        # The local builder may overwrite the shared runtime RoPE immediately.
+        source_cos.zero_()
+        source_sin.zero_()
+        torch.testing.assert_close(captured_cos, torch.full_like(captured_cos, float(value)))
+        torch.testing.assert_close(captured_sin, torch.full_like(captured_sin, -float(value)))
+
+    too_large = {"config": {"default": (torch.zeros(9, 1, 1, 2), torch.zeros(9, 1, 1, 2))}}
+    with pytest.raises(ValueError, match="capacity"):
+        builder._copy_global_rope_to_graph_buffers(
+            SimpleNamespace(req_metadata=SimpleNamespace(cos=RopeDataProxy(too_large)))
+        )
+
+
+def test_pcp_graph_empty_owner_refreshes_local_device_metadata():
+    builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
+    builder.__dict__.update(_make_builder(compressor_ratio=4).__dict__)
+    AscendDSAMetadataBuilder.enable_device_metadata(builder)
+    query_offsets = torch.zeros(5, dtype=torch.int32)
+    seq_lens = torch.zeros(4, dtype=torch.int32)
+    captured_pointers = None
+    for num_actual_tokens in (2, 0, 1):
+        query_offsets.copy_(torch.arange(5, dtype=torch.int32).clamp(max=num_actual_tokens))
+        seq_lens.zero_()
+        seq_lens[:num_actual_tokens] = 8
+        common = AscendCommonAttentionMetadata(
+            query_start_loc=query_offsets,
+            query_start_loc_cpu=query_offsets.clone(),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            seq_lens_cpu_upper_bound=seq_lens.clone(),
+            num_reqs=4,
+            num_actual_tokens=num_actual_tokens,
+            max_query_len=1,
+            max_seq_len=16,
+            block_table_tensor=torch.ones((4, 2), dtype=torch.int32),
+            slot_mapping=torch.full((4,), -1, dtype=torch.int64),
+            positions=torch.arange(4, dtype=torch.int64),
+            attn_state=AscendAttentionState.DecodeOnly,
+            num_input_tokens=4,
+            is_prefilling=torch.zeros(4, dtype=torch.bool),
+        )
+        common = builder._build_graph_common_attn_metadata(common, num_actual_tokens, full_graph_mode=True)
+        with (
+            patch("vllm_ascend.attention.dsa_v1.get_cos_and_sin_dsa", return_value=(torch.ones(4), torch.zeros(4))),
+            patch(
+                "vllm_ascend.attention.dsa_v1.get_full_cos_and_sin_dsa", return_value=(torch.ones(1), torch.zeros(1))
+            ),
+        ):
+            metadata = builder._build_local_dsa_metadata(
+                0,
+                common,
+                False,
+                num_actual_reqs=num_actual_tokens,
+                common_ratio_to_sas_metadata={},
+                full_graph_mode=True,
+            )
+        assert metadata.num_actual_tokens == 4
+        assert metadata.req_metadata is not None
+        req = metadata.req_metadata
+        assert req.num_actual_reqs == 4
+        assert req.compressor_metadata is not None
+        pointers = (req.sas_metadata.data_ptr(), req.qli_metadata.data_ptr(), req.compressor_metadata[0].data_ptr())
+        if captured_pointers is None:
+            captured_pointers = pointers
+        assert pointers == captured_pointers
+        tasks = AscendDSAMetadataBuilder.take_device_metadata_tasks(builder)
+        assert {task.stage for task in tasks} == {
+            DeviceMetadataStage.COMPRESSOR,
+            DeviceMetadataStage.INDEXER,
+            DeviceMetadataStage.ATTENTION,
+        }
+        assert torch.equal(req.seq_lens, seq_lens)
+        assert torch.count_nonzero(req.block_table[num_actual_tokens:]) == 0
 
 
 def test_pcp_metadata_provider_discards_unused_global_tasks():
