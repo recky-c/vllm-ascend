@@ -167,6 +167,34 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
 
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
+    ) -> BatchExecutionDescriptor:
+        pcp_manager = self.model_runner.pcp_manager
+        if (
+            pcp_manager is not None
+            and pcp_manager.shard_decode_requests
+            and self.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and uniform_token_count is not None
+        ):
+            # PCP already supplies the maximum local token count. Uniform
+            # decode needs the corresponding local request capacity too.
+            num_reqs = num_tokens // uniform_token_count
+        return super().dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+            max_query_len=max_query_len,
+            num_ubatches=num_ubatches,
+        )
+
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
