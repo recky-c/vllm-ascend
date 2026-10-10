@@ -91,8 +91,10 @@ class _RecordingGDNReuseBuilder(AscendGDNAttentionMetadataBuilder):
     def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
         return self.build(0, common_attn_metadata, **kwargs)
 
-    def update_block_table(self, metadata, blk_table, slot_mapping=None):
+    def update_block_table(self, metadata, blk_table, slot_mapping=None, graph_state_updates=None):
         self.update_calls.append(metadata)
+        if graph_state_updates is not None:
+            graph_state_updates.append(blk_table)
         return SimpleNamespace(batch=metadata.batch, block_table=blk_table)
 
 
@@ -2486,3 +2488,69 @@ def test_mrv2_fia_groups_share_conversions_and_rebuild_each_invocation(monkeypat
         assert current.seq_lens_list is not first.seq_lens_list
         assert current is not first
         assert current.actual_seq_lengths_q is not first.actual_seq_lengths_q
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+@pytest.mark.parametrize("groups", [5, 24])
+def test_gdn_graph_state_flushes_all_global_groups_before_return(for_capture, groups):
+    builders, kwargs = _make_gdn_reuse_inputs(groups)
+    kwargs["model_specific_attn_metadata"] = MambaHybridAttnMetadata(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.full((2,), 3, dtype=torch.int32),
+    )
+    updater = MagicMock()
+    builders[0].graph_state_updater = updater
+    kwargs["for_cudagraph_capture"] = for_capture
+    result = attn_utils.build_attn_metadata(**kwargs)
+    updater.apply.assert_called_once()
+    updates = updater.apply.call_args.args[0]
+    assert len(updates) == groups - 1
+    for group, table in enumerate(updates, start=1):
+        assert table is kwargs["block_tables"][group]
+        assert result[f"layer{group}"].block_table is table
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_draft_exact_cpu_lengths_are_scoped_and_capture_remains_conservative(capture):
+    builders, kwargs = _make_gdn_reuse_inputs(2)
+    exact = torch.tensor([17, 35], dtype=torch.int32)
+    with attn_utils.dflash_draft_seq_lens_cpu(exact):
+        result = attn_utils.build_attn_metadata(**kwargs, for_cudagraph_capture=capture)
+        common = builders[0].build_calls[-1][0]
+        assert common.seq_lens_cpu_is_exact is not capture
+        torch.testing.assert_close(common.seq_lens_cpu, kwargs["seq_lens_cpu_upper_bound"] if capture else exact)
+        assert common.seq_lens.data_ptr() == kwargs["seq_lens"].data_ptr()
+        assert result["layer0"].batch is kwargs["query_start_loc_gpu"]
+    attn_utils.build_attn_metadata(**kwargs)
+    assert not builders[0].build_calls[-1][0].seq_lens_cpu_is_exact
+    torch.testing.assert_close(builders[0].build_calls[-1][0].seq_lens_cpu, kwargs["seq_lens_cpu_upper_bound"])
+
+
+def test_exact_cpu_length_scope_nests_and_resets_after_exception():
+    first = torch.tensor([17, 35], dtype=torch.int32)
+    second = first + 1
+    assert attn_utils._DFLASH_DRAFT_SEQ_LENS_CPU.get() is None
+    with attn_utils.dflash_draft_seq_lens_cpu(first):
+        with pytest.raises(RuntimeError, match="stop"), attn_utils.dflash_draft_seq_lens_cpu(second):
+            assert attn_utils._DFLASH_DRAFT_SEQ_LENS_CPU.get() is second
+            raise RuntimeError("stop")
+        assert attn_utils._DFLASH_DRAFT_SEQ_LENS_CPU.get() is first
+    assert attn_utils._DFLASH_DRAFT_SEQ_LENS_CPU.get() is None
+
+
+def test_explicit_exact_mirror_overrides_scoped_mirror():
+    builders, kwargs = _make_gdn_reuse_inputs(2)
+    explicit = torch.tensor([7, 11], dtype=torch.int32)
+    with attn_utils.dflash_draft_seq_lens_cpu(torch.tensor([18, 36], dtype=torch.int32)):
+        attn_utils.build_attn_metadata(**kwargs, seq_lens_cpu=explicit)
+    common = builders[0].build_calls[-1][0]
+    assert common.seq_lens_cpu_is_exact
+    torch.testing.assert_close(common.seq_lens_cpu, explicit)
+
+
+def test_incomplete_exact_mirror_rejected_before_any_group_build():
+    builders, kwargs = _make_gdn_reuse_inputs(2)
+    with pytest.raises(ValueError, match="complete"):
+        attn_utils.build_attn_metadata(**kwargs, seq_lens_cpu=torch.ones(1, dtype=torch.int32))
+    assert all(not builder.build_calls for builder in builders)

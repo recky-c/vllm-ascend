@@ -342,6 +342,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         host_seq_lens = common_attn_metadata.dflash_draft_seq_lens_cpu_upper_bound
         if type(self) is not AscendAttentionMetadataBuilder or isinstance(self.kv_cache_spec, CrossAttentionSpec):
             host_seq_lens = None
+        if (
+            host_seq_lens is None
+            and common_attn_metadata.seq_lens_cpu_is_exact
+            and type(self) is AscendAttentionMetadataBuilder
+            and not isinstance(self.kv_cache_spec, CrossAttentionSpec)
+        ):
+            exact_cpu = common_attn_metadata.seq_lens_cpu
+            if exact_cpu is not None and exact_cpu.device.type == "cpu" and exact_cpu.numel() >= num_reqs:
+                # Padded graph queries need a benign length even when the
+                # upstream query boundaries have no live tokens in this row.
+                active = query_start_loc_cpu[1:] > query_start_loc_cpu[:-1]
+                host_seq_lens = torch.where(active, exact_cpu[:num_reqs], 1)
         if host_seq_lens is None:
             host_seq_lens = seq_lens
         # Keep the existing conversion cache API, including its tuple payload.
@@ -376,7 +388,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens,
+            seq_lens_cpu=(
+                common_attn_metadata.seq_lens_cpu
+                if common_attn_metadata.seq_lens_cpu_is_exact and host_seq_lens.device.type == "cpu"
+                else seq_lens
+            ),
             seq_lens_list=seq_lens_list,
             actual_seq_lengths_q=actual_seq_lengths_q,
         )
@@ -432,6 +448,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 seq_lens.dtype,
                 seq_lens.device,
                 tensor_view_key(common_attn_metadata.dflash_draft_seq_lens_cpu_upper_bound),
+                common_attn_metadata.seq_lens_cpu_is_exact,
+                tensor_view_key(common_attn_metadata.seq_lens_cpu)
+                if common_attn_metadata.seq_lens_cpu_is_exact
+                else None,
                 id(common_attn_metadata.is_prefilling),
                 id(common_attn_metadata.context_parallel_metadata),
             )

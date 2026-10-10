@@ -106,7 +106,7 @@ may become visible, especially in noncausal Full attention, and causal/SWA
 alignment can also shift. It deliberately trades some draft acceptance for
 less metadata synchronization; there is no exact device mask for that interval.
 Target verification remains exact. Full-model output equivalence, acceptance,
-and net throughput for this combined branch require separate measurement.
+and net throughput for this optimistic mode have not been measured.
 The option does not remove the runner's earlier corrected-count D2H wait or
 the target FIA readback, and has no guaranteed performance gain.
 
@@ -136,10 +136,11 @@ A further 150 NPU metadata tests passed on the new base: aligned-state Triton
 calculations, physical group mappings, changing inputs, and graph capture/replay.
 These tests cover metadata preparation, not a complete model forward pass.
 
-The combined branch on the new base has no full-model accuracy or performance
-result. Python import checks using existing native extensions do not establish
-compatibility with all operators in the new base, which includes renamed native
-symbols. Build matching native extensions before deploying this revision.
+Whole-model checks of the later exact-metadata increment are described below.
+They used this environment's existing runtime resources and process-local import
+bootstrap. These runs establish compatibility for the exercised model paths in
+that environment, rather than every new-base operator or native-build/ABI
+combination. Other environments need matching native resources.
 
 Earlier experiments on the old base are separate evidence, not measurements of
 this combined port. In a Qwen3.5-9B DFlash TP2 width-five experiment, 38 KV groups
@@ -164,3 +165,140 @@ The external header, rebuilt FLA binaries, and CANN packages are not included in
 this branch. Metadata reuse and fixed-width grouping do not replace that runtime
 fix. Machine-specific launch scripts and the separate target-CPU-length
 experiment are also excluded.
+
+## PR18139 exact metadata and graph preparation increment
+
+`enable_dflash_exact_metadata_optimizations` defaults to `true`. For ordinary
+MRV2 DFlash FIA with PP/PCP/DCP equal to one, live pure-decode proposals copy the
+current rejection-corrected device lengths **E** to a persistent pinned CPU
+buffer once. The copy is queued on a dedicated stream after the final global
+draft KV group writes the shared length buffer, before context KV work. Host
+metadata waits for the copy event, then shares the exact mirror across compatible
+FIA builders. Device length tensors and target attention retain their exact
+contracts. Inactive padded requests use a benign FIA host length of one.
+
+This retains one device-to-host copy and its event synchronization. It does not
+remove the target runner's corrected-count readback. The earlier implementation
+already shares FIA lists within each build, so this increment must not be
+interpreted as reducing one synchronization per layer to one per proposal.
+
+Supported FULL layouts reuse a template across proposals. The template key
+includes live and padded shape, query width, step, group causality, builder/KV
+specification and input layout. Every proposal refreshes exact host lists, device
+length views, global-group physical block tables and slot mappings; mutable
+per-step scratch and reshape events are cleared. Shrinking or growing the live
+batch and changes in layout force a fresh build. Capture, dummy/profile runs,
+prefill, adaptive verification, specialized/sink backends and context parallel
+retain their original metadata path.
+
+The separate `enable_dflash_deferred_metadata` control defaults to `false`.
+The default prepares host metadata before replay and allocates no neutral KV
+resources. When explicitly enabled, a compatible `UpdatableGraph` may queue its
+independent query prefix before host metadata preparation. The update stream's
+input dependency is recorded **before**
+replay is queued, and every FIA task remains behind its external update event.
+Only FIA-only graphs with preallocated independent neutral K/V and block-table
+parameters may use this order. The first build and layout changes use the normal
+metadata-first order. If host preparation fails after replay, all waiting FIA
+tasks receive legal neutral parameters, the graph drains, caches are invalidated
+and the original exception is raised. Neutral resources remain owned by the
+graph; they add one zero KV page per captured FIA task and a separate block table.
+Neutral KV supports only ND format, dense inner dimensions and a positive outer
+page stride at least as large as the payload. Independent zero backing preserves
+the live strides without changing live K/V or physical block tables. Packed,
+overlapping or unknown geometry and other task kinds retain the normal order.
+
+The deferred option remains experimental. Three historical native comparisons
+observed intermittent noncausal Full graph-versus-first-functional differences
+in BF16, including a failure after all task updates were submitted before any
+external event was released. The responsible output and root cause remain
+unclassified. Repeated passing runs and exact model tokens do not resolve this
+component gate. Separating deferred execution from the default is a release
+scope decision, not a numerical fix.
+
+The previous `enable_dflash_draft_kv_optimistic_bound=true` option takes priority
+and disables the new exact mirror, template and graph-overlap path together.
+Its optimistic U experiment and new-block zeroer retain their prior behavior.
+To use the original exact metadata path, set:
+
+```bash
+--additional-config '{"enable_dflash_exact_metadata_optimizations": false}'
+```
+
+`enable_gdn_graph_state_batching` is independently enabled by default. It batches
+compatible MRV2 GDN graph-state copy, fill and reset operations; it does not
+require aligned prefix caching and is not disabled by the optimistic flag.
+Unsupported states/builders keep the per-group path. To disable both increments:
+
+```bash
+--additional-config '{"enable_dflash_exact_metadata_optimizations": false, "enable_gdn_graph_state_batching": false}'
+```
+
+The DFlash component test runs the real rejection/input producer, last-group
+snapshot callback, metadata producer/builders, graph manager and external events.
+It compares four rounds with different exact lengths and physical tables,
+including shrink/growth, against eager attention with the same E for noncausal
+Full and causal sparse-mode-4 SWA with window 4096. It also checks finite neutral
+exception recovery, unchanged live KV, and recovery of the next proposal.
+The small upstream graph-dispatch entry is replaced by `graph.replay` in this
+component fixture; no model weights are loaded. Whole-model accuracy, draft
+acceptance and throughput are separate validations and are not established by
+these component comparisons.
+
+The final default separation passed 734 related CPU tests and 12 native tests on
+an isolated NPU, including the previous optimistic-bound and new-block-zeroer
+regressions. Five fixed independent processes also passed the default
+metadata-first four-round comparison without a diagnostic or resolver observer.
+Explicit deferred fixtures retain prefix/neutral rescue coverage; they do not
+dismiss the historical numerical failures. A fresh prefix sentinel, read on an
+independent stream before FIA
+parameter updates, proves current replay progress; an event completed during
+capture alone is insufficient evidence. This test-only probe adds no polling to
+the implementation. The exact mirror and overlap follow the fixed PR18139
+[`ed96262`](https://github.com/vllm-project/vllm-ascend/commit/ed96262a41b4e44aade00a8888eac30abd50806c)
+and [`f2c9582`](https://github.com/vllm-project/vllm-ascend/commit/f2c95825917da6f08f52b4f0adbe1cdd07609e6c)
+increments, adapted to the current upstream uniform metadata producer.
+
+## Whole-model validation of the default configuration
+
+An independent Qwen3.5-9B DFlash TP1, K3, FULL-graph check compared published
+`78349326e` with the increment's default configuration. Nine target and nine
+draft graph sizes captured successfully. Across nine phases, all 27 requests and
+4116 generated tokens matched exactly, as did each phase's speculative acceptance
+counter deltas. Batch growth/shrink and long contexts were included. Two extra
+batch-two phases with context lengths 8186 then 4094 brought the checked run to
+31 requests and 4628 tokens.
+
+One idle-only counter flush observed 519 exact snapshots and 490 template
+refreshes, with zero early replays and no neutral resources owned by the three
+used graph descriptors. The target's 24 GDN builders were
+`AscendGDNHostMetadataBuilder`, with block-table updates unsupported and no
+graph-state updater, so GDN batching fell back. These results verify the default
+DFlash mirror/template path; they establish no whole-model GDN batching gain.
+The six draft groups were five causal SWA4096 groups and one noncausal Full
+group, using BF16 ND strided K/V with physical blocks 640 and kernel blocks 128.
+
+Separate uninstrumented increment-OFF and increment-ON service launches matched
+all output tokens and per-phase acceptance deltas for 29 main requests and the
+four-request 8K-to-4K turnover workload. Deferred execution stayed disabled.
+Five steady batch-four samples each generated 732 completion tokens:
+
+| Metric | Increment OFF mean | Increment ON mean | Change |
+| --- | --- | --- | --- |
+| Batch wall time | 3.29432 s | 3.22185 s | -2.20% |
+| Framework mean request TPOT | 14.4667 ms | 14.1489 ms | -2.20% |
+
+Wall-time standard deviations were 0.02153 s and 0.02789 s; TPOT standard
+deviations were 0.08730 ms and 0.12128 ms. This is an observation from five
+synthetic samples on one device. Wall time includes prefill, client and API
+work; TPOT is the framework's per-request mean. It is not a production benchmark,
+a formal model-accuracy suite or confirmation of upstream performance claims.
+Earlier timings from a wrapper that wrote per-proposal counters to a network
+filesystem are excluded. The optimistic U mode remains unmeasured.
+
+These model launches used CANN 9.2beta2, the existing corrected 64-bit FLA runtime
+and process-local native-resource bootstrap with the installed
+PyTorch/torch_npu/vLLM. No production package was replaced or native extension
+rebuilt. This is a real model check in that environment, not a general native
+build or ABI guarantee. The default results do not resolve the experimental
+deferred path's historical numerical discrepancies.

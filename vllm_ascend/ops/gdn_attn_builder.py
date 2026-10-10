@@ -32,6 +32,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.metadata_reuse import tensor_view_key
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
@@ -375,6 +376,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         if self.supports_update_block_table:
             self.mamba_aligned_state_indices: torch.Tensor | None = None
+            if get_ascend_config().enable_gdn_graph_state_batching:
+                # Keep MRV1 and specialized builders on their original path.
+                from vllm_ascend.ops.triton.v2.mamba.graph_state import GDNGraphStateUpdater
+
+                self.graph_state_updater = GDNGraphStateUpdater()
         sequence_index_capacity = max(
             self.vllm_config.scheduler_config.max_num_seqs,
             self.decode_cudagraph_max_bs,
@@ -1091,6 +1097,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         metadata: GDNAttentionMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor | None = None,
+        graph_state_updates: list | None = None,
     ) -> GDNAttentionMetadata:
         """Follow upstream's update contract: replace only group-local inputs.
 
@@ -1123,10 +1130,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_indices = torch.index_select(block_table[:, 0], 0, m.non_spec_sequence_indices)
             prefill_indices = conv_cache_indices = non_spec_indices
 
-        if self.use_full_cuda_graph and self.use_spec_decode and m.num_spec_decodes == 0:
-            # The first build already clears shared query/accepted/length inputs.
-            # Each group's captured physical state input still needs clearing.
-            self.spec_state_indices_tensor[: m.gdn_graph_request_count].fill_(PAD_SLOT_ID)
+        clear_spec = self.use_full_cuda_graph and self.use_spec_decode and m.num_spec_decodes == 0
+        reset = self.spec_state_indices_tensor[: m.gdn_graph_request_count] if clear_spec else None
+        if clear_spec and (graph_state_updates is None or m.num_prefills > 0):
+            # Clear the complete captured request range even for zero draft.
+            reset.fill_(PAD_SLOT_ID)
         if (
             self.use_full_cuda_graph
             and m.num_prefills == 0
@@ -1134,27 +1142,57 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             and m.num_spec_decodes > 0
             and self._can_pad_spec_decode(m.spec_query_start_loc.size(0) - 1, m.num_spec_decode_tokens)
         ):
-            spec_indices = _materialize_graph_request_tensor(
-                self.spec_state_indices_tensor,
-                spec_indices,
-                m.num_spec_decodes,
-                m.spec_query_start_loc.size(0) - 1,
-                self._SPEC_GRAPH_PAD_SLOT_ID,
-            )
+            graph_rows = m.spec_query_start_loc.size(0) - 1
+            if graph_state_updates is None:
+                spec_indices = _materialize_graph_request_tensor(
+                    self.spec_state_indices_tensor,
+                    spec_indices,
+                    m.num_spec_decodes,
+                    graph_rows,
+                    self._SPEC_GRAPH_PAD_SLOT_ID,
+                )
+            else:
+                graph_state_updates.append(
+                    (
+                        spec_indices,
+                        self.spec_state_indices_tensor,
+                        m.num_spec_decodes,
+                        graph_rows,
+                        self._SPEC_GRAPH_PAD_SLOT_ID,
+                        None,
+                    )
+                )
+                spec_indices = self.spec_state_indices_tensor[:graph_rows]
         elif (
             self.use_full_cuda_graph
             and m.num_prefills == 0
             and m.num_spec_decodes == 0
             and m.non_spec_query_start_loc.size(0) - 1 <= self.decode_cudagraph_max_bs
         ):
-            non_spec_indices = _materialize_graph_request_tensor(
-                self.non_spec_state_indices_tensor,
-                non_spec_indices,
-                m.num_decode_tokens,
-                m.non_spec_query_start_loc.size(0) - 1,
-                NULL_BLOCK_ID,
-            )
+            graph_rows = m.non_spec_query_start_loc.size(0) - 1
+            if graph_state_updates is None:
+                non_spec_indices = _materialize_graph_request_tensor(
+                    self.non_spec_state_indices_tensor,
+                    non_spec_indices,
+                    m.num_decode_tokens,
+                    graph_rows,
+                    NULL_BLOCK_ID,
+                )
+            else:
+                graph_state_updates.append(
+                    (
+                        non_spec_indices,
+                        self.non_spec_state_indices_tensor,
+                        m.num_decode_tokens,
+                        graph_rows,
+                        NULL_BLOCK_ID,
+                        reset,
+                    )
+                )
+                non_spec_indices = self.non_spec_state_indices_tensor[:graph_rows]
             conv_cache_indices = non_spec_indices
+        elif clear_spec and graph_state_updates is not None and m.num_prefills == 0:
+            reset.fill_(PAD_SLOT_ID)
         result = replace(
             m,
             spec_state_indices_tensor=spec_indices,

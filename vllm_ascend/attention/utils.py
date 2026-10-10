@@ -267,6 +267,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # per-request bound, not a corrected CPU mirror. Device consumers must
     # continue using seq_lens; target/prefill metadata never sets this field.
     dflash_draft_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+    # Execution-local mirror of this draft step's rejection-corrected device
+    # lengths, shared by ordinary FIA host-list consumers only.
+    seq_lens_cpu_is_exact: bool = False
 
     # Host mirror of this cache group's block table, including padded rows.
 
@@ -333,6 +336,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
             seq_lens_cpu=_slice_reqs(self.seq_lens_cpu),
+            seq_lens_cpu_is_exact=self.seq_lens_cpu_is_exact,
             num_computed_tokens_cpu=_slice_reqs(self.num_computed_tokens_cpu),
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,

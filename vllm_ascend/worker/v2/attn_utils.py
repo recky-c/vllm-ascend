@@ -109,6 +109,17 @@ if TYPE_CHECKING:
 # MRV2's upstream _dummy_run drops runner-specific kwargs such as``skip_gdn_state_update``
 _SKIP_RING_STATE_UPDATE: ContextVar[bool] = ContextVar("_SKIP_RING_STATE_UPDATE", default=False)
 _DFLASH_DRAFT_KV_OPTIMISTIC_BOUND: ContextVar[bool] = ContextVar("_DFLASH_DRAFT_KV_OPTIMISTIC_BOUND", default=False)
+_DFLASH_DRAFT_SEQ_LENS_CPU: ContextVar[torch.Tensor | None] = ContextVar("_DFLASH_DRAFT_SEQ_LENS_CPU", default=None)
+
+
+@contextmanager
+def dflash_draft_seq_lens_cpu(seq_lens_cpu: torch.Tensor | None):
+    """Keep this proposal's exact mirror local to its draft metadata build."""
+    token = _DFLASH_DRAFT_SEQ_LENS_CPU.set(seq_lens_cpu)
+    try:
+        yield
+    finally:
+        _DFLASH_DRAFT_SEQ_LENS_CPU.reset(token)
 
 
 @contextmanager
@@ -373,6 +384,7 @@ def build_attn_metadata(
     # extra attributes for ascend npus.
     parallel_config: ParallelConfig | None = None,
     seq_lens_np: np.ndarray | None = None,
+    seq_lens_cpu: torch.Tensor | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
@@ -406,7 +418,15 @@ def build_attn_metadata(
         draft_fia_seq_lens_cpu = _get_dflash_draft_fia_seq_lens_cpu(
             seq_lens_cpu_upper_bound, query_start_loc_cpu, num_reqs, max_seq_len
         )
-    if seq_lens_np is None:
+    if seq_lens_cpu is None and not for_cudagraph_capture:
+        seq_lens_cpu = _DFLASH_DRAFT_SEQ_LENS_CPU.get()
+    seq_lens_cpu_is_exact = seq_lens_cpu is not None and not for_cudagraph_capture
+    if seq_lens_cpu_is_exact:
+        if seq_lens_cpu.device.type != "cpu" or seq_lens_cpu.ndim != 1 or seq_lens_cpu.size(0) < num_reqs:
+            raise ValueError("Exact draft sequence lengths require a complete one-dimensional CPU mirror")
+        seq_lens_cpu = seq_lens_cpu[:num_reqs]
+        seq_lens_np = seq_lens_cpu.numpy()
+    elif seq_lens_np is None:
         if seq_lens_cpu_upper_bound is not None:
             # FIA needs a CPU-side seq_lens upper bound for each request when
             # speculative decoding does not provide exact CPU sequence lengths.
@@ -416,7 +436,8 @@ def build_attn_metadata(
             # FIA accuracy by overstating individual KV sequence lengths.
             seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
 
-    seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
+    if not seq_lens_cpu_is_exact:
+        seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
     if seq_lens_cpu_upper_bound is None:
         # seq_lens_cpu is already an upper bound (possibly exact), so reuse it
         # when no separate CPU upper bound was supplied.
@@ -459,6 +480,7 @@ def build_attn_metadata(
     common_fia_metadata: dict[tuple, dict[str, Any]] = {}
     cached_dense_metadata: dict[tuple[Any, ...], AscendMetadata] = {}
     cached_gdn_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    gdn_graph_updates: dict[tuple[KVCacheSpec, type], tuple[Any, list]] = {}
     # One scope per invocation: target and each draft phase have different
     # lengths. Capture still initializes every builder's own stable buffers.
     batch_metadata_cache = {} if envs.VLLM_ASCEND_REUSE_BATCH_METADATA and not for_cudagraph_capture else None
@@ -514,6 +536,7 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_is_exact=seq_lens_cpu_is_exact,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dflash_draft_seq_lens_cpu_upper_bound=draft_fia_seq_lens_cpu,
             seq_lens=seq_lens[:num_reqs],
@@ -644,10 +667,14 @@ def build_attn_metadata(
 
             for variant_names, variant_common in metadata_variants:
                 if gdn_cache_key is not None and gdn_cache_key in cached_gdn_metadata:
+                    update_kwargs = {}
+                    if gdn_cache_key in gdn_graph_updates:
+                        update_kwargs["graph_state_updates"] = gdn_graph_updates[gdn_cache_key][1]
                     metadata = attn_metadata_builder.update_block_table(
                         cached_gdn_metadata[gdn_cache_key],
                         variant_common.block_table_tensor,
                         variant_common.slot_mapping,
+                        **update_kwargs,
                     )
                 elif for_cudagraph_capture:
                     metadata = attn_metadata_builder.build_for_cudagraph_capture(
@@ -656,6 +683,8 @@ def build_attn_metadata(
                     )
                     if gdn_cache_key is not None:
                         cached_gdn_metadata[gdn_cache_key] = metadata
+                        if hasattr(attn_metadata_builder, "graph_state_updater"):
+                            gdn_graph_updates[gdn_cache_key] = (attn_metadata_builder.graph_state_updater, [])
                 elif dense_cache_key is not None and dense_cache_key in cached_dense_metadata:
                     metadata = attn_metadata_builder.update_block_table(
                         cached_dense_metadata[dense_cache_key],
@@ -683,12 +712,18 @@ def build_attn_metadata(
                         cached_dense_metadata[dense_cache_key] = metadata
                     if gdn_cache_key is not None:
                         cached_gdn_metadata[gdn_cache_key] = metadata
+                        if hasattr(attn_metadata_builder, "graph_state_updater"):
+                            gdn_graph_updates[gdn_cache_key] = (attn_metadata_builder.graph_state_updater, [])
                 if is_dsa_builder:
                     # Preserve sharing even if a builder replaces one of the
                     # dictionaries while constructing its metadata.
                     common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
                 for layer_name in variant_names:
                     attn_metadata[layer_name] = metadata
+    # Every captured physical state buffer must be current before its consumer
+    # can run. These updates retain each group's original global mapping.
+    for updater, updates in gdn_graph_updates.values():
+        updater.apply(updates)
     return attn_metadata
 
 

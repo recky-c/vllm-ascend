@@ -435,6 +435,9 @@ class AscendConfig:
             "enable_pcp_o_proj_weight_sharding": true,
             "enable_pcp_embedding_lmhead_weight_sharding": true,
             "enable_dflash_draft_kv_optimistic_bound": false,
+            "enable_dflash_exact_metadata_optimizations": true,
+            "enable_dflash_deferred_metadata": false,
+            "enable_gdn_graph_state_batching": true,
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -588,6 +591,15 @@ class AscendConfig:
     # CPU upper bounds avoid a device readback, but may reduce acceptance.
     # Target/device lengths remain exact. Unsupported paths fall back to exact.
     enable_dflash_draft_kv_optimistic_bound: bool = False
+    # Exact post-rejection DFlash host mirrors and fixed-layout metadata.
+    # The optimistic flag overrides these exact optimizations.
+    enable_dflash_exact_metadata_optimizations: bool = True
+    # Experimental FULL replay before host metadata preparation. Exact
+    # metadata and legal graph-owned neutral FIA parameters are also required.
+    enable_dflash_deferred_metadata: bool = False
+    # Batch compatible MRV2 GDN graph-state updates; unsupported paths retain
+    # their per-group copy/fill implementation.
+    enable_gdn_graph_state_batching: bool = True
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
