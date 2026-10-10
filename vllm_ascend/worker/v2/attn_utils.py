@@ -55,10 +55,13 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend import envs
+from vllm_ascend._310p.attention.metadata_builder import AscendAttentionMetadataBuilder310
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder, AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -85,6 +88,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant.cache import uses_turboquant_groups
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -434,6 +438,12 @@ def build_attn_metadata(
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}
+    common_fia_metadata: dict[tuple, dict[str, Any]] = {}
+    cached_dense_metadata: dict[tuple[Any, ...], AscendMetadata] = {}
+    cached_gdn_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    # One scope per invocation: target and each draft phase have different
+    # lengths. Capture still initializes every builder's own stable buffers.
+    batch_metadata_cache = {} if envs.VLLM_ASCEND_REUSE_BATCH_METADATA and not for_cudagraph_capture else None
     kv_cache_groups = kv_cache_config.kv_cache_groups
     batch_tq_slots = uses_turboquant_groups(kv_cache_groups)
     formatted_slot_mappings = None
@@ -529,13 +539,58 @@ def build_attn_metadata(
                         (draft_names, draft_common)
                     ]
             consumes_pcp_context = bool(getattr(attn_metadata_builder, "consumes_pcp_context", False))
+            # Standard Mamba providers expose batch-global GDN inputs. Only
+            # the first build needs to fetch the extra tensors.
+            reuse_gdn_metadata = (
+                isinstance(attn_metadata_builder, AscendGDNAttentionMetadataBuilder)
+                and getattr(attn_metadata_builder, "supports_update_block_table", False)
+                and isinstance(attn_group.kv_cache_spec, MambaSpec)
+                and (
+                    model_specific_attn_metadata is None
+                    or type(model_specific_attn_metadata) is MambaHybridAttnMetadata
+                )
+                and not common_attn_metadata_extra_kwargs
+                and pcp_context is None
+            )
+            if isinstance(attn_metadata_builder, AscendGDNAttentionMetadataBuilder):
+                captured_reuse = getattr(attn_metadata_builder, "_gdn_reuse_at_capture", None)
+                if for_cudagraph_capture:
+                    attn_metadata_builder._gdn_reuse_at_capture = reuse_gdn_metadata
+                elif captured_reuse is False:
+                    reuse_gdn_metadata = False
+                elif captured_reuse is True and not reuse_gdn_metadata:
+                    raise ValueError("Captured GDN metadata reuse requires a batch-global Mamba provider")
             attn_metadata_extra_kwargs = (
                 model_specific_attn_metadata.get_extra_attn_kwargs(
                     attn_metadata_builder,
                     num_reqs,
                 )
-                if not for_cudagraph_capture and model_specific_attn_metadata is not None
+                if not for_cudagraph_capture and model_specific_attn_metadata is not None and not reuse_gdn_metadata
                 else {}
+            )
+            # Check provider semantics before adding the internal FIA/legacy
+            # caches. Their kwargs do not prevent dense metadata reuse.
+            reuse_dense_metadata = (
+                type(attn_metadata_builder) is AscendAttentionMetadataBuilder
+                and getattr(attn_metadata_builder, "supports_update_block_table", False)
+                and not for_cudagraph_capture
+                and not common_attn_metadata_extra_kwargs
+                and not attn_metadata_extra_kwargs
+                and pcp_context is None
+            )
+            dense_cache_key = (
+                (
+                    attn_metadata_builder.kv_cache_spec,
+                    attn_metadata_builder.decode_threshold,
+                    group_causal,
+                    id(attn_metadata_builder.vllm_config),
+                    attn_metadata_builder.device,
+                )
+                if reuse_dense_metadata
+                else None
+            )
+            gdn_cache_key = (
+                (attn_metadata_builder.kv_cache_spec, type(attn_metadata_builder)) if reuse_gdn_metadata else None
             )
             if is_dsa_builder:
                 # DSA cache groups share request-level metadata during replay.
@@ -556,6 +611,10 @@ def build_attn_metadata(
                     # branches in the graph even for a short dummy sequence.
                     full_graph_mode=full_graph_mode or for_cudagraph_capture,
                 )
+            elif type(attn_metadata_builder) in (AscendAttentionMetadataBuilder, AscendAttentionMetadataBuilder310):
+                # These exact builders accept the shared FIA keyword. DCP/PCP
+                # and other subclasses retain their own preparation contracts.
+                attn_metadata_extra_kwargs["common_fia_metadata"] = common_fia_metadata
             # Parallel attention and cache-only backends opt in to the PCP
             # context needed to construct their own metadata.
             if pcp_context is not None and (is_sfa_builder or is_dsa_builder or consumes_pcp_context):
@@ -565,19 +624,46 @@ def build_attn_metadata(
                 )
 
             for variant_names, variant_common in metadata_variants:
-                if for_cudagraph_capture:
+                if gdn_cache_key is not None and gdn_cache_key in cached_gdn_metadata:
+                    metadata = attn_metadata_builder.update_block_table(
+                        cached_gdn_metadata[gdn_cache_key],
+                        variant_common.block_table_tensor,
+                        variant_common.slot_mapping,
+                    )
+                elif for_cudagraph_capture:
                     metadata = attn_metadata_builder.build_for_cudagraph_capture(
                         variant_common,
                         **attn_metadata_extra_kwargs,
                     )
+                    if gdn_cache_key is not None:
+                        cached_gdn_metadata[gdn_cache_key] = metadata
+                elif dense_cache_key is not None and dense_cache_key in cached_dense_metadata:
+                    metadata = attn_metadata_builder.update_block_table(
+                        cached_dense_metadata[dense_cache_key],
+                        variant_common.block_table_tensor,
+                        variant_common.slot_mapping,
+                    )
                 else:
+                    if batch_metadata_cache is not None and type(attn_metadata_builder) in (
+                        AscendAttentionMetadataBuilder,
+                        AscendGDNAttentionMetadataBuilder,
+                    ):
+                        attn_metadata_extra_kwargs["batch_metadata_cache"] = batch_metadata_cache
                     if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+                        if reuse_gdn_metadata and model_specific_attn_metadata is not None:
+                            attn_metadata_extra_kwargs.update(
+                                model_specific_attn_metadata.get_extra_attn_kwargs(attn_metadata_builder, num_reqs)
+                            )
                         attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
                     metadata = attn_metadata_builder.build(
                         common_prefix_len=0,
                         common_attn_metadata=variant_common,
                         **attn_metadata_extra_kwargs,
                     )
+                    if dense_cache_key is not None:
+                        cached_dense_metadata[dense_cache_key] = metadata
+                    if gdn_cache_key is not None:
+                        cached_gdn_metadata[gdn_cache_key] = metadata
                 if is_dsa_builder:
                     # Preserve sharing even if a builder replaces one of the
                     # dictionaries while constructing its metadata.

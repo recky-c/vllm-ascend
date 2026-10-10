@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -241,6 +242,48 @@ class TestAscendAttentionBackendImpl310(TestBase):
 
 
 class TestAscendAttentionMetadataBuilder310(TestBase):
+    def test_build_and_capture_forward_shared_metadata_with_310_overrides(self):
+        builder = object.__new__(AscendMetadataBuilder310Direct)
+        builder._query_lens_cpu_buffer = torch.zeros(4, dtype=torch.int32)
+        common = SimpleNamespace(
+            num_reqs=2,
+            query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1, 3], dtype=torch.int32),
+            seq_lens=torch.tensor([17, 19], dtype=torch.int32),
+        )
+        builder.device = torch.device("cpu")
+        shared = {}
+        compressed_mask = object()
+        for for_capture in (False, True):
+            for state in (AscendAttentionState.DecodeOnly, AscendAttentionState.ChunkedPrefill):
+                with self.subTest(for_capture=for_capture, state=state):
+                    metadata = SimpleNamespace(attn_state=state, attn_mask=object())
+                    with (
+                        patch.object(
+                            AscendMetadataBuilder310Direct.__bases__[0], "build", return_value=metadata
+                        ) as parent_build,
+                        patch(
+                            "vllm_ascend._310p.attention.metadata_builder.is_compressed_mask_supported",
+                            return_value=True,
+                        ),
+                        patch(
+                            "vllm_ascend._310p.attention.metadata_builder.AttentionMaskBuilder310.get_compressed_splitfuse_mask",
+                            return_value=compressed_mask,
+                        ),
+                    ):
+                        if for_capture:
+                            result = builder.build_for_cudagraph_capture(common, common_fia_metadata=shared)
+                        else:
+                            result = builder.build(0, common, common_fia_metadata=shared)
+                    parent_build.assert_called_once_with(0, common, False, common_fia_metadata=shared)
+                    assert parent_build.call_args.kwargs["common_fia_metadata"] is shared
+                    assert result is metadata
+                    assert result.seq_lens.data_ptr() == common.seq_lens.data_ptr()
+                    assert result.query_start_loc.data_ptr() == common.query_start_loc.data_ptr()
+                    if state == AscendAttentionState.ChunkedPrefill:
+                        assert result.query_lens_cpu.tolist() == [1, 2]
+                        assert result.attn_mask is compressed_mask
+
     def test_fill_query_lens_cpu_without_buffer(self):
         builder = AscendMetadataBuilder310Direct.__new__(AscendMetadataBuilder310Direct)
         builder._query_lens_cpu_buffer = None
@@ -298,5 +341,5 @@ class TestAscendAttentionMetadataBuilder310(TestBase):
 
         with patch.object(AscendMetadataBuilder310Direct.__bases__[0], "build", return_value=MagicMock()) as mock_build:
             result = builder.build_for_drafting(common_attn_metadata=common_attn_metadata, draft_index=0)
-            mock_build.assert_called_once_with(0, common_attn_metadata, True)
+            mock_build.assert_called_once_with(0, common_attn_metadata, True, common_fia_metadata=None)
             assert result is not None

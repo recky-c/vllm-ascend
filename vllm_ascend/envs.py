@@ -35,7 +35,23 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _nonnegative_int_env(name: str, default: str = "0") -> int:
+    value = os.getenv(name, default)
+    if not value.isascii() or not value.isdigit():
+        raise ValueError(f"{name} must be a nonnegative integer, got {value!r}")
+    return int(value)
+
+
 env_variables: dict[str, Callable[[], Any]] = {
+    # Override the target layers per group in generic uniform-page hybrid KV
+    # grouping. 0 (default) retains the original heuristic; positive integers
+    # set a maximum group width. Specialized model planners remain unchanged.
+    # Experimental: wider groups can waste KV memory on padding. Not sensitive.
+    "VLLM_ASCEND_KV_CACHE_GROUP_SIZE": lambda: _nonnegative_int_env("VLLM_ASCEND_KV_CACHE_GROUP_SIZE"),
+    # Reuse request-only FIA/GDN metadata across MRV2 cache groups in one build.
+    # Default: 0 (disabled). Valid values: 0 or 1. Not sensitive.
+    # Physical cache mappings and captured state-index buffers remain group-local.
+    "VLLM_ASCEND_REUSE_BATCH_METADATA": lambda: _strict_binary_env("VLLM_ASCEND_REUSE_BATCH_METADATA"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

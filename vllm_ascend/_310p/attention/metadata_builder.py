@@ -111,8 +111,12 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
         is_drafting: bool = False,
+        *,
+        common_fia_metadata: dict[tuple, dict[str, Any]] | None = None,
     ) -> AscendMetadata:
-        attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        attn_metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build, common_fia_metadata=common_fia_metadata
+        )
 
         num_reqs = common_attn_metadata.num_reqs
 

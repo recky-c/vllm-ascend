@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import torch
@@ -43,8 +43,46 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         with disable_profiling_chunk_for_draft(self.vllm_config):
             return super().load_draft_model(target_model, target_attn_layer_names)
 
+    def _build_uniform_attn_metadata(
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        num_reqs: int,
+        num_query_per_req: int,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+        step: int,
+        causal: bool | Mapping[int, bool] = True,
+        dcp_local_seq_lens: torch.Tensor | None = None,
+    ) -> dict[str, Any] | None:
+        attn_metadata = super()._build_uniform_attn_metadata(
+            batch_desc=batch_desc,
+            num_reqs=num_reqs,
+            num_query_per_req=num_query_per_req,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            step=step,
+            causal=causal,
+            dcp_local_seq_lens=dcp_local_seq_lens,
+        )
+        if (
+            getattr(self, "_reuse_draft_attn_metadata", False)
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and attn_metadata is not None
+        ):
+            # Upstream propose already builds current draft metadata before
+            # replay. Hand that same build to Ascend's graph parameter update.
+            self._draft_attn_metadata_for_graph = (batch_desc, attn_metadata)
+        return attn_metadata
+
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
+        cached = getattr(self, "_draft_attn_metadata_for_graph", None)
+        # Consume the handoff once. Standalone graph updates and a different
+        # padded shape must build fresh metadata.
+        self._draft_attn_metadata_for_graph = None
+        if cached is not None:
+            batch_desc, attn_metadata = cached
+            if batch_desc.num_reqs == num_reqs_padded and batch_desc.num_tokens == num_tokens_padded:
+                self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)
+                return [attn_metadata]
         with build_attn_metadata_wrapper():
             # vLLM main (#56181) replaced _build_draft_attn_metadata with
             # _build_uniform_attn_metadata (BatchExecutionDescriptor).
@@ -61,6 +99,7 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
                 step=self.num_query_per_req,
                 causal=self._group_causal,
             )
+        self._draft_attn_metadata_for_graph = None
         self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)
         return [attn_metadata]
 
@@ -156,6 +195,8 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         self.input_batch = input_batch
+        self._draft_attn_metadata_for_graph = None
+        self._reuse_draft_attn_metadata = True
         sync_state = dp_sync
         if dummy_run and skip_attn_for_dummy_run:
             # Profiling runs the draft with its own query token count, which
@@ -164,25 +205,31 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
-        with build_attn_metadata_wrapper():
-            return super().propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings,
-                last_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                sync_state,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                mm_inputs,
-                is_profile=is_profile,
-            )
+        try:
+            with build_attn_metadata_wrapper():
+                return super().propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    sync_state,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    mm_inputs,
+                    is_profile=is_profile,
+                )
+        finally:
+            # Never let metadata from this batch survive into the next proposal,
+            # including eager/profiling paths or a failed graph replay.
+            self._reuse_draft_attn_metadata = False
+            self._draft_attn_metadata_for_graph = None
 
 
 def prepare_dflash_inputs(

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import CrossAttentionSpec, FullAttentionSpec
 
 import vllm_ascend.attention.attention_v1 as attn_module
 from tests.ut.base import TestBase
@@ -389,6 +389,203 @@ def test_pcp_builder_keeps_short_extend_in_prefill() -> None:
     )
 
     assert builder._split_decodes_and_prefills(common_metadata) == (0, 2, 0, 5)
+
+
+def _make_fia_sharing_builder(
+    config,
+    *,
+    kv_cache_spec=None,
+    parallel_drafting=False,
+    decode_threshold=4,
+    builder_cls=AscendAttentionMetadataBuilder,
+):
+    builder = builder_cls.__new__(builder_cls)
+    builder.vllm_config = config
+    builder.model_config = config.model_config
+    builder.kv_cache_spec = kv_cache_spec
+    builder.speculative_config = (
+        SimpleNamespace(parallel_drafting=True, use_dspark=lambda: False) if parallel_drafting else None
+    )
+    builder.decode_threshold = decode_threshold
+    builder.pcp_enabled = False
+    builder.device = torch.device("cpu")
+    builder.attn_mask_builder = MagicMock()
+    builder.attn_mask_builder.get_attention_mask.return_value = None
+    return builder
+
+
+def _make_fia_sharing_common():
+    query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32)
+    return AscendCommonAttentionMetadata(
+        query_start_loc=query_start_loc.clone(),
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=torch.tensor([20, 30], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([200, 300], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=8,
+        max_query_len=4,
+        max_seq_len=30,
+        block_table_tensor=torch.zeros((2, 2), dtype=torch.int32),
+        slot_mapping=torch.arange(10, dtype=torch.int64),
+        attn_state=AscendAttentionState.SpecDecoding,
+    )
+
+
+def test_fia_sharing_keeps_cpu_and_exact_device_length_sources_separate(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
+    common = _make_fia_sharing_common()
+    builders = [
+        _make_fia_sharing_builder(config),
+        _make_fia_sharing_builder(
+            config,
+            kv_cache_spec=CrossAttentionSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.float16),
+        ),
+        _make_fia_sharing_builder(config, parallel_drafting=True),
+    ]
+    shared = {}
+
+    cpu_metadata, cross_metadata, dflash_metadata = [
+        builder.build(0, common, common_fia_metadata=shared) for builder in builders
+    ]
+
+    assert len(shared) == 2
+    assert cpu_metadata.seq_lens_list == [200, 300]
+    assert cross_metadata.seq_lens_list == [20, 30]
+    assert dflash_metadata.seq_lens_list is cross_metadata.seq_lens_list
+    assert cpu_metadata.seq_lens_list is not dflash_metadata.seq_lens_list
+    assert dflash_metadata.actual_seq_lengths_q is cross_metadata.actual_seq_lengths_q
+    # Cross-attention still owns its complete int32 slot mapping, even when
+    # its request lengths share the same conversion as the DFlash builder.
+    assert cross_metadata.slot_mapping.dtype == torch.int32
+    assert cross_metadata.slot_mapping.numel() == common.slot_mapping.numel()
+    assert dflash_metadata.slot_mapping.dtype == torch.int64
+    assert dflash_metadata.slot_mapping.numel() == common.num_actual_tokens
+    assert cpu_metadata is not cross_metadata
+    assert cross_metadata is not dflash_metadata
+
+
+def test_fia_sharing_separates_decode_classification_thresholds(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
+    common = _make_fia_sharing_common()
+    shared = {}
+    decode_builder = _make_fia_sharing_builder(config, parallel_drafting=True)
+    prefill_builder = _make_fia_sharing_builder(config, parallel_drafting=True, decode_threshold=3)
+
+    decode_metadata = decode_builder.build(0, common, common_fia_metadata=shared)
+    prefill_metadata = prefill_builder.build(0, common, common_fia_metadata=shared)
+
+    assert len(shared) == 2
+    assert (decode_metadata.num_decodes, decode_metadata.num_prefills, decode_metadata.num_decode_tokens) == (2, 0, 8)
+    assert (prefill_metadata.num_decodes, prefill_metadata.num_prefills, prefill_metadata.num_decode_tokens) == (
+        0,
+        2,
+        0,
+    )
+
+
+def test_fia_sharing_reuses_legacy_conversion_cache_with_padding(monkeypatch):
+    config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
+    common = _make_fia_sharing_common()
+    common.query_start_loc_cpu = torch.tensor([0, 4, 8, 12], dtype=torch.int32)
+    common.query_start_loc = common.query_start_loc_cpu.clone()
+    common.num_reqs = 3
+    for warm_cache in (False, True):
+        calls = []
+
+        def pin_memory(tensor, calls=calls):
+            calls.append(tensor)
+            return tensor
+
+        monkeypatch.setattr(torch.Tensor, "pin_memory", pin_memory)
+        builders = [_make_fia_sharing_builder(config, parallel_drafting=True) for _ in range(2)]
+        legacy_cache, shared = {}, {}
+        if warm_cache:
+            # The fourth positional argument remains the legacy tuple cache.
+            builders[0].build(0, common, False, legacy_cache)
+        first = builders[0].build(0, common, batch_metadata_cache=legacy_cache, common_fia_metadata=shared)
+        second = builders[1].build_for_cudagraph_capture(
+            common, batch_metadata_cache=legacy_cache, common_fia_metadata=shared
+        )
+
+        assert len(calls) == 1
+        assert len(legacy_cache) == len(shared) == 1
+        legacy_payload = next(iter(legacy_cache.values()))
+        assert isinstance(legacy_payload, tuple)
+        assert len(legacy_payload) == 3
+        assert legacy_payload[2] == [20, 30]
+        assert first.seq_lens_list == [20, 30, 1]
+        assert first.seq_lens_list is second.seq_lens_list
+        assert first.seq_lens is second.seq_lens
+        assert first.query_start_loc is second.query_start_loc is legacy_payload[0]
+        assert first.actual_seq_lengths_q is second.actual_seq_lengths_q is legacy_payload[1]
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+@pytest.mark.parametrize("with_pcp_context", [False, True])
+def test_dcp_runner_keeps_original_build_and_context_contract(monkeypatch, for_capture, with_pcp_context):
+    from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
+    common = _make_fia_sharing_common()
+    builders = [
+        _make_fia_sharing_builder(config, parallel_drafting=True, builder_cls=AscendAttentionDCPMetadataBuilder)
+        for _ in range(2)
+    ]
+    for builder in builders:
+        builder._split_decodes_and_prefills = MagicMock(return_value=(2, 0, 8, 0))
+        builder._build_backend_metadata = MagicMock(
+            side_effect=lambda _, **kw: dict(
+                decode=SimpleNamespace(block_tables=kw["block_table"][: kw["num_decodes"]])
+            )
+        )
+    groups = [
+        [
+            SimpleNamespace(
+                layer_names=[f"layer.{i}"],
+                kv_cache_spec=builder.kv_cache_spec,
+                get_metadata_builder=lambda _, b=builder: b,
+            )
+        ]
+        for i, builder in enumerate(builders)
+    ]
+    tables = [common.block_table_tensor + i * 10 for i in range(2)]
+    slots = [common.slot_mapping + i * 100 for i in range(2)]
+    context = object() if with_pcp_context else None
+    result = build_attn_metadata(
+        attn_groups=groups,
+        num_reqs=common.num_reqs,
+        num_tokens=8,
+        query_start_loc_gpu=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        max_query_len=4,
+        seq_lens=common.seq_lens,
+        max_seq_len=30,
+        block_tables=tables,
+        slot_mappings=slots,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=b.kv_cache_spec) for b in builders]
+        ),
+        attn_state=common.attn_state,
+        causal={0: False, 1: True},
+        pcp_context=context,
+        for_cudagraph_capture=for_capture,
+    )
+    first, second = result["layer.0"], result["layer.1"]
+    assert first.seq_lens_list == second.seq_lens_list == [20, 30]
+    assert first.actual_seq_lengths_q == second.actual_seq_lengths_q == [4, 8]
+    assert first.seq_lens_list is not second.seq_lens_list
+    assert first.decode is not second.decode
+    assert first.decode.block_tables[0, 0] == 0
+    assert second.decode.block_tables[0, 0] == 10
+    assert first.slot_mapping[0] == 0 and second.slot_mapping[0] == 100
+    for i, builder in enumerate(builders):
+        builder._split_decodes_and_prefills.assert_called_once()
+        builder._build_backend_metadata.assert_called_once()
+        assert builder._pcp_context is context
+        assert builder._pcp_cache_group_idx == (i if with_pcp_context else None)
 
 
 class TestAscendAttentionBackendImpl(TestBase):

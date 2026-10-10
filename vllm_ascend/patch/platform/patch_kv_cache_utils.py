@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
@@ -233,12 +234,70 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
     return groups
 
 
+def _get_fixed_width_kv_cache_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    group_size: int,
+) -> list[KVCacheGroupSpec]:
+    """Override only group width, preserving upstream compatible-spec buckets.
+
+    This mirrors the bucket merge and round-robin split in vLLM's generic
+    uniform-page planner. Equal page bytes alone never authorize merging:
+    Full/SWA/Mamba and incompatible attention head layouts stay separate.
+    No fake layers are inserted; the existing allocator accounts for shorter
+    groups by allocating the largest real group's layer width.
+    """
+    if group_size <= 0:
+        raise ValueError("Fixed KV cache group size must be positive")
+    if not kv_cache_spec:
+        return []
+    if len({spec.page_size_bytes for spec in kv_cache_spec.values()}) != 1:
+        raise ValueError("Fixed KV cache grouping requires uniform physical page sizes")
+
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for name, spec in kv_cache_spec.items():
+        same_type_layers[spec].append(name)
+    layer_buckets: list[list[str]] = []
+    spec_buckets: list[list[KVCacheSpec]] = []
+    for spec, names in same_type_layers.items():
+        for bucket_names, bucket_specs in zip(layer_buckets, spec_buckets):
+            try:
+                type(bucket_specs[0]).merge([*bucket_specs, spec])
+            except (AssertionError, ValueError):
+                continue
+            bucket_names.extend(names)
+            bucket_specs.append(spec)
+            break
+        else:
+            layer_buckets.append(list(names))
+            spec_buckets.append([spec])
+
+    grouped_layers = []
+    for names in layer_buckets:
+        num_groups = cdiv(len(names), group_size)
+        # Preserve upstream PP-friendly interleaving, rather than contiguous
+        # chunks that can leave some pipeline stages with empty groups.
+        grouped_layers.extend(names[index::num_groups] for index in range(num_groups))
+    allocated_width = max(len(names) for names in grouped_layers)
+    padding_slots = allocated_width * len(grouped_layers) - len(kv_cache_spec)
+    logger.info(
+        "Ascend fixed KV cache group width=%d: %d groups, allocated width=%d, %d padding layer slots",
+        group_size,
+        len(grouped_layers),
+        allocated_width,
+        padding_slots,
+    )
+    return vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
     kimi_k3_groups = _get_kimi_k3_dspark_mixed_kv_cache_groups(kv_cache_spec)
     if kimi_k3_groups is not None:
         return kimi_k3_groups
+    group_size = envs.VLLM_ASCEND_KV_CACHE_GROUP_SIZE
+    if group_size:
+        return _get_fixed_width_kv_cache_groups(kv_cache_spec, group_size)
     return _orig_get_kv_cache_groups_uniform_page_size(kv_cache_spec)
 
 
