@@ -96,7 +96,7 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
-from vllm_ascend.worker.utils import disable_compilation
+from vllm_ascend.worker.utils import AscendKVBlockZeroer, CompositeKVBlockZeroer, disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
@@ -132,6 +132,52 @@ class NPUModelRunner(GPUModelRunner):
 
     execute_model_state: ExecuteModelState | None
     max_num_reqs: int
+
+    def _init_kv_zero_meta(self) -> None:
+        """Clear recycled tuple K/V pages before optimistic DFlash reads.
+
+        The inherited scheduler/runner path supplies only newly allocated
+        global block IDs, before forward writes or prefix-copy operations.
+        Existing valid blocks are not cleared. Default-off keeps upstream's
+        zeroer; opting in requires complete ordinary draft FIA coverage.
+        """
+        speculator = self.speculator
+        if speculator is not None:
+            speculator._dflash_draft_kv_zeroing_ready = False
+        super()._init_kv_zero_meta()
+        if not (
+            getattr(speculator, "_dflash_draft_kv_optimistic_bound_enabled", False)
+            and self.kv_cache_config.needs_kv_cache_zeroing
+        ):
+            return
+        upstream_zeroer = self.kv_block_zeroer
+        groups = [group for group_list in self.attn_groups for group in group_list]
+        groups.extend(group for group_list in speculator.attn_groups for group in group_list)
+        zeroer = AscendKVBlockZeroer(self.device, pin_memory=getattr(self, "pin_memory", True))
+        try:
+            zeroer.init_meta(
+                attn_groups_iter=groups,
+                kernel_block_sizes=self.kernel_block_sizes,
+                cache_dtype=self.cache_config.cache_dtype,
+                runner_only_attn_layers=set(),
+                static_forward_context=self.compilation_config.static_forward_context,
+                include_sliding_window=True,
+                num_blocks=self.kv_cache_config.num_blocks,
+            )
+        except (AssertionError, ValueError) as error:
+            logger.warning_once("Keeping exact DFlash FIA lengths: unsupported KV zeroing geometry: %s", error)
+            return
+        required_names = {
+            name
+            for group_id in speculator.draft_kv_cache_group_ids
+            for group in speculator.attn_groups[group_id]
+            for name in group.layer_names
+        }
+        if zeroer._meta is None or not required_names.issubset(zeroer.covered_layer_names):
+            logger.warning_once("Keeping exact DFlash FIA lengths: incomplete draft KV zeroing coverage")
+            return
+        self.kv_block_zeroer = CompositeKVBlockZeroer((upstream_zeroer, zeroer))
+        speculator._dflash_draft_kv_zeroing_ready = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations

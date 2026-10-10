@@ -6,7 +6,7 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
@@ -142,6 +142,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
+        self.covered_layer_names: set[str] = set()
 
     def init_meta(
         self,
@@ -150,6 +151,9 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         cache_dtype: str,
         runner_only_attn_layers: set[str],
         static_forward_context: dict[str, Any],
+        *,
+        include_sliding_window: bool = False,
+        num_blocks: int | None = None,
     ) -> None:
         """One-time precomputation for zero_block_ids.
 
@@ -165,13 +169,17 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         seen_ptrs: set[int] = set()
+        segments_by_address: dict[int, int] = {}
+        self.covered_layer_names = set()
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
         seg_page_strides: list[int] = []
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, FullAttentionSpec):
+            if not isinstance(spec, FullAttentionSpec) and not (
+                include_sliding_window and type(spec) is SlidingWindowSpec
+            ):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
@@ -183,6 +191,9 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv_tuple = static_forward_context[layer_name].kv_cache
+                if include_sliding_window and isinstance(kv_tuple, torch.Tensor):
+                    # The composite upstream zeroer preserves Tensor layouts.
+                    continue
                 if cache_dtype == "mxfp8" and len(kv_tuple) == 4:
                     # V scales are checkpoint constants, initialized before
                     # capture. Clearing a recycled block must preserve them.
@@ -190,8 +201,15 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                 else:
                     assert len(kv_tuple) == 2, "K and V are not stored separately"
                 for kv in kv_tuple:
+                    if include_sliding_window:
+                        assert isinstance(kv, torch.Tensor) and kv.ndim > 0, "Unknown KV tensor layout"
+                        assert kv.device.type == self.device.type and (
+                            self.device.index is None or kv.device.index == self.device.index
+                        ), "KV zeroing must use local cache tensors"
+                        if num_blocks is not None:
+                            assert kv.shape[0] == num_blocks * ratio, "KV shape does not match logical block allocation"
                     dp = kv.data_ptr()
-                    if dp in seen_ptrs:
+                    if dp in seen_ptrs and not include_sliding_window:
                         continue
                     seen_ptrs.add(dp)
 
@@ -200,14 +218,26 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                     stride_bytes = kv.stride(0) * el
                     assert kv[0].is_contiguous(), "KV block payload must be contiguous"
                     assert payload_bytes % 4 == 0 and stride_bytes % 4 == 0
+                    if include_sliding_window:
+                        assert payload_bytes <= stride_bytes, "KV block payload overlaps another physical block"
                     # A physical stride may include other caches and padding.
                     # Only clear the payload. Contiguous subblocks can be
                     # coalesced; strided subblocks need one segment each.
                     contiguous = payload_bytes == stride_bytes
                     for subblock in range(1 if contiguous else ratio):
-                        seg_addrs.append(dp + subblock * stride_bytes)
-                        seg_page_sizes.append(payload_bytes * (ratio if contiguous else 1) // 4)
-                        seg_page_strides.append(stride_bytes * ratio // 4)
+                        address = dp + subblock * stride_bytes
+                        page_size = payload_bytes * (ratio if contiguous else 1) // 4
+                        page_stride = stride_bytes * ratio // 4
+                        if include_sliding_window and address in segments_by_address:
+                            index = segments_by_address[address]
+                            assert seg_page_strides[index] == page_stride, "Aliased KV segments have different strides"
+                            seg_page_sizes[index] = max(seg_page_sizes[index], page_size)
+                        else:
+                            segments_by_address[address] = len(seg_addrs)
+                            seg_addrs.append(address)
+                            seg_page_sizes.append(page_size)
+                            seg_page_strides.append(page_stride)
+                self.covered_layer_names.add(layer_name)
 
         if not seg_addrs:
             self._meta = None
@@ -269,3 +299,18 @@ class AscendKVBlockZeroer(KVBlockZeroer):
             BLOCK_SIZE=blk_size,
             GRID_SIZE=grid,
         )
+
+
+class CompositeKVBlockZeroer:
+    """Preserve upstream zeroing while adding Ascend tuple K/V coverage."""
+
+    def __init__(self, zeroers: Sequence[KVBlockZeroer]):
+        self.zeroers = tuple(zeroers)
+
+    def zero_block_ids(self, block_ids: list[int]) -> None:
+        for zeroer in self.zeroers:
+            zeroer.zero_block_ids(block_ids)
+
+    def warmup(self, num_kv_blocks: int) -> None:
+        for zeroer in self.zeroers:
+            zeroer.warmup(num_kv_blocks)

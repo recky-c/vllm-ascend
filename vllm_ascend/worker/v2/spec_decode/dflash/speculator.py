@@ -15,8 +15,10 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
 from vllm_ascend.ops.triton.v2.spec_decode.prepare_dflash_inputs import prepare_dflash_inputs_triton
-from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
+from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper, dflash_draft_kv_optimistic_bound
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -34,7 +36,69 @@ def prepare_dflash_inputs_factory(kv_cache_block_size: int) -> Callable[..., Non
     return prepare_with_block_size
 
 
+def _supports_dflash_draft_kv_optimistic_bound(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    parallel_config = vllm_config.parallel_config
+    return (
+        speculative_config is not None
+        and speculative_config.method == "dflash"
+        and vllm_config.model_config.hf_text_config.model_type in ("qwen3_5", "qwen3_5_text")
+        and not speculative_config.enable_adaptive_verification
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size == 1
+        and parallel_config.decode_context_parallel_size == 1
+    )
+
+
 class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
+    def _can_use_dflash_draft_cpu_bound(self, num_reqs: int, upper_bound: torch.Tensor, step: int) -> bool:
+        """Require an upstream CPU bound covered by allocated kernel blocks.
+
+        DFlash reserves K+1 lookahead tokens. The upper bound adds the same
+        query width; rejection can only shorten the exact device length.
+        Check the host allocation ledger rather than preallocated table width.
+        """
+        if (
+            not getattr(self, "_dflash_draft_kv_optimistic_bound_active", False)
+            or not getattr(self, "_dflash_draft_kv_zeroing_ready", False)
+            or step != self.num_query_per_req
+            or num_reqs <= 0
+            or upper_bound is None
+            or upper_bound.device.type != "cpu"
+            or upper_bound.ndim != 1
+            or upper_bound.dtype not in (torch.int32, torch.int64)
+            or upper_bound.numel() < num_reqs
+        ):
+            return False
+        block_tables = getattr(self, "block_tables", None)
+        num_blocks = getattr(getattr(block_tables, "num_blocks", None), "np", None)
+        idx_mapping = getattr(self.input_batch, "idx_mapping_np", None)
+        group_ids = getattr(self, "draft_kv_cache_group_ids", None)
+        kernel_block_sizes = getattr(block_tables, "kernel_block_sizes", None)
+        if (
+            num_blocks is None
+            or idx_mapping is None
+            or group_ids is None
+            or not group_ids
+            or kernel_block_sizes is None
+            or len(idx_mapping) < num_reqs
+            or num_blocks.ndim != 2
+        ):
+            return False
+        bounds = upper_bound[:num_reqs].to(torch.int64).numpy()
+        for req in range(num_reqs):
+            state_idx = int(idx_mapping[req])
+            if state_idx < 0 or state_idx >= num_blocks.shape[1] or bounds[req] < 0:
+                return False
+            draft_bound = min(int(bounds[req]) + step, self.max_model_len)
+            for group_id in group_ids:
+                if group_id < 0 or group_id >= num_blocks.shape[0] or group_id >= len(kernel_block_sizes):
+                    return False
+                block_size = kernel_block_sizes[group_id]
+                if block_size <= 0 or draft_bound > int(num_blocks[group_id, state_idx]) * block_size:
+                    return False
+        return True
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
@@ -53,15 +117,24 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         causal: bool | Mapping[int, bool] = True,
         dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        attn_metadata = super()._build_uniform_attn_metadata(
-            batch_desc=batch_desc,
-            num_reqs=num_reqs,
-            num_query_per_req=num_query_per_req,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            step=step,
-            causal=causal,
-            dcp_local_seq_lens=dcp_local_seq_lens,
+        use_cpu_bound = (
+            self._can_use_dflash_draft_cpu_bound(num_reqs, seq_lens_cpu_upper_bound, step)
+            and step == self.num_query_per_req
+            and num_query_per_req == self.num_query_per_req
+            and dcp_local_seq_lens is None
         )
+        # Scope only the draft query build, including the fresh FULL graph
+        # fallback. Target-prefill reuse and capture never enter this scope.
+        with build_attn_metadata_wrapper(), dflash_draft_kv_optimistic_bound(use_cpu_bound):
+            attn_metadata = super()._build_uniform_attn_metadata(
+                batch_desc=batch_desc,
+                num_reqs=num_reqs,
+                num_query_per_req=num_query_per_req,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                step=step,
+                causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+            )
         if (
             getattr(self, "_reuse_draft_attn_metadata", False)
             and batch_desc.cg_mode == CUDAGraphMode.FULL
@@ -124,6 +197,12 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
+        self._dflash_draft_kv_optimistic_bound_enabled = (
+            get_ascend_config().enable_dflash_draft_kv_optimistic_bound
+            and _supports_dflash_draft_kv_optimistic_bound(vllm_config)
+        )
+        self._dflash_draft_kv_optimistic_bound_active = False
+        self._dflash_draft_kv_zeroing_ready = False
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
@@ -168,7 +247,19 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type, layer_names)
 
             for layer_name in layer_names:
-                attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
+                layer = attn_layers[layer_name]
+                attn_backends[layer_name] = layer.get_attn_backend()
+                # Sink/FIA-v2 and specialized backends keep their existing
+                # contracts until their graph consumers are separately tested.
+                if getattr(getattr(layer, "impl", None), "sinks", None) is not None:
+                    self._dflash_draft_kv_optimistic_bound_enabled = False
+
+        if getattr(self, "_dflash_draft_kv_optimistic_bound_enabled", False):
+            self._dflash_draft_kv_optimistic_bound_enabled = all(
+                type(group.get_metadata_builder(0)) is AscendAttentionMetadataBuilder
+                for group_id in self.draft_kv_cache_group_ids
+                for group in self.attn_groups[group_id]
+            )
 
         self.attn_backends = attn_backends
         dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
@@ -197,6 +288,12 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         self.input_batch = input_batch
         self._draft_attn_metadata_for_graph = None
         self._reuse_draft_attn_metadata = True
+        self._dflash_draft_kv_optimistic_bound_active = (
+            getattr(self, "_dflash_draft_kv_optimistic_bound_enabled", False)
+            and not dummy_run
+            and not is_profile
+            and not getattr(input_batch, "has_prefill", True)
+        )
         sync_state = dp_sync
         if dummy_run and skip_attn_for_dummy_run:
             # Profiling runs the draft with its own query token count, which
@@ -229,6 +326,7 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
             # Never let metadata from this batch survive into the next proposal,
             # including eager/profiling paths or a failed graph replay.
             self._reuse_draft_attn_metadata = False
+            self._dflash_draft_kv_optimistic_bound_active = False
             self._draft_attn_metadata_for_graph = None
 
 

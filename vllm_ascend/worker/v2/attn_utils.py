@@ -108,6 +108,17 @@ if TYPE_CHECKING:
 
 # MRV2's upstream _dummy_run drops runner-specific kwargs such as``skip_gdn_state_update``
 _SKIP_RING_STATE_UPDATE: ContextVar[bool] = ContextVar("_SKIP_RING_STATE_UPDATE", default=False)
+_DFLASH_DRAFT_KV_OPTIMISTIC_BOUND: ContextVar[bool] = ContextVar("_DFLASH_DRAFT_KV_OPTIMISTIC_BOUND", default=False)
+
+
+@contextmanager
+def dflash_draft_kv_optimistic_bound(enabled: bool):
+    """Scope optimistic FIA host lengths to this draft query build only."""
+    token = _DFLASH_DRAFT_KV_OPTIMISTIC_BOUND.set(enabled)
+    try:
+        yield
+    finally:
+        _DFLASH_DRAFT_KV_OPTIMISTIC_BOUND.reset(token)
 
 
 @contextmanager
@@ -388,6 +399,13 @@ def build_attn_metadata(
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
         skip_ring_state_update = ring_state_update_skipped()
+    # Only a real draft CPU bound supplied by the upstream speculator is
+    # eligible. The synthetic batch-maximum fallback below is never eligible.
+    draft_fia_seq_lens_cpu = None
+    if _DFLASH_DRAFT_KV_OPTIMISTIC_BOUND.get() and not for_cudagraph_capture:
+        draft_fia_seq_lens_cpu = _get_dflash_draft_fia_seq_lens_cpu(
+            seq_lens_cpu_upper_bound, query_start_loc_cpu, num_reqs, max_seq_len
+        )
     if seq_lens_np is None:
         if seq_lens_cpu_upper_bound is not None:
             # FIA needs a CPU-side seq_lens upper bound for each request when
@@ -497,6 +515,7 @@ def build_attn_metadata(
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            dflash_draft_seq_lens_cpu_upper_bound=draft_fia_seq_lens_cpu,
             seq_lens=seq_lens[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=num_actual_tokens,
@@ -1767,6 +1786,41 @@ def _reshape_kv_cache_v2(
 
 
 _BUILD_ATTN_METADATA_MODULE = _speculator
+
+
+def _get_dflash_draft_fia_seq_lens_cpu(
+    upper_bound: torch.Tensor | None,
+    query_start_loc_cpu: torch.Tensor,
+    num_reqs: int,
+    max_seq_len: int,
+) -> torch.Tensor | None:
+    """Validate a supplied per-request CPU bound without reading device data.
+
+    The DFlash caller proves scheduling/allocation eligibility. Do not infer
+    allocation from the block table width: unused columns are preallocated.
+    Dummy requests have no query tokens before graph padding and use length 1.
+    """
+    if (
+        upper_bound is None
+        or upper_bound.device.type != "cpu"
+        or upper_bound.ndim != 1
+        or upper_bound.dtype not in (torch.int32, torch.int64)
+        or upper_bound.numel() < num_reqs
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.numel() < num_reqs + 1
+    ):
+        return None
+    bounds = upper_bound[:num_reqs]
+    query_lens = query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]
+    active = query_lens > 0
+    if (
+        bool((query_lens < 0).any())
+        or bool((bounds < 0).any())
+        or bool((bounds > max_seq_len).any())
+        or bool((bounds[active] < query_lens[active]).any())
+    ):
+        return None
+    return torch.where(active, bounds, 1)
 
 
 @contextmanager

@@ -337,16 +337,29 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
         num_decodes, num_prefills, num_decode_tokens, _ = self._split_decodes_and_prefills(common_attn_metadata)
+        # Optimistic bounds affect only FIA's host list. Preserve accurate
+        # device lengths for GDN, indexing, and any device-side consumers.
+        host_seq_lens = common_attn_metadata.dflash_draft_seq_lens_cpu_upper_bound
+        if type(self) is not AscendAttentionMetadataBuilder or isinstance(self.kv_cache_spec, CrossAttentionSpec):
+            host_seq_lens = None
+        if host_seq_lens is None:
+            host_seq_lens = seq_lens
         # Keep the existing conversion cache API, including its tuple payload.
         # A common FIA cache miss can reuse it without converting lengths twice.
         request_key = None
         if batch_metadata_cache is not None:
-            request_key = ("fia", tensor_view_key(query_start_loc_cpu), tensor_view_key(seq_lens), self.device)
+            request_key = (
+                "fia",
+                tensor_view_key(query_start_loc_cpu),
+                tensor_view_key(seq_lens),
+                tensor_view_key(host_seq_lens),
+                self.device,
+            )
         request_metadata = None if batch_metadata_cache is None else batch_metadata_cache.get(request_key)
         if request_metadata is None:
             query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
             actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-            seq_lens_list = seq_lens.tolist()
+            seq_lens_list = host_seq_lens.tolist()
             request_metadata = (query_start_loc, actual_seq_lengths_q, seq_lens_list)
             if batch_metadata_cache is not None:
                 batch_metadata_cache[request_key] = request_metadata
@@ -418,6 +431,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 seq_lens.stride(),
                 seq_lens.dtype,
                 seq_lens.device,
+                tensor_view_key(common_attn_metadata.dflash_draft_seq_lens_cpu_upper_bound),
                 id(common_attn_metadata.is_prefilling),
                 id(common_attn_metadata.context_parallel_metadata),
             )

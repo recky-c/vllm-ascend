@@ -15,13 +15,16 @@
 
 from collections.abc import Callable
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.worker import utils as worker_utils
-from vllm_ascend.worker.utils import AscendKVBlockZeroer
+from vllm_ascend.worker.utils import AscendKVBlockZeroer, CompositeKVBlockZeroer
+from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 
 class _FakeKernel:
@@ -159,6 +162,108 @@ def _context():
             kv_cache=(torch.zeros(shape), torch.zeros(shape)),
         )
     }
+
+
+@pytest.mark.parametrize("include_sliding_window", [False, True])
+def test_sliding_window_zeroing_is_opt_in(include_sliding_window):
+    spec = SlidingWindowSpec(block_size=8, num_kv_heads=1, head_size=2, dtype=torch.float32, sliding_window=16)
+    group = SimpleNamespace(kv_cache_spec=spec, kv_cache_group_id=0, layer_names=["swa"])
+    cache = torch.ones(4, 4, 1, 2)
+    zeroer = AscendKVBlockZeroer(torch.device("cpu"), pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        [4],
+        "auto",
+        set(),
+        {"swa": SimpleNamespace(kv_cache=(cache, cache.clone()))},
+        include_sliding_window=include_sliding_window,
+        num_blocks=2,
+    )
+    assert (zeroer._meta is not None) is include_sliding_window
+    assert zeroer.covered_layer_names == ({"swa"} if include_sliding_window else set())
+
+
+def test_opt_in_zeroing_preserves_widest_aliased_payload_and_padding():
+    raw = torch.ones(2, 32, dtype=torch.int32)
+    short = torch.as_strided(raw, (2, 4), (32, 1))
+    wide = torch.as_strided(raw, (2, 16), (32, 1))
+    first = _attention_group(layer_names=["short"])
+    second = _attention_group(layer_names=["wide"])
+    zeroer = AscendKVBlockZeroer(torch.device("cpu"), pin_memory=False)
+    zeroer.init_meta(
+        [first, second],
+        [8],
+        "auto",
+        set(),
+        {
+            "short": SimpleNamespace(kv_cache=(short, short)),
+            "wide": SimpleNamespace(kv_cache=(wide, wide)),
+        },
+        include_sliding_window=True,
+        num_blocks=2,
+    )
+    addresses, sizes, _, _, count = zeroer._meta
+    assert count == 1 and addresses.tolist() == [raw.data_ptr()]
+    assert sizes.tolist() == [16]
+    assert zeroer._seg_page_strides.tolist() == [32]
+
+
+@pytest.mark.parametrize("enabled,needs_zeroing", [(False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("unsupported", [None, "shape", "coverage"])
+def test_mrv2_opt_in_zeroer_preserves_upstream_and_adds_all_draft_segments(
+    monkeypatch, enabled, needs_zeroing, unsupported
+):
+    upstream = MagicMock()
+    monkeypatch.setattr(GPUModelRunner, "_init_kv_zero_meta", lambda self: setattr(self, "kv_block_zeroer", upstream))
+    runner = object.__new__(NPUModelRunner)
+    runner.device, runner.pin_memory = torch.device("cpu"), False
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")
+    runner.kv_cache_config = SimpleNamespace(needs_kv_cache_zeroing=needs_zeroing, num_blocks=2)
+    full = _attention_group(group_id=1, layer_names=["full"])
+    swa = SimpleNamespace(
+        kv_cache_group_id=2,
+        layer_names=["swa"],
+        kv_cache_spec=SlidingWindowSpec(
+            block_size=8, num_kv_heads=1, head_size=2, dtype=torch.float32, sliding_window=16
+        ),
+    )
+    runner.attn_groups = [[_attention_group(layer_names=["target"])], [], []]
+    runner.speculator = SimpleNamespace(
+        _dflash_draft_kv_optimistic_bound_enabled=enabled,
+        attn_groups=[[], [full], [swa]],
+        draft_kv_cache_group_ids=[1, 2],
+    )
+    cache = torch.ones(4, 4, 1, 2)
+    runner.kernel_block_sizes = [4, 4, 4]
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={
+            "target": SimpleNamespace(kv_cache=cache),
+            "full": SimpleNamespace(kv_cache=(cache.clone(), cache.clone())),
+            "swa": SimpleNamespace(kv_cache=(cache.clone(), cache.clone())),
+        }
+    )
+    if unsupported == "shape":
+        runner.compilation_config.static_forward_context["swa"].kv_cache = (cache[:3], cache[:3])
+    elif unsupported == "coverage":
+        runner.compilation_config.static_forward_context["swa"].kv_cache = cache
+    runner._init_kv_zero_meta()
+    if enabled and needs_zeroing and unsupported is None:
+        assert isinstance(runner.kv_block_zeroer, CompositeKVBlockZeroer)
+        assert runner.kv_block_zeroer.zeroers[0] is upstream
+        ascend = runner.kv_block_zeroer.zeroers[1]
+        assert ascend.covered_layer_names == {"full", "swa"}
+        monkeypatch.setattr(ascend, "zero_block_ids", MagicMock())
+        monkeypatch.setattr(ascend, "warmup", MagicMock())
+        runner.kv_block_zeroer.zero_block_ids([1])
+        runner.kv_block_zeroer.warmup(2)
+        upstream.zero_block_ids.assert_called_once_with([1])
+        upstream.warmup.assert_called_once_with(2)
+        ascend.zero_block_ids.assert_called_once_with([1])
+        ascend.warmup.assert_called_once_with(2)
+        assert runner.speculator._dflash_draft_kv_zeroing_ready
+    else:
+        assert runner.kv_block_zeroer is upstream
+        assert not runner.speculator._dflash_draft_kv_zeroing_ready
 
 
 def test_init_meta_uses_flat_kernel_size_for_virtual_blocks():

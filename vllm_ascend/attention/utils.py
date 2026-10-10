@@ -263,6 +263,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None
 
+    # Opt-in MRV2 DFlash draft-only FIA host lengths. This is an optimistic
+    # per-request bound, not a corrected CPU mirror. Device consumers must
+    # continue using seq_lens; target/prefill metadata never sets this field.
+    dflash_draft_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+
     # Host mirror of this cache group's block table, including padded rows.
 
     # CPU tensor of already computed tokens count per request.
@@ -603,9 +608,10 @@ def _select_seq_lens(
     updated during draft iterations, while ``seq_lens_cpu`` is None in async
     spec decode mode. Cross-attention and generic parallel drafting override
     this with the NPU ``seq_lens``; the one exception is DSpark on the GLM5.2
-    family, whose CPU mirror carries the same post-rejection-sampling lengths
-    across draft iterations, so building from it skips the NPU->CPU sync at
-    ``seq_lens.tolist()`` in the metadata build.
+    family, which intentionally uses optimistic CPU lengths to skip the
+    NPU->CPU sync, potentially trading draft acceptance for performance.
+    The opt-in Qwen DFlash optimization only changes FIA's host length list;
+    it does not change the device tensor selected here.
     """
     # Prefer _seq_lens_cpu (always available, updated during draft
     # iterations) over seq_lens_cpu (None in async spec decode mode).

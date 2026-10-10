@@ -434,6 +434,7 @@ class AscendConfig:
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": true,
             "enable_pcp_embedding_lmhead_weight_sharding": true,
+            "enable_dflash_draft_kv_optimistic_bound": false,
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -583,6 +584,10 @@ class AscendConfig:
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
+    # Experimental Qwen3.5 MRV2 DFlash draft FIA host lengths. Per-request
+    # CPU upper bounds avoid a device readback, but may reduce acceptance.
+    # Target/device lengths remain exact. Unsupported paths fall back to exact.
+    enable_dflash_draft_kv_optimistic_bound: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
