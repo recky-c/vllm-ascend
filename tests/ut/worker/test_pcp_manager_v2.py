@@ -817,7 +817,7 @@ def test_sampling_restore_exposes_unpadded_global_view() -> None:
     manager._global_batch = batch
     hidden_states = torch.arange(32).reshape(16, 2)
     manager._restored_target_outputs = (hidden_states, [hidden_states])
-    with patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=True):
+    with patch.object(AscendPCPManager, "_hides_target_graph_padding", return_value=True):
         # vLLM #57980 threads aux_hidden_states through this hook.
         restored_hidden, restored_aux, restored_batch = manager.restore_for_sampling(hidden_states, None)
     assert len(restored_aux) == 1
@@ -849,7 +849,9 @@ def _make_execute_state(input_batch, hidden_states=None, aux_hidden_states=None,
 
 def test_global_view_restores_target_outputs_once_per_step() -> None:
     manager = AscendPCPManager.__new__(AscendPCPManager)
-    manager._global_batch = SimpleNamespace(num_tokens=4, num_tokens_after_padding=4, is_dummy=False)
+    manager._global_batch = _make_global_pcp_batch()
+    manager._global_batch.num_tokens = manager._global_batch.num_tokens_after_padding = 4
+    manager._global_batch.is_dummy = False
     manager._restored_target_outputs = None
     local_batch = _make_local_pcp_batch()
     local_batch.is_dummy = False
@@ -862,7 +864,7 @@ def test_global_view_restores_target_outputs_once_per_step() -> None:
             return_value=SimpleNamespace(is_last_rank=True),
         ),
         patch.object(PCPManager, "restore_hidden_states", side_effect=lambda value: value.repeat(2, 1)) as gather,
-        patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=False),
+        patch.object(AscendPCPManager, "_hides_target_graph_padding", return_value=False),
     ):
         global_state = manager.to_global_view(state)
         sampled_hidden, sampled_aux, sampled_batch = manager.restore_for_sampling(
@@ -1387,3 +1389,63 @@ def test_short_prefill_leaves_empty_pcp_ranks_in_mixed_batch(num_prefill_tokens)
             expected.append((3, rank, 1))
         assert chunks == expected
     assert manager.get_num_tokens_for_dispatch(counts, prefilling) == 5
+
+
+@pytest.mark.parametrize(("scheduled", "rewritten"), [([2, 2], True), ([2, 1], False)])
+def test_sharded_decode_query_offsets_cover_uniform_graph_rows(scheduled, rewritten) -> None:
+    """FIA needs offsets ending at T; non-uniform batches keep upstream offsets."""
+    global_batch = SimpleNamespace(num_scheduled_tokens=np.array(scheduled, dtype=np.int32))
+    original = np.array([0, 2, 2, 2, 2], dtype=np.int32)
+    local_batch = SimpleNamespace(
+        num_reqs_after_padding=4,
+        num_tokens_after_padding=8,
+        query_start_loc_np=original.copy(),
+        query_start_loc=torch.zeros(5, dtype=torch.int32),
+    )
+    buffer_ptr = local_batch.query_start_loc.data_ptr()
+
+    with patch(
+        "vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu",
+        side_effect=lambda values, out: out.copy_(torch.from_numpy(values)),
+    ) as copy:
+        AscendPCPManager._pad_sharded_decode_query_offsets(global_batch, local_batch)
+
+    expected = [0, 2, 4, 6, 8] if rewritten else original.tolist()
+    assert local_batch.query_start_loc_np.tolist() == expected
+    assert copy.call_count == int(rewritten)
+    # Graph replay reads the offsets from the captured buffer address.
+    assert local_batch.query_start_loc.data_ptr() == buffer_ptr
+
+
+def _padded_scheduled_batch(is_dummy: bool = False) -> AscendInputBatch:
+    batch = _make_global_pcp_batch()
+    batch.num_reqs, batch.num_tokens, batch.num_tokens_after_padding = 2, 3, 4
+    batch.query_start_loc = torch.tensor([0, 1, 3, 4], dtype=torch.int32)
+    batch.query_start_loc_np = np.array([0, 1, 3, 4], dtype=np.int32)
+    batch.is_dummy = is_dummy
+    return batch
+
+
+@pytest.mark.parametrize(
+    ("speculative", "sharded", "is_dummy", "hides"),
+    [(True, True, False, True), (False, True, False, False), (True, False, False, False), (True, True, True, False)],
+)
+def test_scheduled_tokens_hide_target_graph_padding_only_for_sharded_spec_decode(
+    speculative, sharded, is_dummy, hides
+) -> None:
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager.vllm_config = SimpleNamespace(speculative_config=object() if speculative else None)
+    global_batch = _padded_scheduled_batch(is_dummy)
+    hidden, aux = torch.arange(8).reshape(4, 2), [torch.ones(4, 2)]
+
+    with patch.object(AscendPCPManager, "is_decode_sharded", sharded):
+        out_hidden, out_aux, out_batch = manager._to_scheduled_tokens(hidden, aux, global_batch)
+
+    if hides:
+        assert out_hidden.shape == out_aux[0].shape == (3, 2)
+        assert out_hidden.data_ptr() == hidden.data_ptr()
+        assert out_batch.num_tokens_after_padding == 3
+        assert out_batch.query_start_loc_np.tolist() == [0, 1, 3]
+        assert global_batch.num_tokens_after_padding == 4
+    else:
+        assert (out_hidden, out_aux, out_batch) == (hidden, aux, global_batch)

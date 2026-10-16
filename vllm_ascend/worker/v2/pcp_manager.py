@@ -304,9 +304,9 @@ class AscendPCPManager(PCPManager):
         local_batch.is_cpp_profile = getattr(global_batch, "is_cpp_profile", False)
         self._pad_hidden_restore_idx(global_batch)
         if not self.is_decode_sharded:
-            local_batch = self._pad_replicated_decode_graph(global_batch, local_batch)
+            local_batch = self._pad_replicated_decode_to_graph(global_batch, local_batch)
         elif padded_num_reqs is not None:
-            self._pad_uniform_query_start_loc(global_batch, local_batch)
+            self._pad_sharded_decode_query_offsets(global_batch, local_batch)
 
         actual_seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
         if local_batch.num_tokens == 0:
@@ -369,7 +369,7 @@ class AscendPCPManager(PCPManager):
         self._hidden_restore_idx = restore_idx
 
     @staticmethod
-    def _pad_uniform_query_start_loc(global_batch: AscendInputBatch, local_batch: AscendInputBatch) -> None:
+    def _pad_sharded_decode_query_offsets(global_batch: AscendInputBatch, local_batch: AscendInputBatch) -> None:
         """Give every row of a uniform FULL graph the captured query width.
 
         FIA needs query offsets that cover the whole padded input, including
@@ -383,7 +383,7 @@ class AscendPCPManager(PCPManager):
         local_batch.query_start_loc_np[:] = np.arange(num_reqs + 1, dtype=np.int32) * query_len
         async_copy_to_gpu(local_batch.query_start_loc_np, out=local_batch.query_start_loc)
 
-    def _pad_replicated_decode_graph(
+    def _pad_replicated_decode_to_graph(
         self,
         global_batch: AscendInputBatch,
         local_batch: AscendInputBatch,
@@ -480,8 +480,8 @@ class AscendPCPManager(PCPManager):
         for padded batches; they read as zeros. ``_pad_hidden_restore_idx``
         extends the restore indices to the padded extent, so the parent is
         expected to return exactly that length; anything else raises.
-        Fixed-K speculative decode sharding restores to the unpadded global
-        batch instead, returning the compact ``num_tokens`` rows.
+        Hiding target-only graph padding from sampling and drafting belongs to
+        the to_global_view handoff.
         """
         if not self.is_last_pp_rank:
             return hidden_states
@@ -502,33 +502,7 @@ class AscendPCPManager(PCPManager):
             return restored_hidden_states
 
         restored_hidden_states[num_tokens:].zero_()
-        if self._restore_unpadded_global_batch():
-            restored_hidden_states = restored_hidden_states[:num_tokens]
         return restored_hidden_states
-
-    def _restore_unpadded_global_batch(self) -> bool:
-        """Sampling and replicated drafting consume scheduled global tokens.
-
-        Target graph padding stays private to target attention/capture views.
-        The draft chooses its own execution padding after restoration.
-        """
-        return (
-            self.vllm_config.speculative_config is not None
-            and self.is_decode_sharded
-            and self._global_batch is not None
-            and not self._global_batch.is_dummy
-        )
-
-    def _expose_unpadded_global_batch(self, global_batch: InputBatch) -> InputBatch:
-        """Expose real request boundaries and token extent at restoration."""
-        # Preserve the target's batch; expose real request boundaries and
-        # token extent at the global restoration boundary.
-        return replace(
-            global_batch,
-            num_tokens_after_padding=global_batch.num_tokens,
-            query_start_loc=global_batch.query_start_loc[: global_batch.num_reqs + 1],
-            query_start_loc_np=global_batch.query_start_loc_np[: global_batch.num_reqs + 1],
-        )
 
     def restore_for_sampling(
         self,
@@ -547,18 +521,9 @@ class AscendPCPManager(PCPManager):
             # to_global_view already gathered this step's outputs; a second
             # all-gather would reorder the global rows.
             aux_hidden_states = restored_target_outputs[1]
-            global_batch = self._global_batch
         else:
-            hidden_states, aux_hidden_states, global_batch = super().restore_for_sampling(
-                hidden_states, aux_hidden_states
-            )
-        if self._restore_unpadded_global_batch():
-            global_batch = self._expose_unpadded_global_batch(global_batch)
-            num_tokens = global_batch.num_tokens
-            hidden_states = hidden_states[:num_tokens]
-            if aux_hidden_states is not None:
-                aux_hidden_states = [states[:num_tokens] for states in aux_hidden_states]
-        return hidden_states, aux_hidden_states, global_batch
+            hidden_states, aux_hidden_states, _ = super().restore_for_sampling(hidden_states, aux_hidden_states)
+        return self._to_scheduled_tokens(hidden_states, aux_hidden_states, self._global_batch)
 
     def to_global_view(
         self,
@@ -586,8 +551,39 @@ class AscendPCPManager(PCPManager):
         aux_hidden_states = state.aux_hidden_states
         if aux_hidden_states is not None:
             aux_hidden_states = [self.restore_hidden_states(states) for states in aux_hidden_states]
+        hidden_states, aux_hidden_states, _ = self._to_scheduled_tokens(
+            hidden_states, aux_hidden_states, self.global_batch
+        )
         self._restored_target_outputs = (hidden_states, aux_hidden_states)
         return state._replace(hidden_states=hidden_states, aux_hidden_states=aux_hidden_states)
+
+    def _to_scheduled_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        global_batch: InputBatch,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None, InputBatch]:
+        """Hide target-only graph padding from sampling and drafting.
+
+        A sharded speculative decode pads the global batch for the target's
+        graphs; sampling and the draft consume only scheduled tokens and the
+        draft picks its own execution padding.
+        """
+        if not self._hides_target_graph_padding(global_batch):
+            return hidden_states, aux_hidden_states, global_batch
+        num_tokens = global_batch.num_tokens
+        if aux_hidden_states is not None:
+            aux_hidden_states = [aux[:num_tokens] for aux in aux_hidden_states]
+        scheduled_batch = replace(
+            global_batch,
+            num_tokens_after_padding=num_tokens,
+            query_start_loc=global_batch.query_start_loc[: global_batch.num_reqs + 1],
+            query_start_loc_np=global_batch.query_start_loc_np[: global_batch.num_reqs + 1],
+        )
+        return hidden_states[:num_tokens], aux_hidden_states, scheduled_batch
+
+    def _hides_target_graph_padding(self, global_batch: InputBatch) -> bool:
+        return self.vllm_config.speculative_config is not None and self.is_decode_sharded and not global_batch.is_dummy
 
     def _restore_hidden_state_buffer(self, hidden_states: torch.Tensor) -> None:
         """Restore a model-owned rank-local buffer to the global PCP layout."""
