@@ -4,17 +4,32 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
+from vllm.v1.worker.gpu.input_batch import InputBatch
 
+from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 from vllm_ascend.worker.v2.pcp.draft_handoff import ProvidesMTPTargetHiddenStates, ReplicatedDraftHandoff
 
 
+def _padded_global_batch(is_dummy: bool = False) -> InputBatch:
+    buffers = AscendInputBuffers(max_num_reqs=4, max_num_tokens=8, device=torch.device("cpu"))
+    batch = InputBatch.make_dummy(num_reqs=2, num_tokens=4, input_buffers=buffers)
+    batch.num_tokens = 3
+    batch.query_start_loc.copy_(torch.tensor([0, 1, 3, 4], dtype=torch.int32)[: batch.query_start_loc.shape[0]])
+    batch.query_start_loc_np = np.array([0, 1, 3, 4], dtype=np.int32)
+    batch.is_dummy = is_dummy
+    return batch
+
+
 class _FakeRestorer:
-    def __init__(self, is_last_pp_rank: bool = True) -> None:
-        self.global_batch = SimpleNamespace(name="global")
+    def __init__(self, is_last_pp_rank: bool = True, sharded_spec_decode: bool = False) -> None:
+        self.global_batch = _padded_global_batch()
         self.is_last_pp_rank = is_last_pp_rank
+        self.vllm_config = SimpleNamespace(speculative_config=object() if sharded_spec_decode else None)
+        self.is_decode_sharded = sharded_spec_decode
         self.restored: list[torch.Tensor] = []
         self.restored_buffers: list[torch.Tensor] = []
 
@@ -107,3 +122,37 @@ def test_mtp_hidden_state_provider_is_structural() -> None:
 
     assert isinstance(_Provider(), ProvidesMTPTargetHiddenStates)
     assert not isinstance(object(), ProvidesMTPTargetHiddenStates)
+
+
+def test_sharded_spec_decode_hides_target_graph_padding() -> None:
+    handoff = ReplicatedDraftHandoff(_FakeRestorer(sharded_spec_decode=True))
+    global_batch = _padded_global_batch()
+    hidden, aux = torch.arange(8).reshape(4, 2), [torch.ones(4, 2)]
+
+    scheduled_hidden, scheduled_aux, scheduled_batch = handoff.to_scheduled_tokens(hidden, aux, global_batch)
+
+    assert scheduled_hidden.shape == scheduled_aux[0].shape == (3, 2)
+    assert scheduled_hidden.data_ptr() == hidden.data_ptr()
+    assert scheduled_batch.num_tokens_after_padding == 3
+    assert scheduled_batch.query_start_loc_np.tolist() == [0, 1, 3]
+    assert scheduled_batch.query_start_loc.tolist() == [0, 1, 3]
+    # The target keeps its padded batch.
+    assert global_batch.num_tokens_after_padding == 4
+
+
+@pytest.mark.parametrize(("sharded_spec_decode", "is_dummy"), [(False, False), (True, True)])
+def test_other_layouts_keep_global_padding(sharded_spec_decode: bool, is_dummy: bool) -> None:
+    handoff = ReplicatedDraftHandoff(_FakeRestorer(sharded_spec_decode=sharded_spec_decode))
+    global_batch = _padded_global_batch(is_dummy)
+    hidden = torch.zeros(4, 2)
+
+    assert handoff.to_scheduled_tokens(hidden, None, global_batch) == (hidden, None, global_batch)
+
+
+def test_draft_step_caches_scheduled_outputs() -> None:
+    handoff = ReplicatedDraftHandoff(_FakeRestorer(sharded_spec_decode=True))
+    draft_state = handoff.to_draft_step(_state(), None)
+
+    # _FakeRestorer doubles 2 local rows into the padded 4-row global layout.
+    assert draft_state.hidden_states.shape == draft_state.aux_hidden_states[0].shape == (3, 4)
+    assert handoff.take_restored_outputs(draft_state.hidden_states)[0] is draft_state.hidden_states

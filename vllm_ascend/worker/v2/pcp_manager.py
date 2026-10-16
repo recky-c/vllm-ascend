@@ -311,9 +311,9 @@ class AscendPCPManager(PCPManager):
         local_batch.is_cpp_profile = getattr(global_batch, "is_cpp_profile", False)
         self._pad_hidden_restore_idx(global_batch)
         if not self.is_decode_sharded:
-            local_batch = self._pad_replicated_decode_graph(global_batch, local_batch)
+            local_batch = self._pad_replicated_decode_to_graph(global_batch, local_batch)
         elif padded_num_reqs is not None:
-            self._pad_uniform_query_start_loc(global_batch, local_batch)
+            self._pad_sharded_decode_query_offsets(global_batch, local_batch)
 
         actual_seq_lens_np = local_batch.num_computed_tokens_np + local_batch.num_scheduled_tokens
         if local_batch.num_tokens == 0:
@@ -376,7 +376,7 @@ class AscendPCPManager(PCPManager):
         self._hidden_restore_idx = restore_idx
 
     @staticmethod
-    def _pad_uniform_query_start_loc(global_batch: AscendInputBatch, local_batch: AscendInputBatch) -> None:
+    def _pad_sharded_decode_query_offsets(global_batch: AscendInputBatch, local_batch: AscendInputBatch) -> None:
         """Give every row of a uniform FULL graph the captured query width.
 
         FIA needs query offsets that cover the whole padded input, including
@@ -390,7 +390,7 @@ class AscendPCPManager(PCPManager):
         local_batch.query_start_loc_np[:] = np.arange(num_reqs + 1, dtype=np.int32) * query_len
         async_copy_to_gpu(local_batch.query_start_loc_np, out=local_batch.query_start_loc)
 
-    def _pad_replicated_decode_graph(
+    def _pad_replicated_decode_to_graph(
         self,
         global_batch: AscendInputBatch,
         local_batch: AscendInputBatch,
@@ -487,8 +487,8 @@ class AscendPCPManager(PCPManager):
         for padded batches; they read as zeros. ``_pad_hidden_restore_idx``
         extends the restore indices to the padded extent, so the parent is
         expected to return exactly that length; anything else raises.
-        Fixed-K speculative decode sharding restores to the unpadded global
-        batch instead, returning the compact ``num_tokens`` rows.
+        Hiding target-only graph padding from sampling and drafting belongs to
+        the draft handoff.
         """
         if not self.is_last_pp_rank:
             return hidden_states
@@ -509,33 +509,7 @@ class AscendPCPManager(PCPManager):
             return restored_hidden_states
 
         restored_hidden_states[num_tokens:].zero_()
-        if self._restore_unpadded_global_batch():
-            restored_hidden_states = restored_hidden_states[:num_tokens]
         return restored_hidden_states
-
-    def _restore_unpadded_global_batch(self) -> bool:
-        """Sampling and replicated drafting consume scheduled global tokens.
-
-        Target graph padding stays private to target attention/capture views.
-        The draft chooses its own execution padding after restoration.
-        """
-        return (
-            self.vllm_config.speculative_config is not None
-            and self.is_decode_sharded
-            and self._global_batch is not None
-            and not self._global_batch.is_dummy
-        )
-
-    def _expose_unpadded_global_batch(self, global_batch: InputBatch) -> InputBatch:
-        """Expose real request boundaries and token extent at restoration."""
-        # Preserve the target's batch; expose real request boundaries and
-        # token extent at the global restoration boundary.
-        return replace(
-            global_batch,
-            num_tokens_after_padding=global_batch.num_tokens,
-            query_start_loc=global_batch.query_start_loc[: global_batch.num_reqs + 1],
-            query_start_loc_np=global_batch.query_start_loc_np[: global_batch.num_reqs + 1],
-        )
 
     def restore_for_sampling(
         self,
@@ -549,20 +523,11 @@ class AscendPCPManager(PCPManager):
         """
         assert self._global_batch is not None
         restored_outputs = self.draft_handoff.take_restored_outputs(hidden_states)
-        if restored_outputs is not None:
-            hidden_states, aux_hidden_states = restored_outputs
-            global_batch = self._global_batch
+        if restored_outputs is None:
+            hidden_states, aux_hidden_states, _ = super().restore_for_sampling(hidden_states, aux_hidden_states)
         else:
-            hidden_states, aux_hidden_states, global_batch = super().restore_for_sampling(
-                hidden_states, aux_hidden_states
-            )
-        if self._restore_unpadded_global_batch():
-            global_batch = self._expose_unpadded_global_batch(global_batch)
-            num_tokens = global_batch.num_tokens
-            hidden_states = hidden_states[:num_tokens]
-            if aux_hidden_states is not None:
-                aux_hidden_states = [states[:num_tokens] for states in aux_hidden_states]
-        return hidden_states, aux_hidden_states, global_batch
+            hidden_states, aux_hidden_states = restored_outputs
+        return self.draft_handoff.to_scheduled_tokens(hidden_states, aux_hidden_states, self._global_batch)
 
     def finish_target_step(
         self,

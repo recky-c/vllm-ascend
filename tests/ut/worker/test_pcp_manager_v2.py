@@ -817,8 +817,9 @@ def test_sampling_restore_exposes_unpadded_global_view() -> None:
     batch.query_start_loc = torch.tensor([0, 12, 16], dtype=torch.int32)
     manager._global_batch = batch
     hidden_states = torch.arange(32).reshape(16, 2)
-    manager.draft_handoff = SimpleNamespace(take_restored_outputs=lambda hidden: (hidden, [hidden]))
-    with patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=True):
+    manager.draft_handoff = ReplicatedDraftHandoff(manager)
+    manager.draft_handoff.take_restored_outputs = lambda hidden: (hidden, [hidden])
+    with patch.object(ReplicatedDraftHandoff, "_hides_target_graph_padding", return_value=True):
         # vLLM #57980 threads aux_hidden_states through this hook.
         restored_hidden, restored_aux, restored_batch = manager.restore_for_sampling(hidden_states, None)
     assert len(restored_aux) == 1
@@ -850,7 +851,9 @@ def _make_execute_state(input_batch, hidden_states=None, aux_hidden_states=None,
 
 def test_target_step_restores_outputs_once_for_draft_and_sampling() -> None:
     manager = AscendPCPManager.__new__(AscendPCPManager)
-    manager._global_batch = SimpleNamespace(num_tokens=4, num_tokens_after_padding=4, is_dummy=False)
+    manager._global_batch = _make_global_pcp_batch()
+    manager._global_batch.num_tokens = manager._global_batch.num_tokens_after_padding = 4
+    manager._global_batch.is_dummy = False
     manager.draft_handoff = ReplicatedDraftHandoff(manager)
     local_batch = _make_local_pcp_batch()
     local_batch.is_dummy = False
@@ -863,7 +866,7 @@ def test_target_step_restores_outputs_once_for_draft_and_sampling() -> None:
             return_value=SimpleNamespace(is_last_rank=True),
         ),
         patch.object(PCPManager, "restore_hidden_states", side_effect=lambda value: value.repeat(2, 1)) as gather,
-        patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=False),
+        patch.object(ReplicatedDraftHandoff, "_hides_target_graph_padding", return_value=False),
     ):
         draft_state = manager.finish_target_step(state, None)
         sampled_hidden, sampled_aux, sampled_batch = manager.restore_for_sampling(
@@ -1367,3 +1370,29 @@ def test_short_prefill_leaves_empty_pcp_ranks_in_mixed_batch(num_prefill_tokens)
             expected.append((3, rank, 1))
         assert chunks == expected
     assert manager.get_num_tokens_for_dispatch(counts, prefilling) == 5
+
+
+@pytest.mark.parametrize(("scheduled", "rewritten"), [([2, 2], True), ([2, 1], False)])
+def test_sharded_decode_query_offsets_cover_uniform_graph_rows(scheduled, rewritten) -> None:
+    """FIA needs offsets ending at T; non-uniform batches keep upstream offsets."""
+    global_batch = SimpleNamespace(num_scheduled_tokens=np.array(scheduled, dtype=np.int32))
+    original = np.array([0, 2, 2, 2, 2], dtype=np.int32)
+    local_batch = SimpleNamespace(
+        num_reqs_after_padding=4,
+        num_tokens_after_padding=8,
+        query_start_loc_np=original.copy(),
+        query_start_loc=torch.zeros(5, dtype=torch.int32),
+    )
+    buffer_ptr = local_batch.query_start_loc.data_ptr()
+
+    with patch(
+        "vllm_ascend.worker.v2.pcp_manager.async_copy_to_gpu",
+        side_effect=lambda values, out: out.copy_(torch.from_numpy(values)),
+    ) as copy:
+        AscendPCPManager._pad_sharded_decode_query_offsets(global_batch, local_batch)
+
+    expected = [0, 2, 4, 6, 8] if rewritten else original.tolist()
+    assert local_batch.query_start_loc_np.tolist() == expected
+    assert copy.call_count == int(rewritten)
+    # Graph replay reads the offsets from the captured buffer address.
+    assert local_batch.query_start_loc.data_ptr() == buffer_ptr

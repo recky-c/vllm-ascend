@@ -3,9 +3,11 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Hand a PCP-sharded target step to a replicated, PCP-unaware draft."""
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
+from vllm.config import VllmConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 if TYPE_CHECKING:
@@ -14,6 +16,11 @@ if TYPE_CHECKING:
 
 class TargetOutputRestorer(Protocol):
     """The target sharding primitives the handoff relies on."""
+
+    vllm_config: VllmConfig
+
+    @property
+    def is_decode_sharded(self) -> bool: ...
 
     @property
     def global_batch(self) -> InputBatch: ...
@@ -64,6 +71,9 @@ class ReplicatedDraftHandoff:
         aux_hidden_states = state.aux_hidden_states
         if aux_hidden_states is not None:
             aux_hidden_states = [self._restorer.restore_hidden_states(aux) for aux in aux_hidden_states]
+        hidden_states, aux_hidden_states, _ = self.to_scheduled_tokens(
+            hidden_states, aux_hidden_states, self._restorer.global_batch
+        )
         self._restored_outputs = (hidden_states, aux_hidden_states)
         return state._replace(hidden_states=hidden_states, aux_hidden_states=aux_hidden_states)
 
@@ -78,3 +88,35 @@ class ReplicatedDraftHandoff:
         if restored_outputs is None or hidden_states is not restored_outputs[0]:
             return None
         return restored_outputs
+
+    def to_scheduled_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        global_batch: InputBatch,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None, InputBatch]:
+        """Hide target-only graph padding from sampling and drafting.
+
+        A sharded speculative decode pads the global batch for the target's
+        graphs; sampling and the draft consume only scheduled tokens and the
+        draft picks its own execution padding.
+        """
+        if not self._hides_target_graph_padding(global_batch):
+            return hidden_states, aux_hidden_states, global_batch
+        num_tokens = global_batch.num_tokens
+        if aux_hidden_states is not None:
+            aux_hidden_states = [aux[:num_tokens] for aux in aux_hidden_states]
+        scheduled_batch = replace(
+            global_batch,
+            num_tokens_after_padding=num_tokens,
+            query_start_loc=global_batch.query_start_loc[: global_batch.num_reqs + 1],
+            query_start_loc_np=global_batch.query_start_loc_np[: global_batch.num_reqs + 1],
+        )
+        return hidden_states[:num_tokens], aux_hidden_states, scheduled_batch
+
+    def _hides_target_graph_padding(self, global_batch: InputBatch) -> bool:
+        return (
+            self._restorer.vllm_config.speculative_config is not None
+            and self._restorer.is_decode_sharded
+            and not global_batch.is_dummy
+        )
