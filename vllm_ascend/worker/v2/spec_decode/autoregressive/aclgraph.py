@@ -35,6 +35,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     collect_sorted_captured_token_sizes,
     model_capture_wrapper,
 )
+from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -49,6 +50,10 @@ class AutoRegressiveAclGraphManager(SpeculatorCudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
     ):
+        # Upstream uses num_speculative_steps + 1 as the draft-prefill query
+        # length and 1 for draft decode.
+        if decode_query_len > 1:
+            cudagraph_mode = AscendPCPManager.draft_prefill_cudagraph_mode(vllm_config, cudagraph_mode)
         super().__init__(
             vllm_config,
             device,

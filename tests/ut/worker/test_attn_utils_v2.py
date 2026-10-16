@@ -1,7 +1,7 @@
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import numpy as np
 import pytest
@@ -1897,7 +1897,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     pcp_context = object() if pcp_size > 1 else None
     pcp_manager = (
         SimpleNamespace(
-            build_attention_context=MagicMock(return_value=pcp_context),
+            attention_context_for=MagicMock(return_value=pcp_context),
         )
         if pcp_context is not None
         else None
@@ -1980,7 +1980,7 @@ def test_mrv2_builds_shared_dsa_metadata_for_each_execution_mode(
     if pcp_context is not None:
         assert [call["pcp_cache_group_idx"] for call in calls] == [0, 1]
         assert pcp_manager is not None
-        pcp_manager.build_attention_context.assert_called_once_with(input_batch, block_tables, slot_mappings)
+        pcp_manager.attention_context_for.assert_called_once_with(ANY, input_batch, block_tables, slot_mappings)
     else:
         assert all(call["pcp_cache_group_idx"] is None for call in calls)
 
