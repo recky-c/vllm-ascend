@@ -21,6 +21,8 @@ import copy
 import torch
 from vllm.config import CompilationMode, VllmConfig
 
+from vllm_ascend.worker.v2.spec_decode.draft_config import derive_replicated_draft_config
+
 
 def init_speculator(
     vllm_config: VllmConfig,
@@ -28,9 +30,13 @@ def init_speculator(
 ):
     """Override GPU init_speculator for Ascend NPUs.
     Use AscendEagleSpeculator when eagle is used.
+
+    Every draft is built for replicated execution under PCP, so speculators
+    never see the target's PCP topology.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    vllm_config = derive_replicated_draft_config(vllm_config)
     if speculative_config.enforce_eager:
         vllm_config = copy.copy(vllm_config)
         vllm_config.compilation_config = copy.copy(vllm_config.compilation_config)

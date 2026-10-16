@@ -36,6 +36,7 @@ from vllm_ascend.worker.v2 import states as states_module
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, _prepare_pcp_inputs_to_capture
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+from vllm_ascend.worker.v2.pcp.draft_handoff import ReplicatedDraftHandoff
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
     AscendAutoRegressiveSpeculator,
@@ -815,11 +816,11 @@ def test_sampling_restore_exposes_unpadded_global_view() -> None:
     batch.query_start_loc_np = np.array([0, 12, 16], dtype=np.int32)
     batch.query_start_loc = torch.tensor([0, 12, 16], dtype=torch.int32)
     manager._global_batch = batch
-    manager._sampling_hidden_restored = True
     hidden_states = torch.arange(32).reshape(16, 2)
+    manager.draft_handoff = SimpleNamespace(take_restored_outputs=lambda hidden: (hidden, [hidden]))
     with patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=True):
         # vLLM #57980 threads aux_hidden_states through this hook.
-        restored_hidden, restored_aux, restored_batch = manager.restore_for_sampling(hidden_states, [hidden_states])
+        restored_hidden, restored_aux, restored_batch = manager.restore_for_sampling(hidden_states, None)
     assert len(restored_aux) == 1
     assert restored_aux[0].shape == (12, 2)
     assert restored_aux[0].data_ptr() == hidden_states.data_ptr()
@@ -833,10 +834,55 @@ def test_sampling_restore_exposes_unpadded_global_view() -> None:
     assert batch.query_start_loc.tolist() == [0, 12, 16]
 
 
+def _make_execute_state(input_batch, hidden_states=None, aux_hidden_states=None, dp_sync=None):
+    return vllm_model_runner.ExecuteModelState(
+        input_batch=input_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=hidden_states,
+        aux_hidden_states=aux_hidden_states,
+        dp_sync=dp_sync,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        cudagraph_stats=None,
+    )
+
+
+def test_target_step_restores_outputs_once_for_draft_and_sampling() -> None:
+    manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager._global_batch = SimpleNamespace(num_tokens=4, num_tokens_after_padding=4, is_dummy=False)
+    manager.draft_handoff = ReplicatedDraftHandoff(manager)
+    local_batch = _make_local_pcp_batch()
+    local_batch.is_dummy = False
+    local_hidden_states = torch.zeros(2, 2)
+    state = _make_execute_state(local_batch, local_hidden_states, [torch.ones(2, 2)], dp_sync=object())
+
+    with (
+        patch(
+            "vllm_ascend.worker.v2.pcp_manager.get_pp_group",
+            return_value=SimpleNamespace(is_last_rank=True),
+        ),
+        patch.object(PCPManager, "restore_hidden_states", side_effect=lambda value: value.repeat(2, 1)) as gather,
+        patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=False),
+    ):
+        draft_state = manager.finish_target_step(state, None)
+        sampled_hidden, sampled_aux, sampled_batch = manager.restore_for_sampling(
+            draft_state.hidden_states, draft_state.aux_hidden_states
+        )
+
+    assert draft_state.hidden_states.shape == (4, 2)
+    assert sampled_hidden is draft_state.hidden_states
+    assert sampled_aux is draft_state.aux_hidden_states
+    assert sampled_batch is manager._global_batch
+    # Hidden and one aux tensor; sampling does not gather again.
+    assert gather.call_count == 2
+
+
 def test_pcp_manager_restores_model_owned_hidden_buffer() -> None:
     hidden_states = torch.tensor([[1.0, 2.0], [3.0, 4.0], [-1.0, -1.0], [-1.0, -1.0]])
     restored = torch.tensor([[1.0, 2.0], [5.0, 6.0], [3.0, 4.0], [9.0, 9.0]])
     manager = AscendPCPManager.__new__(AscendPCPManager)
+    manager.vllm_config = SimpleNamespace(speculative_config=None)
     manager.pcp_world_size = 2
     manager._padded_gather_idx = torch.empty(6, dtype=torch.int64)
     manager._global_batch = SimpleNamespace(
@@ -923,7 +969,6 @@ def test_pcp_manager_skips_hidden_restore_before_last_pp_rank() -> None:
         patch.object(PCPManager, "restore_hidden_states") as parent_restore,
     ):
         restored_hidden_states = manager.restore_hidden_states(hidden_states)
-        manager.restore_hidden_state_buffer(hidden_states)
 
     assert restored_hidden_states is hidden_states
     parent_restore.assert_not_called()
@@ -1076,52 +1121,6 @@ def test_main_pcp_capture_block_tables_keep_runtime_storage() -> None:
 def test_mrv2_runner_registers_ascend_pcp_manager() -> None:
     runner = NPUModelRunner.__new__(NPUModelRunner)
     assert runner.pcp_manager_cls is AscendPCPManager
-
-
-@pytest.mark.parametrize("is_last_pp_rank", [False, True])
-def test_sample_tokens_uses_global_batch_only_on_non_last_pp_rank(
-    is_last_pp_rank: bool,
-) -> None:
-    runner = NPUModelRunner.__new__(NPUModelRunner)
-    manager = AscendPCPManager.__new__(AscendPCPManager)
-    local_batch = _make_local_pcp_batch()
-    global_batch = _make_global_pcp_batch()
-    manager._global_batch = global_batch
-    runner.pcp_manager = manager
-    runner.is_last_pp_rank = is_last_pp_rank
-    runner.speculator = None
-    # Dump contract from the production initializer; helpers no-op on None.
-    runner.debugger = None
-    runner._debugger_started = False
-    runner.prompt_logprobs_worker = None
-    # vLLM main added these ExecuteModelState fields.
-    state_kwargs: dict = {}
-    state_kwargs["dp_sync"] = None
-    state_kwargs["cudagraph_stats"] = None
-    runner.execute_model_state = vllm_model_runner.ExecuteModelState(
-        input_batch=local_batch,
-        attn_metadata=None,
-        slot_mappings_by_layer=None,
-        hidden_states=None,
-        aux_hidden_states=None,
-        finished_req_ids=set(),
-        ec_connector_output=None,
-        **state_kwargs,
-    )
-    grammar_output = object()
-    expected_output = object()
-
-    with patch.object(
-        vllm_model_runner.GPUModelRunner,
-        "sample_tokens",
-        return_value=expected_output,
-    ) as parent_sample_tokens:
-        actual_output = runner.sample_tokens(grammar_output)
-
-    expected_batch = local_batch if is_last_pp_rank else global_batch
-    assert runner.execute_model_state.input_batch is expected_batch
-    assert actual_output is expected_output
-    parent_sample_tokens.assert_called_once_with(grammar_output)
 
 
 def test_partition_batch_clears_padded_dcp_local_seq_lens() -> None:

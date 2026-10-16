@@ -299,7 +299,7 @@ def _make_speculator(max_num_reqs=8, num_speculative_steps=1):
     spec = object.__new__(_ConcreteSpeculator)
     spec.max_num_reqs = max_num_reqs
     spec.num_speculative_steps = num_speculative_steps
-    spec.replicated_pcp = False
+    spec.pcp_manager = None
     spec.model = MagicMock()
     spec.use_local_argmax_reduction = False
     spec.enable_adaptive_verification = False  # parent __init__ fields

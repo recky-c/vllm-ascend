@@ -149,7 +149,7 @@ def test_index_fill_mode_can_reenter_native_device_adaptor(monkeypatch):
 def test_propose_adaptive_draft_negotiates_its_own_dp_shape(monkeypatch, adaptive, is_profile, dummy_run):
     spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
     spec.use_dcp = False
-    spec.replicated_pcp = False
+    spec.pcp_manager = None
     spec.input_buffers = SimpleNamespace(positions=torch.arange(20))
     spec.vllm_config = SimpleNamespace(parallel_config=object())
     spec.enable_adaptive_verification = adaptive
@@ -203,6 +203,7 @@ def test_adaptive_idle_dp_restores_request_count_after_target_forward(
     monkeypatch, adaptive, dummy, profile, context_len, scheduled_reqs, has_state, expected_reqs
 ):
     runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.pcp_manager = None
     runner.debugger = None
     runner.ascend_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=False))

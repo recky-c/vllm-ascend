@@ -32,7 +32,10 @@ def _make_config(
         use_step3p5_mtp=MagicMock(return_value=use_step3p5_mtp),
         draft_model_config=SimpleNamespace(architectures=architectures or []),
     )
-    return SimpleNamespace(speculative_config=speculative_config)
+    return SimpleNamespace(
+        speculative_config=speculative_config,
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+    )
 
 
 def _mock_speculator_module(monkeypatch, module_name, class_name):
