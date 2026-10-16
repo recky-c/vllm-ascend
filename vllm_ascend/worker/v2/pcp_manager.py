@@ -19,11 +19,12 @@
 
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed import get_pcp_group, get_pp_group
+from vllm.distributed import get_pp_group
 
 # vLLM main (#56888) replaced buffer_utils.async_copy_to_gpu with
 # torch_utils.async_tensor_h2d (gaining out=/device=None support).
@@ -34,11 +35,15 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.model_runner import ExecuteModelState
 
 
 @dataclass(frozen=True)
@@ -69,9 +74,11 @@ class AscendPCPManager(PCPManager):
     _global_batch_slot_mappings: torch.Tensor | None
     _gathered_kv_slot_mappings: torch.Tensor | None
     _pad_slot_id: torch.Tensor
-    _sampling_hidden_restored: bool = False
+    # Target outputs already restored by to_global_view this step.
+    _restored_target_outputs: tuple[torch.Tensor, list[torch.Tensor] | None] | None = None
     # The runner's global input buffers, which back global graph metadata.
     global_input_buffers: AscendInputBuffers | None = None
+    _target_attn_group_ids: frozenset[int] = frozenset()
 
     def __init__(
         self,
@@ -125,14 +132,7 @@ class AscendPCPManager(PCPManager):
             # the scheduled tokens that upstream assigns to rank segments.
             self._hidden_restore_idx_buffer = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
 
-        # Whether the runner already restored the target hidden states to the
-        # global PCP layout for the current sampling step (replicated PCP
-        # draft). A second all-gather in restore_for_sampling would reorder
-        # them, so the sampling path consumes this flag instead of inferring
-        # the layout from the tensor length, which is ambiguous under
-        # piecewise/FULL graphs where each rank pads its local batch to the
-        # same global padded length.
-        self._sampling_hidden_restored = False
+        self._restored_target_outputs = None
 
     @property
     def is_decode_sharded(self) -> bool:
@@ -186,27 +186,26 @@ class AscendPCPManager(PCPManager):
                 if chunk_len > 0:
                     yield req_idx, chunk_offset, chunk_len
 
-    @staticmethod
-    def broadcast_replicated_hidden_states(
-        last_hidden_states: torch.Tensor,
-        hidden_states: torch.Tensor,
-        num_tokens: int,
-        replicated_pcp: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Broadcast actual draft hidden states only when target PCP is replicated."""
-        if not replicated_pcp:
-            return last_hidden_states, hidden_states
+    def bind_runner(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        global_input_buffers: AscendInputBuffers,
+        target_attn_groups: list[list[AttentionGroup]],
+    ) -> None:
+        """Bind the runner state Ascend metadata needs after KV cache init."""
+        self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
+        self.global_input_buffers = global_input_buffers
+        self._target_attn_group_ids = frozenset(id(group) for groups in target_attn_groups for group in groups)
 
-        # Draft tokens are replicated: broadcast PCP rank 0 directly,
-        # matching target decode's gather-then-select behavior.
-        pcp_group = get_pcp_group()
-        shared_hidden_states = hidden_states is last_hidden_states
-        last_hidden_states = pcp_group.broadcast(last_hidden_states[:num_tokens].contiguous(), src=0)
-        if shared_hidden_states:
-            hidden_states = last_hidden_states
-        else:
-            hidden_states = pcp_group.broadcast(hidden_states[:num_tokens].contiguous(), src=0)
-        return last_hidden_states, hidden_states
+    def serves_attn_groups(self, attn_groups: list[list[AttentionGroup]]) -> bool:
+        """Whether these groups are target layers, which run PCP-sharded.
+
+        Membership is per group, so filtered views of the target groups still
+        match while the replicated draft's own groups never do.
+        """
+        return any(id(group) in self._target_attn_group_ids for groups in attn_groups for group in groups)
 
     @property
     def global_batch(self) -> AscendInputBatch:
@@ -514,7 +513,7 @@ class AscendPCPManager(PCPManager):
         The draft chooses its own execution padding after restoration.
         """
         return (
-            getattr(getattr(self, "vllm_config", None), "speculative_config", None) is not None
+            self.vllm_config.speculative_config is not None
             and self.is_decode_sharded
             and self._global_batch is not None
             and not self._global_batch.is_dummy
@@ -536,14 +535,18 @@ class AscendPCPManager(PCPManager):
         hidden_states: torch.Tensor,
         aux_hidden_states: list[torch.Tensor] | None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None, InputBatch]:
-        """Return the global batch and, when already global, skip re-gathering.
+        """Return the global batch, reusing outputs restored by to_global_view.
 
         vLLM main (#57980) threads aux_hidden_states through this hook and
         returns them alongside the global batch.
         """
         assert self._global_batch is not None
-        if self._sampling_hidden_restored:
-            self._sampling_hidden_restored = False
+        restored_target_outputs = self._restored_target_outputs
+        self._restored_target_outputs = None
+        if restored_target_outputs is not None and hidden_states is restored_target_outputs[0]:
+            # to_global_view already gathered this step's outputs; a second
+            # all-gather would reorder the global rows.
+            aux_hidden_states = restored_target_outputs[1]
             global_batch = self._global_batch
         else:
             hidden_states, aux_hidden_states, global_batch = super().restore_for_sampling(
@@ -557,11 +560,37 @@ class AscendPCPManager(PCPManager):
                 aux_hidden_states = [states[:num_tokens] for states in aux_hidden_states]
         return hidden_states, aux_hidden_states, global_batch
 
-    def restore_hidden_state_buffer(self, hidden_states: torch.Tensor) -> None:
-        """Restore a model-owned rank-local buffer to the global PCP layout."""
-        if not self.is_last_pp_rank:
-            return
+    def to_global_view(
+        self,
+        state: "ExecuteModelState",
+        model_hidden_buffer: torch.Tensor | None = None,
+    ) -> "ExecuteModelState":
+        """Single PCP exit after the target forward; nothing downstream is sharded.
 
+        - ``dp_sync`` describes the PCP-local target shape and is only consumed
+          by the draft, which runs replicated and synchronizes its own shape.
+        - On a real step a non-last PP stage gets the global batch, and the
+          last PP stage restores hidden, aux hidden and ``model_hidden_buffer`` (a model-owned draft
+          input such as DeepSeek V4's pre-hc_head residual) once.
+          restore_for_sampling reuses that result instead of gathering again.
+        """
+        state = state._replace(dp_sync=None)
+        if state.input_batch.is_dummy:
+            return state
+        if not self.is_last_pp_rank:
+            return state._replace(input_batch=self.global_batch)
+        if model_hidden_buffer is not None:
+            # In place: graph replay reads this buffer at a fixed address.
+            self._restore_hidden_state_buffer(model_hidden_buffer)
+        hidden_states = self.restore_hidden_states(state.hidden_states)
+        aux_hidden_states = state.aux_hidden_states
+        if aux_hidden_states is not None:
+            aux_hidden_states = [self.restore_hidden_states(states) for states in aux_hidden_states]
+        self._restored_target_outputs = (hidden_states, aux_hidden_states)
+        return state._replace(hidden_states=hidden_states, aux_hidden_states=aux_hidden_states)
+
+    def _restore_hidden_state_buffer(self, hidden_states: torch.Tensor) -> None:
+        """Restore a model-owned rank-local buffer to the global PCP layout."""
         assert self._padded_gather_idx is not None
         local_num_tokens_padded = self._padded_gather_idx.shape[0] // self.pcp_world_size
         restored_hidden_states = self.restore_hidden_states(hidden_states[:local_num_tokens_padded])

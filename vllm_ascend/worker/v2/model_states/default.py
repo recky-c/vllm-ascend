@@ -222,13 +222,18 @@ class AscendModelState(DefaultModelState):
 
         num_actual_reqs = input_batch.num_reqs
         num_actual_tokens = input_batch.num_tokens
+        # PCP context belongs to the target's layers; the replicated draft
+        # builds plain metadata on the global batch.
+        pcp_manager = (
+            self.pcp_manager
+            if self.pcp_manager is not None and self.pcp_manager.serves_attn_groups(attn_groups)
+            else None
+        )
         if self.kvpp_runtime is not None and self.kvpp_runtime.scheduler is not None:
             # PCP-local offsets include earlier chunks of this same forward.
             # Use prior-forward history shared by every PCP x TP group member.
             history_batch = (
-                self.pcp_manager.global_batch
-                if self.pcp_manager is not None and not self.kvpp_is_dummy_run
-                else input_batch
+                pcp_manager.global_batch if pcp_manager is not None and not self.kvpp_is_dummy_run else input_batch
             )
             self.kvpp_runtime.prepare_forward(
                 not self.kvpp_is_dummy_run
@@ -285,8 +290,8 @@ class AscendModelState(DefaultModelState):
         is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
         pcp_context = (
-            self.pcp_manager.build_attention_context(input_batch, block_tables, slot_mappings)
-            if self.pcp_manager is not None
+            pcp_manager.build_attention_context(input_batch, block_tables, slot_mappings)
+            if pcp_manager is not None
             else None
         )
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.

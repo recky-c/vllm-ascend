@@ -15,7 +15,6 @@ from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
-from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
     AscendAutoRegressiveSpeculator,
     gather,
@@ -108,9 +107,9 @@ def test_draft_prefill_attn_groups():
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
     speculator.attn_groups = object()
     speculator.target_attn_groups = object()
-    speculator.replicated_pcp = True
+    speculator.pcp_manager = MagicMock()
     assert speculator.draft_prefill_attn_groups is speculator.attn_groups
-    speculator.replicated_pcp = False
+    speculator.pcp_manager = None
     assert speculator.draft_prefill_attn_groups is speculator.target_attn_groups
 
 
@@ -170,27 +169,6 @@ def test_init_cudagraph_manager_keeps_graph_mode():
     parent_init.assert_called_once_with(CUDAGraphMode.FULL)
 
 
-def test_run_model_broadcasts_replicated_hidden_states():
-    """Test broadcasting hidden states for replicated PCP."""
-    speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
-    speculator.replicated_pcp = True
-    last_hidden_states = torch.tensor([1])
-    hidden_states = torch.tensor([2])
-    expected = (torch.tensor([3]), torch.tensor([4]))
-    with (
-        patch.object(
-            AutoRegressiveSpeculator,
-            "_run_model",
-            return_value=(last_hidden_states, hidden_states),
-        ) as parent_run_model,
-        patch.object(AscendPCPManager, "broadcast_replicated_hidden_states", return_value=expected) as broadcast,
-    ):
-        result = speculator._run_model(3, None, None, None)
-    parent_run_model.assert_called_once_with(3, None, None, None, CUDAGraphMode.NONE, None)
-    broadcast.assert_called_once_with(last_hidden_states, hidden_states, 3, replicated_pcp=True)
-    assert result is expected
-
-
 def test_generate_draft_updates_attn_metadata():
     """Test updating attention metadata during draft generation."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
@@ -240,7 +218,7 @@ def test_prefill_filters_target_only_metadata():
     attn_metadata = {"draft": draft_metadata, "target": target_metadata}
     slot_mappings = {"draft": torch.tensor([1])}
     speculator.draft_attn_layer_names = {"draft"}
-    speculator._prepare_replicated_prefill_attn = MagicMock(return_value=(attn_metadata, slot_mappings))
+    speculator._prepare_global_prefill_attn = MagicMock(return_value=(attn_metadata, slot_mappings))
     with patch.object(AutoRegressiveSpeculator, "_prefill") as parent_prefill:
         speculator._prefill(2, 4, attn_metadata, slot_mappings, None)
     parent_prefill.assert_called_once_with(
@@ -393,10 +371,10 @@ def test_build_draft_attn_metadatas_prefill():
     speculator.model_state = SimpleNamespace(attn_metadata={"draft": draft_metadata, "target": object()})
     speculator.draft_attn_layer_names = {"draft"}
     prepared = {"draft": object()}
-    speculator._prepare_replicated_prefill_attn = MagicMock(return_value=(prepared, None))
+    speculator._prepare_global_prefill_attn = MagicMock(return_value=(prepared, None))
     result = speculator.build_draft_attn_metadatas(4, 8, True)
     assert result == [prepared]
-    filtered = speculator._prepare_replicated_prefill_attn.call_args.args[0]
+    filtered = speculator._prepare_global_prefill_attn.call_args.args[0]
     assert filtered == {"draft": draft_metadata}
 
 
@@ -551,14 +529,10 @@ def test_capture_single_step_only_captures_prefill():
     speculator.target_input_buffers = object()
     speculator.block_tables = object()
     speculator.target_attn_groups = object()
-    speculator.replicated_pcp = False
+    speculator.pcp_manager = None
     speculator.kv_cache_config = object()
     speculator.num_speculative_steps = 1
-    with patch(
-        "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.disable_target_pcp_for_replicated_draft",
-        return_value=nullcontext(),
-    ):
-        speculator.capture()
+    speculator.capture()
     speculator.last_token_indices.zero_.assert_called_once_with()
     speculator.prefill_cudagraph_manager.init_breakable_cg_runner.assert_called_once_with(speculator.model)
     speculator.prefill_cudagraph_manager.capture.assert_called_once()
@@ -578,14 +552,10 @@ def test_capture_multi_step_captures_decode():
     speculator.block_tables = object()
     speculator.target_attn_groups = object()
     speculator.attn_groups = object()
-    speculator.replicated_pcp = False
+    speculator.pcp_manager = None
     speculator.kv_cache_config = object()
     speculator.num_speculative_steps = 3
     with (
-        patch(
-            "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.disable_target_pcp_for_replicated_draft",
-            return_value=nullcontext(),
-        ),
         patch(
             "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.build_attn_metadata_wrapper",
             return_value=nullcontext(),
@@ -596,20 +566,15 @@ def test_capture_multi_step_captures_decode():
     speculator.decode_cudagraph_manager.capture.assert_called_once()
 
 
-def test_propose_replicated_pcp_disables_dp_sync():
-    """Test replicated PCP disables DP synchronization during propose."""
+def test_propose_forwards_dp_sync():
+    """The draft DP sync choice belongs to the runner's PCP handoff."""
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
-    speculator.replicated_pcp = True
-    speculator.pcp_manager = None
+    speculator.pcp_manager = MagicMock()
     input_batch = object()
     args = [object() for _ in range(10)]
     dp_sync = object()
     expected = object()
     with (
-        patch(
-            "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.disable_target_pcp_for_replicated_draft",
-            return_value=nullcontext(),
-        ),
         patch(
             "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.build_attn_metadata_wrapper",
             return_value=nullcontext(),
@@ -622,7 +587,7 @@ def test_propose_replicated_pcp_disables_dp_sync():
     ):
         result = speculator.propose(input_batch, *args, dp_sync=dp_sync)
     assert speculator.input_batch is input_batch
-    assert parent_propose.call_args.args[11] is None
+    assert parent_propose.call_args.args[11] is dp_sync
     assert result is expected
 
 
@@ -630,8 +595,7 @@ def test_propose_consumes_restored_global_inputs():
     # PCP restoration owns the real token extent and request boundaries.
     # Draft consumes that view without copying or trimming the input buffers.
     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
-    speculator.replicated_pcp = True
-    speculator.pcp_manager = SimpleNamespace(is_decode_sharded=True)
+    speculator.pcp_manager = MagicMock()
     input_batch = SimpleNamespace(
         num_reqs=3,
         num_tokens=12,
@@ -646,10 +610,6 @@ def test_propose_consumes_restored_global_inputs():
     auxiliary = [torch.randn(12, 4)]
     args = [object(), object(), hidden, auxiliary, *[object() for _ in range(6)]]
     with (
-        patch(
-            "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.disable_target_pcp_for_replicated_draft",
-            return_value=nullcontext(),
-        ),
         patch(
             "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.build_attn_metadata_wrapper",
             return_value=nullcontext(),
