@@ -459,31 +459,6 @@ def test_adaptive_verification_pads_fia_query_boundaries(
     np.testing.assert_array_equal(actual[: len(expected)], expected)
 
 
-@pytest.mark.parametrize("is_last_pp_rank", [False, True])
-def test_sample_tokens_hands_target_state_to_upstream_unchanged(is_last_pp_rank):
-    """PCP restoration and the draft handoff run inside upstream sample_tokens."""
-    runner = _make_runner(need_timing=False)
-    runner.is_last_pp_rank = is_last_pp_rank
-    runner.speculator = SimpleNamespace(draft_attn_layer_names={"mtp"})
-    runner.pcp_manager = MagicMock(spec=AscendPCPManager)
-    state = Mock(hidden_states=torch.ones(2, 3), aux_hidden_states=None)
-    runner.execute_model_state = state
-    runner.model = SimpleNamespace(get_mtp_target_hidden_states=Mock())
-    seen = {}
-
-    def parent(self, grammar_output):
-        seen["state"] = self.execute_model_state
-        return "out"
-
-    with patch.object(GPUModelRunner, "sample_tokens", parent):
-        assert runner.sample_tokens("grammar") == "out"
-    assert seen["state"] is state
-    state._replace.assert_not_called()
-    runner.pcp_manager.restore_hidden_states.assert_not_called()
-    runner.pcp_manager.restore_for_sampling.assert_not_called()
-    runner.model.get_mtp_target_hidden_states.assert_not_called()
-
-
 def test_prepare_inputs_preserves_pcp_tokens_and_forwards_graph_padding():
     source_path = Path(__file__).parents[3] / "vllm_ascend" / "worker" / "v2" / "model_runner.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))

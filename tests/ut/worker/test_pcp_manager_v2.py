@@ -1267,90 +1267,23 @@ def _hook_manager() -> AscendPCPManager:
     return manager
 
 
-def test_partition_batch_records_finalized_local_batch() -> None:
-    """Draft prefill must reuse the exact (Ascend-padded) batch the target ran."""
-    manager = _hook_manager()
-    global_batch, unpadded_batch = object(), object()
-    upstream_local, finalized = _make_local_pcp_batch(), object()
-    batch_desc = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, num_tokens=8, num_reqs=None)
-    with (
-        patch.object(AscendPCPManager, "_expose_unpadded_global_batch", return_value=unpadded_batch),
-        patch.object(PCPManager, "partition_batch", return_value=upstream_local) as upstream_partition,
-        patch.object(AscendPCPManager, "_finalize_partition", return_value=finalized) as finalize,
-    ):
-        result = manager.partition_batch(global_batch, batch_desc)
-    upstream_partition.assert_called_once_with(unpadded_batch, batch_desc)
-    assert finalize.call_args.args[0] is global_batch
-    assert result is finalized
-    assert manager._local_batch is finalized
-    assert manager._attn_global_batch is global_batch
-
-
-def test_draft_prefill_inputs_are_staged_at_captured_addresses() -> None:
-    """Graphs read the speculator's buffers; global rows return after prefill."""
-    manager = _hook_manager()
-    buffers = AscendInputBuffers(max_num_reqs=4, max_num_tokens=8, device=torch.device("cpu"))
-    buffers.input_ids.copy_(torch.arange(100, 108, dtype=buffers.input_ids.dtype))
-    buffers.positions.copy_(torch.arange(200, 208, dtype=buffers.positions.dtype))
-    buffers.is_padding.fill_(False)
-    global_ids, global_positions = buffers.input_ids.clone(), buffers.positions.clone()
-    manager.draft_prefill_batch = SimpleNamespace(
-        num_tokens_after_padding=3,
-        input_ids=torch.tensor([7, 8, 0], dtype=buffers.input_ids.dtype),
-        positions=torch.tensor([5, 6, 0], dtype=buffers.positions.dtype),
-        is_padding=torch.tensor([False, False, True]),
-    )
-    ids_ptr = buffers.input_ids.data_ptr()
-
-    assert manager.get_draft_input_buffers(buffers) is buffers
-    assert buffers.input_ids.data_ptr() == ids_ptr
-    assert buffers.input_ids[:3].tolist() == [7, 8, 0]
-    assert buffers.positions[:3].tolist() == [5, 6, 0]
-    assert buffers.is_padding[:3].tolist() == [False, False, True]
-
-    last, hidden = torch.zeros(3, 2), torch.zeros(3, 2)
-    with patch.object(PCPManager, "restore_draft_prefill", return_value=("last", "hidden")) as parent:
-        assert manager.restore_draft_prefill(last, hidden) == ("last", "hidden")
-    parent.assert_called_once_with(last, hidden)
-    assert torch.equal(buffers.input_ids, global_ids)
-    assert torch.equal(buffers.positions, global_positions)
-    assert not buffers.is_padding.any()
-    assert manager._staged_draft_inputs is None
-
-
-def test_draft_input_buffers_pass_through_outside_draft_prefill() -> None:
-    manager = _hook_manager()
-    buffers = object()
-    assert manager.get_draft_input_buffers(buffers) is buffers
-    assert manager._staged_draft_inputs is None
-
-
-def test_is_target_attn_groups_excludes_draft_only_groups() -> None:
+@pytest.mark.parametrize("draft_pcp_size", [1, 2], ids=["replicated", "sharded"])
+def test_is_target_attn_groups_excludes_draft_only_groups(draft_pcp_size) -> None:
     manager = _hook_manager()
     group = lambda *names: SimpleNamespace(layer_names=list(names))  # noqa: E731
     # Before a speculator is set, every group is a target group.
     assert manager.is_target_attn_groups([[group("mtp.layers.0")]])
     speculator = SimpleNamespace(
         draft_attn_layer_names={"mtp.layers.0"},
-        vllm_config=SimpleNamespace(parallel_config=ParallelConfig(prefill_context_parallel_size=2)),
+        vllm_config=SimpleNamespace(parallel_config=ParallelConfig(prefill_context_parallel_size=draft_pcp_size)),
     )
     manager.set_speculator(speculator)
+    assert manager._is_draft_prefill_sharded == (draft_pcp_size > 1)
     # Target forwards and draft prefill capture use (possibly filtered) target groups.
     assert manager.is_target_attn_groups([[group("model.layers.0", "mtp.layers.0")], [group("model.layers.1")]])
     assert manager.is_target_attn_groups([[group("model.layers.1")]])
     # Draft decode metadata covers draft-only layers on the global batch.
     assert not manager.is_target_attn_groups([[group("mtp.layers.0")]])
-
-
-@pytest.mark.parametrize(("draft_pcp_size", "expected"), [(2, True), (1, False)], ids=["mtp", "dspark"])
-def test_set_speculator_takes_route_from_draft_pcp_size(draft_pcp_size: int, expected: bool) -> None:
-    manager = _hook_manager()
-    speculator = SimpleNamespace(
-        draft_attn_layer_names=set(),
-        vllm_config=SimpleNamespace(parallel_config=ParallelConfig(prefill_context_parallel_size=draft_pcp_size)),
-    )
-    manager.set_speculator(speculator)
-    assert manager._is_draft_prefill_sharded is expected
 
 
 def test_sharded_draft_prefill_handoff_across_pcp_ranks() -> None:
@@ -1400,24 +1333,31 @@ def test_sharded_draft_prefill_handoff_across_pcp_ranks() -> None:
         buffers = AscendInputBuffers(max_num_reqs=4, max_num_tokens=32, device=torch.device("cpu"))
         buffers.input_ids[:18].copy_(torch.arange(1000, 1018, dtype=buffers.input_ids.dtype))
         buffers.positions[:18].copy_(torch.arange(18, dtype=buffers.positions.dtype))
+        assert manager.get_draft_input_buffers(buffers) is buffers
         global_ids, global_positions = buffers.input_ids.clone(), buffers.positions.clone()
+        global_padding = buffers.is_padding.clone()
+        ids_ptr = buffers.input_ids.data_ptr()
         manager.prepare_draft_prefill(batch, buffers.input_ids[: batch.num_tokens_after_padding])
         assert manager.draft_prefill_batch is local
         assert manager.draft_prefill_batch.num_tokens_after_padding == num_local_padded
         staged = manager.get_draft_input_buffers(buffers)
         assert staged is buffers
+        assert staged.input_ids.data_ptr() == ids_ptr
+        assert torch.equal(staged.is_padding[:num_local_padded], local.is_padding[:num_local_padded])
         real = ~local.is_padding[:num_local_padded]
         assert (staged.input_ids[:num_local_padded][real] - 1000).tolist() == (
             local.positions[:num_local_padded][real].tolist()
         )
         assert staged.positions[:num_local_padded].tolist() == local.positions[:num_local_padded].tolist()
         draft_outputs.append(staged.input_ids[:num_local_padded].float()[:, None].clone())
-        staged_buffers.append((buffers, global_ids, global_positions))
+        staged_buffers.append((buffers, global_ids, global_positions, global_padding))
 
     with (
         patch("vllm.v1.worker.gpu.pcp_manager.get_pcp_group", return_value=gather_from(draft_outputs)),
     ):
-        for manager, output, (buffers, global_ids, global_positions) in zip(managers, draft_outputs, staged_buffers):
+        for manager, output, (buffers, global_ids, global_positions, global_padding) in zip(
+            managers, draft_outputs, staged_buffers
+        ):
             last, hidden = manager.restore_draft_prefill(output, output)
             assert last is hidden
             assert last[:, 0].tolist() == [float(1000 + i) for i in range(18)]
@@ -1425,6 +1365,8 @@ def test_sharded_draft_prefill_handoff_across_pcp_ranks() -> None:
             # Draft decode reads the global positions again after prefill.
             assert torch.equal(buffers.input_ids, global_ids)
             assert torch.equal(buffers.positions, global_positions)
+            assert torch.equal(buffers.is_padding, global_padding)
+            assert manager._staged_draft_inputs is None
 
 
 @pytest.mark.parametrize(

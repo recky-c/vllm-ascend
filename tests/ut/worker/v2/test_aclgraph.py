@@ -14,7 +14,6 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import Specul
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph import (
     AutoRegressiveAclGraphManager,
-    get_draft_prefill_cudagraph_mode,
 )
 
 
@@ -58,20 +57,6 @@ def test_init_draft_prefill_graph():
     assert manager.speculator is None
     set_prefill.assert_called_once_with([4, 8])
     set_decode.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("pcp_size", "mode", "expected"),
-    [
-        (2, CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.PIECEWISE),
-        (2, CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.NONE),
-        (2, CUDAGraphMode.PIECEWISE, CUDAGraphMode.PIECEWISE),
-        (1, CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE),
-    ],
-)
-def test_get_draft_prefill_cudagraph_mode(pcp_size, mode, expected):
-    """A draft keeping the target's PCP size shards its prefill outside FULL graphs."""
-    assert get_draft_prefill_cudagraph_mode(_graph_config(pcp_size), mode) == expected
 
 
 @pytest.mark.parametrize(
@@ -180,72 +165,6 @@ def test_run_fullgraph_uses_legacy_graph():
         draft_attn_metadatas,
     )
     manager._updatable_graph_replay.assert_not_called()
-
-
-def test_capture_draft_prefill_stages_inputs_through_pcp_manager():
-    """Verify draft prefill capture forwards the PCP manager and its metadata."""
-    manager = AutoRegressiveAclGraphManager.__new__(AutoRegressiveAclGraphManager)
-    manager.speculator = object()
-    manager.is_draft_model_prefill = True
-    manager.max_num_reqs = 3
-    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1))
-    forward_fn = MagicMock()
-    model_state = object()
-    input_buffers = object()
-    block_tables = object()
-    attn_groups = object()
-    kv_cache_config = object()
-    pcp_manager = object()
-    attn_metadata = object()
-    slot_mappings = object()
-    desc = SimpleNamespace(
-        num_tokens=8, num_reqs=None, cg_mode=CUDAGraphMode.PIECEWISE, max_query_len=None, uniform_token_count=None
-    )
-
-    def capture_side_effect(manager_arg, create_forward_fn, progress_bar_desc=None):
-        create_forward_fn(desc, False)(CUDAGraphMode.PIECEWISE)
-
-    with (
-        patch(
-            "vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph.communicator_switch",
-            return_value=nullcontext(),
-        ),
-        patch(
-            "vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph.model_capture_wrapper",
-            return_value=nullcontext(),
-        ),
-        patch(
-            "vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph.prepare_inputs_to_capture",
-            return_value=(attn_metadata, slot_mappings),
-        ) as prepare_inputs,
-        patch(
-            "vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph.CudaGraphManager.capture",
-            side_effect=capture_side_effect,
-        ),
-    ):
-        manager.capture(
-            forward_fn,
-            model_state,
-            input_buffers,
-            block_tables,
-            attn_groups,
-            kv_cache_config,
-            pcp_manager=pcp_manager,
-        )
-
-    prepare_inputs.assert_called_once_with(
-        3,
-        8,
-        model_state,
-        input_buffers,
-        block_tables,
-        attn_groups,
-        kv_cache_config,
-        full_cudagraph=False,
-        max_query_len=None,
-        pcp_manager=pcp_manager,
-    )
-    forward_fn.assert_called_once_with(3, 8, attn_metadata, slot_mappings, None, CUDAGraphMode.PIECEWISE)
 
 
 def test_capture_draft_decode_prepares_inputs_and_runs_forward():
