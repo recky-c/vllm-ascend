@@ -102,6 +102,21 @@ def test_merge_preserves_input_dtype(dtype, defer):
     assert merge.call_args.kwargs == {"defer_combine": defer}
 
 
+@pytest.mark.parametrize("with_pcp_context", [True, False], ids=["target", "replicated-draft"])
+def test_context_block_table_follows_pcp_metadata(with_pcp_context):
+    from vllm_ascend.attention.context_parallel.mla_cp import DCPChunkedContextMetadata
+
+    impl = AscendMlaDCPImpl.__new__(AscendMlaDCPImpl)
+    impl.use_pcp = True
+    local_table, global_table = torch.zeros(1, 1), torch.ones(1, 1)
+    chunked_context = DCPChunkedContextMetadata.__new__(DCPChunkedContextMetadata)
+    # Only PCP-context metadata carries the global request table.
+    chunked_context.pcp_global_block_table = global_table if with_pcp_context else None
+    metadata = SimpleNamespace(prefill=SimpleNamespace(block_table=local_table, chunked_context=chunked_context))
+    expected = global_table if with_pcp_context else local_table
+    assert impl.get_context_block_table(metadata) is expected
+
+
 @pytest.mark.parametrize("dcp_enabled", [False, True])
 @pytest.mark.parametrize("with_pcp_context", [False, True])
 def test_capture_forwards_pcp_context_and_preserves_dcp_dummy_metadata(dcp_enabled, with_pcp_context):
