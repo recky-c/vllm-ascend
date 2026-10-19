@@ -1189,7 +1189,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     runner.max_num_reqs = runner.vllm_config.scheduler_config.max_num_seqs
     runner.pcp_manager = MagicMock(spec=AscendPCPManager)
     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
-    runner.speculator = SimpleNamespace()
+    runner.speculator = None
     runner.model_config = SimpleNamespace(enable_return_routed_experts=True, architecture=architecture)
     runner.init_routed_experts_capturer = MagicMock()
     kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])

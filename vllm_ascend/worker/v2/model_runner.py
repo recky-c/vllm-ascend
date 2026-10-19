@@ -50,7 +50,6 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -396,7 +395,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.set_runner_state(self.vllm_config, kv_cache_config, self.input_buffers)
-                if isinstance(self.speculator, DraftModelSpeculator):
+                # init_speculator only returns upstream DraftModelSpeculators.
+                if self.speculator is not None:
                     self.pcp_manager.set_speculator(self.speculator)
                 self.model_state.pcp_manager = self.pcp_manager
         bind_dspark_context_receiver(

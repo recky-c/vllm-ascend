@@ -42,6 +42,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_dcp,
     enabling_mlapo,
+    get_pcp_layout_flags,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
     split_decodes_and_prefills,
@@ -492,7 +493,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     ) -> AscendMLAMetadata:
         self._pcp_context = pcp_context
         self._pcp_cache_group_idx = pcp_cache_group_idx
-        uses_pcp_kv_layout = pcp_context is not None
+        uses_pcp_kv_layout, is_pcp_decode_sharded = get_pcp_layout_flags(pcp_context, self.is_pcp_decode_sharded)
         expanded_slot_mapping = common_attn_metadata.slot_mapping if uses_pcp_kv_layout else None
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
@@ -558,7 +559,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             seq_lens=self.seq_lens,
             seq_lens_cpu=self.seq_lens,
             uses_pcp_kv_layout=uses_pcp_kv_layout,
-            is_pcp_decode_sharded=uses_pcp_kv_layout and self.is_pcp_decode_sharded,
+            is_pcp_decode_sharded=is_pcp_decode_sharded,
         )
         if uses_pcp_kv_layout:
             assert expanded_slot_mapping is not None

@@ -825,7 +825,7 @@ def test_sampling_restore_exposes_unpadded_global_view(is_draft_prefill_sharded:
         return hidden_states, restored_aux, batch
 
     with (
-        patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=True),
+        patch.object(AscendPCPManager, "_should_expose_unpadded_global_batch", return_value=True),
         patch.object(PCPManager, "restore_for_sampling", autospec=True, side_effect=parent_restore) as parent,
     ):
         # vLLM #57980 threads aux_hidden_states through this hook.

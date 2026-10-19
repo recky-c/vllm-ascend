@@ -502,11 +502,11 @@ class AscendPCPManager(PCPManager):
             return restored_hidden_states
 
         restored_hidden_states[num_tokens:].zero_()
-        if self._restore_unpadded_global_batch():
+        if self._should_expose_unpadded_global_batch():
             restored_hidden_states = restored_hidden_states[:num_tokens]
         return restored_hidden_states
 
-    def _restore_unpadded_global_batch(self) -> bool:
+    def _should_expose_unpadded_global_batch(self) -> bool:
         """Sampling and replicated drafting consume scheduled global tokens.
 
         Target graph padding stays private to target attention/capture views.
@@ -546,7 +546,7 @@ class AscendPCPManager(PCPManager):
         hidden_states, aux_hidden_states, global_batch = super().restore_for_sampling(
             hidden_states, None if self._is_draft_prefill_sharded else aux_hidden_states
         )
-        if self._restore_unpadded_global_batch():
+        if self._should_expose_unpadded_global_batch():
             global_batch = self._expose_unpadded_global_batch(global_batch)
             num_tokens = global_batch.num_tokens
             hidden_states = hidden_states[:num_tokens]
