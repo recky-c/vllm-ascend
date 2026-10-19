@@ -398,6 +398,78 @@ def test_mla_pcp_metadata_keeps_expanded_slot_mapping() -> None:
     assert metadata.attn_state == AscendAttentionState.ChunkedPrefill
 
 
+def test_mla_replicated_draft_metadata_does_not_finalize_pcp_slots() -> None:
+    builder = AscendMLAMetadataBuilder.__new__(AscendMLAMetadataBuilder)
+    builder.pcp_enabled = True
+    builder.pcp_size = 2
+    builder.is_pcp_decode_sharded = True
+    builder.dcp_enabled = False
+    builder.decode_threshold = 4
+    builder.metadata_cls = AscendMLAMetadata
+    builder.model_config = SimpleNamespace(get_head_size=lambda: 64)
+    builder.attn_mask_builder = MagicMock()
+    builder.get_block_table_size = MagicMock(return_value=1)
+    builder.build_decode_metadata = MagicMock(return_value=SimpleNamespace())
+    common = SimpleNamespace(
+        num_reqs=1,
+        num_input_tokens=1,
+        num_actual_tokens=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        slot_mapping=torch.tensor([7]),
+        _seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        graph_pad_size=-1,
+        block_table_tensor=torch.zeros(1, 1, dtype=torch.int32),
+        attn_state=AscendAttentionState.DecodeOnly,
+        causal=True,
+    )
+    with patch("vllm_ascend.attention.mla_v1.split_decodes_and_prefills", return_value=(1, 0, 1, 0)):
+        # Draft-only groups get no PCP context: the step runs replicated.
+        metadata = builder.build(0, common)
+        assert metadata.slot_mapping.tolist() == [7]
+        assert metadata.pcp_cos is None
+        # The same builder must still enforce PCP layout on sharded steps.
+        with pytest.raises(RuntimeError, match="1 % 2 != 0"):
+            builder.build(0, common, pcp_context=object())
+
+
+def test_mla_builder_consumes_pcp_context() -> None:
+    assert AscendMLAMetadataBuilder.consumes_pcp_context
+
+
+def test_mla_replicated_draft_decode_skips_pcp_kv_gather() -> None:
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.pcp_enabled = True
+    impl.is_pcp_decode_sharded = True
+    impl.fused_qkv_a_proj = None
+    impl.kv_a_proj_with_mqa = MagicMock(return_value=(torch.zeros(1, 4), None))
+    impl.layerwise_kv_cache_hook = None
+    impl.exec_kv_prefill = MagicMock(side_effect=AssertionError("replicated decode must not gather KV"))
+    impl.mla_preprocess_decode = MagicMock(return_value="decode")
+    # Replicated draft metadata carries no sharded-decode RoPE.
+    metadata = _make_pcp_metadata(num_actual_tokens=1, num_decode_tokens=1)
+    with patch("vllm_ascend.attention.mla_v1.notify_kv_cache_written"):
+        assert impl._mla_preprocess("draft", torch.zeros(1, 4), (), metadata) == ("decode", None)
+    assert impl.mla_preprocess_decode.call_args.args[-1] is None
+
+
+def test_mla_replicated_draft_decode_writes_local_slots() -> None:
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.pcp_enabled = True
+    impl.is_pcp_decode_sharded = True
+    impl.use_mla_rope = False
+    impl._exec_kv_no_rope = MagicMock(return_value=("k_pe", "k_nope"))
+    metadata = _make_pcp_metadata(num_actual_tokens=2, num_decode_tokens=2)
+    metadata.num_input_tokens = 2
+    metadata.slot_mapping = torch.tensor([5, 7], dtype=torch.int64)
+    kv = torch.zeros(2, 4)
+    with patch("vllm_ascend.attention.mla_v1._gather_prefill_cache_inputs") as gather:
+        impl.exec_kv_prefill(kv, None, None, (), metadata.slot_mapping, attn_metadata=metadata)
+    # An unexpanded slot mapping means the step is replicated: no PCP gather.
+    gather.assert_not_called()
+    impl._exec_kv_no_rope.assert_called_once_with(kv, (), metadata.slot_mapping)
+
+
 def test_mla_pcp_prefill_gathers_padded_cache_inputs() -> None:
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
     impl.is_pcp_decode_sharded = False
@@ -1435,7 +1507,8 @@ class TestAscendMLAMetadataBuilderBuild(TestBase):
                 builder.pcp_size = pcp_size
                 builder.pcp_enabled = pcp_size > 1
                 common_attn_metadata.slot_mapping = torch.arange(3 * pcp_size)
-                metadata = builder.build(0, common_attn_metadata)
+                pcp_context = object() if pcp_size > 1 else None
+                metadata = builder.build(0, common_attn_metadata, pcp_context=pcp_context)
                 expected_decodes = 3 if pcp_size == 1 else 0
                 self.assertEqual(metadata.num_decodes, expected_decodes)
                 self.assertEqual(metadata.num_prefills, 3 - expected_decodes)
@@ -2884,7 +2957,9 @@ class TestAscendMLAImpl(TestBase):
                 self.impl.mla_preprocess_prefill = MagicMock(
                     side_effect=lambda *_args: record_event("prefill_cache", prefill)
                 )
-                metadata = SimpleNamespace(num_actual_tokens=2, num_decodes=decodes, num_prefills=prefills)
+                metadata = SimpleNamespace(
+                    num_actual_tokens=2, num_decodes=decodes, num_prefills=prefills, pcp_cos=None
+                )
                 with (
                     patch.object(mla_v1, "wait_for_kv_layer_from_connector"),
                     patch.object(mla_v1, "notify_kv_cache_written"),
@@ -2949,6 +3024,8 @@ class TestAscendMLAImpl(TestBase):
         attn_metadata.num_actual_tokens = 4
         num_prefill_tokens = 2
         attn_metadata.slot_mapping = torch.arange(4)
+        attn_metadata.pcp_cos = None
+        attn_metadata.prefill.pcp_local_num_input_tokens = None
         attn_metadata.decode.cos = torch.randn(2, 64)
         attn_metadata.decode.sin = torch.randn(2, 64)
         attn_metadata.prefill.cos = torch.randn(2, 64)
@@ -3056,7 +3133,7 @@ class TestAscendMLAImpl(TestBase):
                     num_decode_tokens=num_decode_tokens,
                     num_actual_tokens=num_actual_tokens,
                     slot_mapping=torch.arange(4),
-                    prefill=SimpleNamespace(cos=None, sin=None),
+                    prefill=SimpleNamespace(cos=None, sin=None, pcp_local_num_input_tokens=None),
                 )
                 result = self.impl.mla_preprocess_prefill(q_c, kv_no_split, kv_cache, metadata)
 
