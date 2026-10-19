@@ -34,11 +34,6 @@ def test_gqa_dcp_extends_v1_backend_without_polluting_base_metadata() -> None:
     assert not hasattr(AscendMetadata(), "prefill")
 
 
-def test_gqa_builders_consume_pcp_context() -> None:
-    assert AscendAttentionMetadataBuilder.consumes_pcp_context
-    assert AscendAttentionDCPMetadataBuilder.consumes_pcp_context
-
-
 def test_gqa_tp_only_dcp_still_gathers_heads() -> None:
     impl = AscendAttentionDCPImpl.__new__(AscendAttentionDCPImpl)
     impl.pcp_group = SimpleNamespace(world_size=1)

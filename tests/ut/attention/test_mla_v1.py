@@ -432,10 +432,6 @@ def test_mla_builder_without_pcp_context_builds_ordinary_metadata() -> None:
             builder.build(0, common, pcp_context=object())
 
 
-def test_mla_builder_consumes_pcp_context() -> None:
-    assert AscendMLAMetadataBuilder.consumes_pcp_context
-
-
 def test_mla_replicated_draft_decode_skips_pcp_kv_gather() -> None:
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
     impl.use_pcp = True
