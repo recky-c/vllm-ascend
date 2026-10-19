@@ -247,6 +247,9 @@ class AscendMLAMetadata:
     # sharded-decode PCP KV gather.
     pcp_cos: torch.Tensor | None = None
     pcp_sin: torch.Tensor | None = None
+    # MRV2 draft decode is replicated even when its model was built with PCP.
+    # Legacy runners retain their configuration-based behavior by default.
+    pcp_enabled: bool = True
 
     def __post_init__(self):
         pass
@@ -481,10 +484,12 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         *,
         pcp_context=None,
         pcp_cache_group_idx: int | None = None,
+        pcp_enabled: bool = True,
     ) -> AscendMLAMetadata:
         self._pcp_context = pcp_context
         self._pcp_cache_group_idx = pcp_cache_group_idx
-        expanded_slot_mapping = common_attn_metadata.slot_mapping if self.pcp_enabled else None
+        pcp_enabled = self.pcp_enabled and pcp_enabled
+        expanded_slot_mapping = common_attn_metadata.slot_mapping if pcp_enabled else None
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
@@ -494,7 +499,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
                 treat_short_extends_as_decodes=(
-                    not (self.pcp_enabled or self.dcp_enabled)
+                    not (pcp_enabled or self.dcp_enabled)
                     # Only DCP needs the PD last-token recompute override.
                     # Use the builder's config outside the current-config context.
                     or (self.dcp_enabled and is_pd_decode_recompute_scheduler_enabled(self.vllm_config))
@@ -548,8 +553,9 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             block_tables=self.block_table,
             seq_lens=self.seq_lens,
             seq_lens_cpu=self.seq_lens,
+            pcp_enabled=pcp_enabled,
         )
-        if self.pcp_enabled:
+        if pcp_enabled:
             assert expanded_slot_mapping is not None
             self._finalize_pcp_metadata(metadata, expanded_slot_mapping)
             if self.is_pcp_decode_sharded:
@@ -2315,7 +2321,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata | None = None,
     ):
         pcp_local_range = None
-        if self.pcp_enabled:
+        pcp_enabled = self.pcp_enabled and (attn_metadata is None or attn_metadata.pcp_enabled)
+        if pcp_enabled:
             assert attn_metadata is not None
             # Gather before any RoPE-specific writer. use_mla_rope=False used
             # to return first and store rank-local KV with the expanded slots.
@@ -2362,7 +2369,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             if self.qk_rope_head_dim == 0:
                 # The PCP gather carries rank padding with slot -1.
                 k_pe, k_nope = self._exec_kv_mla_nope(
-                    kv_no_split, kv_cache, slots, is_prefill=True, skip_padding_slots=self.pcp_enabled
+                    kv_no_split, kv_cache, slots, is_prefill=True, skip_padding_slots=pcp_enabled
                 )
             else:
                 cache_mode = "PA"
@@ -2785,7 +2792,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self,
         attn_metadata: AscendMLAMetadata,
     ) -> int:
-        if self.pcp_enabled:
+        if self.pcp_enabled and attn_metadata.pcp_enabled:
             prefill_metadata = attn_metadata.prefill
             assert prefill_metadata is not None
             local_num_input_tokens = prefill_metadata.pcp_local_num_input_tokens
@@ -2909,7 +2916,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_preprocess_res = None
         prefill_preprocess_res = None
         # Sharded decode writes other ranks' KV even without local queries.
-        should_write_kv_cache = has_decode or has_prefill or self.is_pcp_decode_sharded
+        is_pcp_decode_sharded = self.is_pcp_decode_sharded and attn_metadata.pcp_enabled
+        should_write_kv_cache = has_decode or has_prefill or is_pcp_decode_sharded
         if has_prefill:
             wait_for_kv_layer_from_connector(layer_name)
         if self.layerwise_kv_cache_hook is not None and should_write_kv_cache:
@@ -2917,7 +2925,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Wait for the broadcast before reading or updating the cache.
             self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
         written_kv = None
-        if self.is_pcp_decode_sharded:
+        if is_pcp_decode_sharded:
             # No local token is replicated, so decode and prefill rows share
             # one PCP gather and cache write.
             written_kv = self.exec_kv_prefill(
@@ -3011,10 +3019,12 @@ class AscendMLAImpl(MLAAttentionImpl):
         dcp_current_kv_buffers = getattr(self, "_dcp_current_kv_buffers", None)
         dcp_prefill_current_kv_buffers = getattr(self, "_dcp_prefill_current_kv_buffers", None)
         num_prefill_tokens = max(num_actual_tokens - num_decode_tokens, 0)
+        pcp_enabled = self.pcp_enabled and attn_metadata.pcp_enabled
+        is_pcp_decode_sharded = self.is_pcp_decode_sharded and attn_metadata.pcp_enabled
         use_prolog_v3_strided_cache = (
             self._cache_requires_prolog_v3_writer(kv_cache)
-            and not self.pcp_enabled
-            and not self.is_pcp_decode_sharded
+            and not pcp_enabled
+            and not is_pcp_decode_sharded
             and (not decode_requires_current_kv or self.dcp_enabled)
             and (not prefill_requires_current_kv or self.dcp_enabled)
             and (
@@ -3048,7 +3058,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             and not fused_mla_cache
             and (not decode_requires_current_kv or can_use_dcp_prolog)
             # The fused prolog writes only local KV, while sharded decode must gather it.
-            and not self.is_pcp_decode_sharded
+            and not is_pcp_decode_sharded
             and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
             and attn_metadata.num_prefills == 0
         ):

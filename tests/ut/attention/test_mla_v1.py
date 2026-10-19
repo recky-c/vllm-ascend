@@ -398,6 +398,57 @@ def test_mla_pcp_metadata_keeps_expanded_slot_mapping() -> None:
     assert metadata.attn_state == AscendAttentionState.ChunkedPrefill
 
 
+def test_mla_replicated_draft_metadata_does_not_finalize_pcp_slots() -> None:
+    builder = AscendMLAMetadataBuilder.__new__(AscendMLAMetadataBuilder)
+    builder.pcp_enabled = True
+    builder.pcp_size = 2
+    builder.is_pcp_decode_sharded = True
+    builder.dcp_enabled = False
+    builder.decode_threshold = 4
+    builder.metadata_cls = AscendMLAMetadata
+    builder.model_config = SimpleNamespace(get_head_size=lambda: 64)
+    builder.attn_mask_builder = MagicMock()
+    builder.get_block_table_size = MagicMock(return_value=1)
+    builder.build_decode_metadata = MagicMock(return_value=SimpleNamespace())
+    common = SimpleNamespace(
+        num_reqs=1,
+        num_input_tokens=1,
+        num_actual_tokens=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        slot_mapping=torch.tensor([7]),
+        _seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
+        graph_pad_size=-1,
+        block_table_tensor=torch.zeros(1, 1, dtype=torch.int32),
+        attn_state=AscendAttentionState.DecodeOnly,
+        causal=True,
+    )
+    with patch("vllm_ascend.attention.mla_v1.split_decodes_and_prefills", return_value=(1, 0, 1, 0)):
+        metadata = builder.build(0, common, pcp_enabled=False)
+        assert not metadata.pcp_enabled
+        assert metadata.slot_mapping.tolist() == [7]
+        assert metadata.pcp_cos is None
+        # The same builder must still enforce PCP layout on sharded steps.
+        with pytest.raises(RuntimeError, match="1 % 2 != 0"):
+            builder.build(0, common, pcp_enabled=True)
+
+
+def test_mla_replicated_draft_decode_skips_pcp_kv_gather() -> None:
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.pcp_enabled = True
+    impl.is_pcp_decode_sharded = True
+    impl.fused_qkv_a_proj = None
+    impl.kv_a_proj_with_mqa = MagicMock(return_value=(torch.zeros(1, 4), None))
+    impl.layerwise_kv_cache_hook = None
+    impl.exec_kv_prefill = MagicMock(side_effect=AssertionError("replicated decode must not gather KV"))
+    impl.mla_preprocess_decode = MagicMock(return_value="decode")
+    metadata = _make_pcp_metadata(num_actual_tokens=1, num_decode_tokens=1)
+    metadata.pcp_enabled = False
+    with patch("vllm_ascend.attention.mla_v1.notify_kv_cache_written"):
+        assert impl._mla_preprocess("draft", torch.zeros(1, 4), (), metadata) == ("decode", None)
+    assert impl.mla_preprocess_decode.call_args.args[-1] is None
+
+
 def test_mla_pcp_prefill_gathers_padded_cache_inputs() -> None:
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
     impl.is_pcp_decode_sharded = False
@@ -3009,6 +3060,7 @@ class TestAscendMLAImpl(TestBase):
                     num_decode_tokens=0,
                     num_actual_tokens=num_tokens,
                     slot_mapping=torch.arange(2 * padded_tokens),
+                    pcp_enabled=True,
                     prefill=SimpleNamespace(
                         cos=torch.zeros(padded_tokens, self.impl.qk_rope_head_dim),
                         sin=torch.zeros(padded_tokens, self.impl.qk_rope_head_dim),
