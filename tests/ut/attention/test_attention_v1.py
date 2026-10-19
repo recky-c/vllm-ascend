@@ -423,6 +423,26 @@ def test_pcp_builder_keeps_short_extend_in_prefill(has_pcp_context, expected) ->
     assert builder._split_decodes_and_prefills(common_metadata, has_pcp_context) == expected
 
 
+@pytest.mark.parametrize("has_pcp_context", [False, True], ids=["replicated", "pcp"])
+def test_pcp_impl_gathers_cache_inputs_only_for_pcp_metadata(has_pcp_context) -> None:
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    impl.pcp_enabled = True
+    impl.key_cache = object()
+    # Only metadata built with a PCP context is finalized with the local layout.
+    metadata = AscendMetadata(pcp_local_num_input_tokens=2 if has_pcp_context else None, model_runner_type="generate")
+    query, key, value, output = (torch.zeros(2, 1, 1) for _ in range(4))
+    layer = SimpleNamespace(layer_name="layer", _k_scale_float=1.0, _v_scale_float=1.0)
+    written = (query, key, value, output)
+    with (
+        patch.object(impl, "_reshape_and_cache_pcp", return_value=written) as pcp_write,
+        patch.object(impl, "reshape_and_cache", return_value=written) as write,
+        patch.object(impl, "forward_impl", return_value=output),
+    ):
+        impl.forward(layer, query, key, value, (), metadata, output)
+    assert pcp_write.called is has_pcp_context
+    assert write.called is not has_pcp_context
+
+
 class TestAscendAttentionBackendImpl(TestBase):
     def setUp(self):
         self.mock_event = MagicMock()
