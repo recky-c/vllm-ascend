@@ -47,12 +47,10 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
 )
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+from vllm_ascend.worker.v2.spec_decode import disable_profiling_chunk_for_draft
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import prepare_dflash_inputs_factory
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
-from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
-    disable_profiling_chunk_for_draft,
-    prepare_replicated_pcp_config,
-)
+from vllm_ascend.worker.v2.spec_decode.pcp_utils import prepare_replicated_pcp_config
 
 
 class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
