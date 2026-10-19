@@ -33,7 +33,7 @@ def impl():
     writer.enable_kv_nz = False
     writer.support_fp8_attention = True
     writer.is_draft_model = True
-    writer.pcp_enabled = False
+    writer.use_pcp = False
     writer.dcp_enabled = False
     writer.is_pcp_decode_sharded = False
     writer.fused_qkv_a_proj = SimpleNamespace(input_size=14336, weight=torch.empty(1, device="npu"))
