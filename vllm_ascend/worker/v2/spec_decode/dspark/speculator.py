@@ -48,12 +48,12 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_factory,
     build_attn_metadata_wrapper,
 )
+from vllm_ascend.worker.v2.spec_decode import disable_profiling_chunk_for_draft
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import prepare_dflash_inputs_factory
-from vllm_ascend.worker.v2.spec_decode.draft_config_utils import disable_profiling_chunk_for_draft
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 
 
-def _prepare_dspark_draft_config(vllm_config: VllmConfig) -> VllmConfig:
+def _build_dspark_draft_config(vllm_config: VllmConfig) -> VllmConfig:
     """Derive the PCP=1 config that upstream DFlash/DSpark drafts run with.
 
     Upstream ``DFlashSpeculator.__init__`` already forces PCP=1. This only adds
@@ -114,7 +114,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     _lmhead_tp_sample_draft_supported = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        vllm_config = _prepare_dspark_draft_config(vllm_config)
+        vllm_config = _build_dspark_draft_config(vllm_config)
         super().__init__(vllm_config, device)
         self._lmhead_tp_validate_draft_sampling()
         self.input_batch: InputBatch | None = None

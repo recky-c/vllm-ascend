@@ -67,7 +67,6 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
-from vllm_ascend.attention.mla_v1 import AscendMLAMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     MLA_FLASH_SUPPORTED_Q_HEADS,
@@ -591,8 +590,6 @@ def build_attn_metadata(
                 )
             # Parallel attention and cache-only backends opt in to the PCP
             # context needed to construct their own metadata.
-            if isinstance(attn_metadata_builder, AscendMLAMetadataBuilder):
-                attn_metadata_extra_kwargs["pcp_enabled"] = pcp_context is not None
             if pcp_context is not None and (is_sfa_builder or is_dsa_builder or consumes_pcp_context):
                 attn_metadata_extra_kwargs.update(
                     pcp_context=pcp_context,

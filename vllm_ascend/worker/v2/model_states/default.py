@@ -285,8 +285,8 @@ class AscendModelState(DefaultModelState):
         is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
         pcp_context = (
-            self.pcp_manager.attention_context_for(attn_groups, input_batch, block_tables, slot_mappings)
-            if self.pcp_manager is not None
+            self.pcp_manager.build_attention_context(input_batch, block_tables, slot_mappings)
+            if self.pcp_manager is not None and self.pcp_manager.is_target_attn_groups(attn_groups)
             else None
         )
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.

@@ -21,11 +21,11 @@ from vllm.config import (
 )
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
+from vllm_ascend.worker.v2.spec_decode import disable_profiling_chunk_for_draft
 from vllm_ascend.worker.v2.spec_decode.autoregressive import (
     speculator as speculator_module,
 )
-from vllm_ascend.worker.v2.spec_decode.draft_config_utils import disable_profiling_chunk_for_draft
-from vllm_ascend.worker.v2.spec_decode.dspark.speculator import _prepare_dspark_draft_config
+from vllm_ascend.worker.v2.spec_decode.dspark.speculator import _build_dspark_draft_config
 from vllm_ascend.worker.v2.spec_decode.eagle import (
     speculator as eagle_speculator_module,
 )
@@ -166,7 +166,7 @@ def test_dspark_draft_eplb_policy(eplb_worker_config, tp_size, pcp_size, dp_size
             ),
         ),
     )
-    draft = _prepare_dspark_draft_config(config)
+    draft = _build_dspark_draft_config(config)
     assert draft.parallel_config.prefill_context_parallel_size == 1
     assert draft.parallel_config.enable_expert_parallel
     assert draft.parallel_config.enable_eplb == expected

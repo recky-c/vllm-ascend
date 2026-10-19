@@ -806,10 +806,10 @@ def test_request_state_cpu_and_numpy_tokens_share_storage() -> None:
     assert state.num_computed_tokens_np[1] == 23
 
 
-@pytest.mark.parametrize(("method", "aux_is_local"), [("dspark", False), ("eagle3", True), ("mtp", True)])
-def test_sampling_restore_exposes_unpadded_global_view(method: str, aux_is_local: bool) -> None:
+@pytest.mark.parametrize("is_draft_prefill_sharded", [False, True], ids=["replicated", "sharded"])
+def test_sampling_restore_exposes_unpadded_global_view(is_draft_prefill_sharded: bool) -> None:
     manager = AscendPCPManager.__new__(AscendPCPManager)
-    manager.vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(method=method))
+    manager._is_draft_prefill_sharded = is_draft_prefill_sharded
     batch = _make_global_pcp_batch()
     batch.is_dummy = False
     batch.num_tokens = 12
@@ -831,7 +831,7 @@ def test_sampling_restore_exposes_unpadded_global_view(method: str, aux_is_local
         # vLLM #57980 threads aux_hidden_states through this hook.
         restored_hidden, restored_aux, restored_batch = manager.restore_for_sampling(torch.zeros(8, 2), local_aux)
     assert len(restored_aux) == 1
-    if aux_is_local:
+    if is_draft_prefill_sharded:
         # Sharded drafts consume aux states next to the local last hidden states.
         assert parent.call_args.args[2] is None
         assert restored_aux is local_aux
@@ -1347,11 +1347,11 @@ def test_short_prefill_leaves_empty_pcp_ranks_in_mixed_batch(num_prefill_tokens)
     assert manager.get_num_tokens_for_dispatch(counts, prefilling) == 5
 
 
-def _hook_manager(method: str = "mtp") -> AscendPCPManager:
+def _hook_manager() -> AscendPCPManager:
     manager = AscendPCPManager.__new__(AscendPCPManager)
     manager.vllm_config = SimpleNamespace(
         parallel_config=ParallelConfig(prefill_context_parallel_size=2),
-        speculative_config=SimpleNamespace(method=method),
+        speculative_config=SimpleNamespace(method="mtp"),
     )
     manager._staged_draft_inputs = None
     manager._sampling_global_batch = None
@@ -1428,38 +1428,32 @@ def test_draft_input_buffers_pass_through_outside_draft_prefill() -> None:
     assert manager._staged_draft_inputs is None
 
 
-def test_attention_context_only_for_target_layers() -> None:
+def test_is_target_attn_groups_excludes_draft_only_groups() -> None:
     manager = _hook_manager()
     group = lambda *names: SimpleNamespace(layer_names=list(names))  # noqa: E731
-    target_groups = [[group("model.layers.0", "mtp.layers.0")], [group("model.layers.1")]]
-    manager.bind(manager.vllm_config, object(), object(), target_groups, draft_layer_names={"mtp.layers.0"})
-    context = object()
-    with patch.object(AscendPCPManager, "build_attention_context", return_value=context) as build:
-        # Target forwards and draft prefill capture use (possibly filtered) target groups.
-        assert manager.attention_context_for(target_groups, "batch", "tables", "slots") is context
-        assert manager.attention_context_for([[group("model.layers.1")]]) is context
-        # Draft decode metadata covers draft-only layers on the global batch.
-        assert manager.attention_context_for([[group("mtp.layers.0")]]) is None
-    assert build.call_count == 2
-    build.assert_any_call("batch", "tables", "slots")
-
-
-@pytest.mark.parametrize(
-    ("pcp_size", "method", "mode", "expected"),
-    [
-        (2, "mtp", CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.PIECEWISE),
-        (2, "eagle3", CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.NONE),
-        (2, "mtp", CUDAGraphMode.PIECEWISE, CUDAGraphMode.PIECEWISE),
-        (2, "dspark", CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE),
-        (1, "mtp", CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE),
-    ],
-)
-def test_draft_prefill_cudagraph_mode(pcp_size, method, mode, expected) -> None:
-    config = SimpleNamespace(
-        parallel_config=ParallelConfig(prefill_context_parallel_size=pcp_size),
-        speculative_config=SimpleNamespace(method=method),
+    # Before a speculator is set, every group is a target group.
+    assert manager.is_target_attn_groups([[group("mtp.layers.0")]])
+    speculator = SimpleNamespace(
+        draft_attn_layer_names={"mtp.layers.0"},
+        vllm_config=SimpleNamespace(parallel_config=ParallelConfig(prefill_context_parallel_size=2)),
     )
-    assert AscendPCPManager.draft_prefill_cudagraph_mode(config, mode) == expected
+    manager.set_speculator(speculator)
+    # Target forwards and draft prefill capture use (possibly filtered) target groups.
+    assert manager.is_target_attn_groups([[group("model.layers.0", "mtp.layers.0")], [group("model.layers.1")]])
+    assert manager.is_target_attn_groups([[group("model.layers.1")]])
+    # Draft decode metadata covers draft-only layers on the global batch.
+    assert not manager.is_target_attn_groups([[group("mtp.layers.0")]])
+
+
+@pytest.mark.parametrize(("draft_pcp_size", "expected"), [(2, True), (1, False)], ids=["mtp", "dspark"])
+def test_set_speculator_takes_route_from_draft_pcp_size(draft_pcp_size: int, expected: bool) -> None:
+    manager = _hook_manager()
+    speculator = SimpleNamespace(
+        draft_attn_layer_names=set(),
+        vllm_config=SimpleNamespace(parallel_config=ParallelConfig(prefill_context_parallel_size=draft_pcp_size)),
+    )
+    manager.set_speculator(speculator)
+    assert manager._is_draft_prefill_sharded is expected
 
 
 def test_sharded_draft_prefill_handoff_across_pcp_ranks() -> None:

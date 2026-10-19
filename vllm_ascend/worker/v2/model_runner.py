@@ -395,17 +395,9 @@ class NPUModelRunner(GPUModelRunner):
             )
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
-                self.pcp_manager.bind(
-                    self.vllm_config,
-                    kv_cache_config,
-                    self.input_buffers,
-                    self.attn_groups,
-                    draft_layer_names=(
-                        self.speculator.draft_attn_layer_names
-                        if isinstance(self.speculator, DraftModelSpeculator)
-                        else None
-                    ),
-                )
+                self.pcp_manager.set_runner_state(self.vllm_config, kv_cache_config, self.input_buffers)
+                if isinstance(self.speculator, DraftModelSpeculator):
+                    self.pcp_manager.set_speculator(self.speculator)
                 self.model_state.pcp_manager = self.pcp_manager
         bind_dspark_context_receiver(
             self.vllm_config,

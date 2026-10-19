@@ -1240,9 +1240,8 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     create_kvpp.assert_called_once()
     assert runner.kvpp == "kvpp"
     assert runner.model_state.kvpp_runtime == "kvpp"
-    runner.pcp_manager.bind.assert_called_once_with(
-        runner.vllm_config, seen["cfg"], runner.input_buffers, runner.attn_groups, draft_layer_names=None
-    )
+    runner.pcp_manager.set_runner_state.assert_called_once_with(runner.vllm_config, seen["cfg"], runner.input_buffers)
+    runner.pcp_manager.set_speculator.assert_not_called()
     assert runner.model_state.pcp_manager is runner.pcp_manager
     runner.init_routed_experts_capturer.assert_called_once_with()
 

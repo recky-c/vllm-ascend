@@ -19,6 +19,7 @@
 
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -41,10 +42,8 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
-# Each method has one fixed PCP draft route, matching upstream vLLM: MTP and
-# Eagle3 shard draft prefill with the target; DSpark drafts replicated.
-SHARDED_DRAFT_METHODS = ("mtp", "eagle3")
-REPLICATED_DRAFT_METHODS = ("dspark",)
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 
 @dataclass(frozen=True)
@@ -77,8 +76,12 @@ class AscendPCPManager(PCPManager):
     _pad_slot_id: torch.Tensor
     # The runner's global input buffers, which back global graph metadata.
     global_input_buffers: AscendInputBuffers | None = None
-    # Target attention layers; only metadata built for them carries a PCP context.
-    _target_layer_names: frozenset[str] = frozenset()
+    # Draft-only attention layers; metadata built only for them runs replicated.
+    _draft_layer_names: frozenset[str] = frozenset()
+    # Whether the speculator shards draft prefill with the target, i.e. the
+    # draft runs with the target's PCP topology (upstream MTP/Eagle3) rather
+    # than replicated with PCP=1 (upstream DFlash/DSpark).
+    _is_draft_prefill_sharded: bool = False
     # The batch restore_for_sampling handed to sampling and the speculator.
     _sampling_global_batch: InputBatch | None = None
     # Draft input rows overwritten by staged rank-local draft prefill inputs.
@@ -136,25 +139,26 @@ class AscendPCPManager(PCPManager):
             # the scheduled tokens that upstream assigns to rank segments.
             self._hidden_restore_idx_buffer = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
 
-    def bind(
+    def set_runner_state(
         self,
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
         global_input_buffers: AscendInputBuffers,
-        target_attn_groups: list[list[AttentionGroup]],
-        draft_layer_names: set[str] | None = None,
     ) -> None:
-        """Bind runner state that upstream's constructor does not receive."""
+        """Set runner state that upstream's constructor does not receive."""
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.global_input_buffers = global_input_buffers
-        self._target_layer_names = frozenset(
-            layer_name
-            for groups in target_attn_groups
-            for group in groups
-            for layer_name in group.layer_names
-            if not draft_layer_names or layer_name not in draft_layer_names
-        )
+
+    def set_speculator(self, speculator: "DraftModelSpeculator") -> None:
+        """Record the draft layers and the draft route the speculator declares.
+
+        The route follows the speculator's own parallel config, as upstream:
+        a draft keeping the target's PCP size shards its prefill, while a
+        draft built with PCP=1 runs replicated on the global batch.
+        """
+        self._draft_layer_names = frozenset(speculator.draft_attn_layer_names)
+        self._is_draft_prefill_sharded = speculator.vllm_config.parallel_config.prefill_context_parallel_size > 1
 
     @property
     def is_decode_sharded(self) -> bool:
@@ -239,7 +243,7 @@ class AscendPCPManager(PCPManager):
 
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None:
-            if speculative_config.method not in SHARDED_DRAFT_METHODS + REPLICATED_DRAFT_METHODS:
+            if speculative_config.method not in ("mtp", "eagle3", "dspark"):
                 raise NotImplementedError(
                     "Ascend MRV2 PCP supports speculative decoding only with MTP, Eagle3 and DSpark."
                 )
@@ -540,7 +544,7 @@ class AscendPCPManager(PCPManager):
         assert self._global_batch is not None
         local_aux_hidden_states = aux_hidden_states
         hidden_states, aux_hidden_states, global_batch = super().restore_for_sampling(
-            hidden_states, None if self._draft_prefill_is_sharded() else aux_hidden_states
+            hidden_states, None if self._is_draft_prefill_sharded else aux_hidden_states
         )
         if self._restore_unpadded_global_batch():
             global_batch = self._expose_unpadded_global_batch(global_batch)
@@ -548,14 +552,10 @@ class AscendPCPManager(PCPManager):
             hidden_states = hidden_states[:num_tokens]
             if aux_hidden_states is not None:
                 aux_hidden_states = [states[:num_tokens] for states in aux_hidden_states]
-        if self._draft_prefill_is_sharded():
+        if self._is_draft_prefill_sharded:
             aux_hidden_states = local_aux_hidden_states
         self._sampling_global_batch = global_batch
         return hidden_states, aux_hidden_states, global_batch
-
-    def _draft_prefill_is_sharded(self) -> bool:
-        speculative_config = self.vllm_config.speculative_config
-        return speculative_config is not None and speculative_config.method in SHARDED_DRAFT_METHODS
 
     def prepare_draft_prefill(self, input_batch: InputBatch, input_ids: torch.Tensor) -> None:
         """Shard draft prefill like the target, also for the unpadded batch.
@@ -607,42 +607,19 @@ class AscendPCPManager(PCPManager):
             input_buffers.is_padding[:num_tokens].copy_(is_padding)
         return super().restore_draft_prefill(last_hidden_states, hidden_states)
 
-    @staticmethod
-    def draft_prefill_cudagraph_mode(vllm_config: VllmConfig, cudagraph_mode: CUDAGraphMode) -> CUDAGraphMode:
-        """Keep sharded draft prefill out of FULL graphs.
-
-        Its rank-local input staging and the all-gather in
-        ``restore_draft_prefill`` run outside the model forward, which a FULL
-        graph would skip on replay.
-        """
-        if vllm_config.parallel_config.prefill_context_parallel_size <= 1:
-            return cudagraph_mode
-        speculative_config = vllm_config.speculative_config
-        if speculative_config is None or speculative_config.method not in SHARDED_DRAFT_METHODS:
-            return cudagraph_mode
-        return CUDAGraphMode.PIECEWISE if cudagraph_mode.has_piecewise_cudagraphs() else CUDAGraphMode.NONE
-
-    def attention_context_for(
-        self,
-        attn_groups: list[list[AttentionGroup]],
-        input_batch: AscendInputBatch | None = None,
-        block_tables: tuple[torch.Tensor, ...] | None = None,
-        slot_mappings: torch.Tensor | None = None,
-    ) -> AscendPCPAttentionContext | None:
-        """PCP context for target-shaped metadata only.
+    def is_target_attn_groups(self, attn_groups: list[list[AttentionGroup]]) -> bool:
+        """Whether the groups contain a target layer and so need a PCP context.
 
         Target forwards and the sharded draft prefill use the target groups
         (possibly filtered, e.g. for profiling). Draft decode runs replicated
         on the global batch with its own draft-only groups.
         """
-        if not any(
-            layer_name in self._target_layer_names
+        return any(
+            layer_name not in self._draft_layer_names
             for groups in attn_groups
             for group in groups
             for layer_name in group.layer_names
-        ):
-            return None
-        return self.build_attention_context(input_batch, block_tables, slot_mappings)
+        )
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         """Return capture views backed by the persistent PCP-local tables.
