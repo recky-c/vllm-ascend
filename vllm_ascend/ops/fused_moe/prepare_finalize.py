@@ -26,6 +26,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import is_forward_context_available
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
@@ -120,11 +121,45 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
     def __init__(self, moe_config: FusedMoEConfig):
         super().__init__(moe_config)
         self._restore_tp_across_dp()
+        self.pcp_replicated_num_tokens: int | None = None
 
     def _restore_tp_across_dp(self):
         """Restore original TP configuration (same as MC2)."""
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
+
+    def _maybe_split_replicated_pcp(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Take this PCP rank's token chunk of PCP-replicated MoE inputs.
+
+        A replicated (PCP=1) draft feeds identical tokens to MoE on every PCP
+        rank. Each rank keeps one contiguous ceil(N / PCP) chunk, so expert
+        dispatch handles every token once; ``_maybe_gather_replicated_pcp``
+        restores the full batch. The forward context derives the matching
+        per-rank MC2 length and mask from the same global N.
+        """
+        self.pcp_replicated_num_tokens = None
+        # Require an actual bool: mocked forward contexts can be truthy.
+        if not is_forward_context_available() or _EXTRA_CTX.moe_replicated_across_pcp is not True:
+            return tensors
+        pcp_group = get_pcp_group()
+        num_tokens = tensors[0].shape[0]
+        chunk = -(-num_tokens // pcp_group.world_size)
+        pad_size = chunk * pcp_group.world_size - num_tokens
+        start = pcp_group.rank_in_group * chunk
+        self.pcp_replicated_num_tokens = num_tokens
+        return tuple(
+            (nn.functional.pad(t, (0, 0) * (t.dim() - 1) + (0, pad_size)) if pad_size > 0 else t)[
+                start : start + chunk
+            ]
+            for t in tensors
+        )
+
+    def _maybe_gather_replicated_pcp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Restore the replicated batch split by ``_maybe_split_replicated_pcp``."""
+        if self.pcp_replicated_num_tokens is None:
+            return hidden_states
+        hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
+        return hidden_states[: self.pcp_replicated_num_tokens]
 
     def prepare(
         self,
@@ -146,6 +181,8 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         """
         self.replace_allreduce = replace_allreduce
 
+        if not self.replace_allreduce:
+            hidden_states, router_logits = self._maybe_split_replicated_pcp(hidden_states, router_logits)
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
             self.num_tokens, _ = hidden_states.shape
@@ -184,6 +221,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         input_ids,
     ):
         if not self.replace_allreduce:
+            (input_ids,) = self._maybe_split_replicated_pcp(input_ids)
             pad_size = self.tp_size - self.num_tokens
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
@@ -224,6 +262,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
 
             if self.num_tokens < hidden_states.shape[0]:
                 hidden_states = hidden_states[: self.num_tokens]
+            hidden_states = self._maybe_gather_replicated_pcp(hidden_states)
 
         return hidden_states
 
@@ -271,6 +310,9 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         """
         self.replace_allreduce = replace_allreduce
         mc2_mask = _EXTRA_CTX.mc2_mask
+        if not self.replace_allreduce:
+            # mc2_mask and padded_num_tokens already describe this PCP chunk.
+            hidden_states, router_logits = self._maybe_split_replicated_pcp(hidden_states, router_logits)
         if self.replace_allreduce:
             # SP shards use the local token count, not the largest DP batch.
             # Select valid bits before adding padding for uniform MC2 batches.
@@ -337,6 +379,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
         else:
+            (input_ids,) = self._maybe_split_replicated_pcp(input_ids)
             target_pad_length = _EXTRA_CTX.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
             if pad_size > 0:

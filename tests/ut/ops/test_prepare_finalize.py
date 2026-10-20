@@ -337,3 +337,119 @@ class TestSequenceParallelPCP(unittest.TestCase):
             reduce.assert_called_once_with(gathered_inputs)
             config.dp_group.all_gather.assert_not_called()
             pcp_group.assert_not_called()
+
+
+class TestReplicatedPCPMoESplit(unittest.TestCase):
+    """A replicated PCP=1 draft splits MoE tokens across PCP ranks."""
+
+    def setUp(self):
+        patches = [
+            patch("vllm_ascend.mrv2_utils.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False),
+            patch("vllm_ascend.ascend_forward_context._USE_V2_EXTRA_KWARGS", False),
+            patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1),
+            patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0),
+            patch("vllm_ascend.ops.fused_moe.prepare_finalize.is_forward_context_available", return_value=True),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.mock_get_forward_context = patch("vllm_ascend.ascend_forward_context.get_forward_context").start()
+        self.addCleanup(patch.stopall)
+        self.mock_get_pcp_group = patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_pcp_group").start()
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.parallel_config.tensor_parallel_size = 1
+        mock_vllm_config.use_v2_model_runner = False
+        config_context = set_current_vllm_config(mock_vllm_config)
+        config_context.__enter__()
+        self.addCleanup(config_context.__exit__, None, None, None)
+        self.moe_config = MagicMock(spec=FusedMoEConfig)
+        self.moe_config.tp_group = MagicMock()
+
+    def _set_context(self, replicated, padded_num_tokens, num_valid):
+        ctx = MagicMock()
+        ctx.moe_replicated_across_pcp = replicated
+        ctx.padded_num_tokens = padded_num_tokens
+        ctx.mc2_mask = torch.arange(padded_num_tokens) < num_valid
+        self.mock_get_forward_context.return_value = ctx
+
+    def _set_pcp(self, world_size, rank, gathered):
+        group = MagicMock()
+        group.world_size = world_size
+        group.rank_in_group = rank
+        group.all_gather.side_effect = lambda tensor, dim: gathered
+        self.mock_get_pcp_group.return_value = group
+        return group
+
+    def test_mc2_splits_16k_tokens_across_pcp16(self):
+        from vllm_ascend.ascend_forward_context import split_replicated_pcp_tokens
+
+        num_tokens, pcp_size, rank = 16384, 16, 3
+        chunk, valid = split_replicated_pcp_tokens(num_tokens, pcp_size, rank)
+        self.assertEqual((chunk, valid), (1024, 1024))
+        x = torch.randn(num_tokens, 4)
+        logits = torch.randn(num_tokens, 2)
+        self._set_context(True, chunk, valid)
+        group = self._set_pcp(pcp_size, rank, gathered=x)
+
+        layer = PrepareAndFinalizeWithMC2(self.moe_config)
+        out = layer.prepare(x, logits)
+        self.assertEqual(out.hidden_states.shape[0], 1024)
+        self.assertTrue(torch.equal(out.hidden_states, x[3072:4096]))
+        self.assertTrue(torch.equal(out.router_logits, logits[3072:4096]))
+        self.assertEqual(int(out.mc2_mask.sum()), 1024)
+
+        restored = layer.finalize(out.hidden_states, reduce_results=False)
+        group.all_gather.assert_called_once()
+        self.assertEqual(restored.shape[0], num_tokens)
+        self.assertTrue(torch.equal(restored, x))
+
+    def test_mc2_pads_12_tokens_to_16_and_restores_12(self):
+        from vllm_ascend.ascend_forward_context import split_replicated_pcp_tokens
+
+        num_tokens, pcp_size = 12, 16
+        self.assertEqual(split_replicated_pcp_tokens(num_tokens, pcp_size, 11), (1, 1))
+        self.assertEqual(split_replicated_pcp_tokens(num_tokens, pcp_size, 13), (1, 0))
+        x = torch.randn(num_tokens, 4)
+        logits = torch.randn(num_tokens, 2)
+        padded = torch.cat([x, torch.zeros(4, 4)])
+        self._set_context(True, 1, 0)
+        self._set_pcp(pcp_size, 13, gathered=padded)
+
+        layer = PrepareAndFinalizeWithMC2(self.moe_config)
+        out = layer.prepare(x, logits)
+        self.assertEqual(out.hidden_states.shape[0], 1)
+        self.assertTrue(torch.equal(out.hidden_states, torch.zeros(1, 4)))
+        self.assertFalse(bool(out.mc2_mask.any()))
+        ids = layer.pad_and_split_input_ids(torch.arange(num_tokens))
+        self.assertEqual(ids.tolist(), [0])
+
+        restored = layer.finalize(out.hidden_states, reduce_results=False)
+        self.assertEqual(restored.shape[0], num_tokens)
+        self.assertTrue(torch.equal(restored, x))
+
+    def test_all2all_splits_and_restores(self):
+        x = torch.randn(12, 4)
+        logits = torch.randn(12, 2)
+        self._set_context(True, 1, 1)
+        group = self._set_pcp(4, 2, gathered=x)
+
+        layer = PrepareAndFinalizeWithAll2All(self.moe_config)
+        out = layer.prepare(x, logits)
+        self.assertTrue(torch.equal(out.hidden_states, x[6:9]))
+        restored = layer.finalize(out.hidden_states, reduce_results=False, padded_hidden_states_shape=None)
+        group.all_gather.assert_called_once()
+        self.assertTrue(torch.equal(restored, x))
+
+    def test_flag_off_keeps_target_path(self):
+        x = torch.randn(16384, 4)
+        logits = torch.randn(16384, 2)
+        self._set_context(False, 16384, 16384)
+        group = self._set_pcp(16, 3, gathered=None)
+
+        layer = PrepareAndFinalizeWithMC2(self.moe_config)
+        out = layer.prepare(x, logits)
+        self.assertTrue(torch.equal(out.hidden_states, x))
+        restored = layer.finalize(out.hidden_states, reduce_results=False)
+        self.assertTrue(torch.equal(restored, x))
+        group.all_gather.assert_not_called()
+        self.mock_get_pcp_group.assert_not_called()

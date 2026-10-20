@@ -7,6 +7,7 @@ from typing import Any
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
@@ -172,6 +173,8 @@ def set_ascend_forward_context(
         )
 
         forward_context.moe_comm_type = moe_comm_type
+        # Only the v2 replicated-PCP draft splits MoE tokens across PCP ranks.
+        forward_context.moe_replicated_across_pcp = False
         # A target and its drafter may own different expert shapes. Resolve
         # model-owned communication state before graph execution; legacy
         # models retain the original singleton implementation.
@@ -249,6 +252,30 @@ def set_ascend_forward_context(
             yield
         finally:
             pass
+
+
+def get_replicated_pcp_moe_rank(vllm_config: VllmConfig) -> tuple[int, int] | None:
+    """Return ``(pcp_size, pcp_rank)`` when MoE inputs are PCP-replicated.
+
+    A replicated MTP draft runs a PCP=1 config inside a PCP>1 worker, so every
+    PCP rank holds the same tokens. The target config keeps its real PCP size
+    and is never treated as replicated.
+    """
+    if vllm_config.parallel_config.prefill_context_parallel_size != 1:
+        return None
+    try:
+        pcp_group = get_pcp_group()
+    except AssertionError:
+        return None
+    if pcp_group.world_size <= 1:
+        return None
+    return pcp_group.world_size, pcp_group.rank_in_group
+
+
+def split_replicated_pcp_tokens(num_tokens: int, pcp_size: int, pcp_rank: int) -> tuple[int, int]:
+    """Return ``(chunk_size, valid_tokens_on_rank)`` for a PCP token split."""
+    chunk = -(-num_tokens // pcp_size)
+    return chunk, max(0, min(chunk, num_tokens - pcp_rank * chunk))
 
 
 _mc2_tokens_capacity: int | None = None
@@ -466,6 +493,7 @@ class _ExtraForwardContextProxy:
         "num_accept_tokens",
         "in_profile_run",
         "padded_num_tokens",
+        "moe_replicated_across_pcp",
         "sinks",
         "eplb_heat_collection_status",
     )

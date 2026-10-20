@@ -591,8 +591,11 @@ class NPUPlatform(Platform):
         from vllm_ascend.ascend_forward_context import (
             _is_decode_only_node,
             get_mc2_mask,
+            MoECommType,
             get_mrv2_in_profile_run,
+            get_replicated_pcp_moe_rank,
             select_moe_comm_method,
+            split_replicated_pcp_tokens,
             sync_v2_extra_kwargs,
             use_cann_megamoe,
         )
@@ -653,20 +656,42 @@ class NPUPlatform(Platform):
         else:
             max_tokens_across_dp = num_tokens
 
+        # A replicated PCP=1 draft splits MoE tokens across PCP ranks; see
+        # PrepareAndFinalizeWithAll2All._maybe_split_replicated_pcp.
+        replicated_pcp = (
+            get_replicated_pcp_moe_rank(vllm_config)
+            if num_tokens is not None and getattr(vllm_config, "lora_config", None) is None
+            else None
+        )
+        moe_max_tokens = max_tokens_across_dp
+        if replicated_pcp is not None:
+            moe_max_tokens = split_replicated_pcp_tokens(max_tokens_across_dp, *replicated_pcp)[0]
+
         # NOTE: Must use max_tokens_across_dp instead of num_tokens for MoE comm method selection
-        # to ensure consistent communication method across all DP ranks
+        # to ensure consistent communication method across all DP ranks. A
+        # replicated draft selects on the per-rank chunk of that global maximum.
         moe_comm_type = select_moe_comm_method(
-            max_tokens_across_dp,
+            moe_max_tokens,
             vllm_config,
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
+        # The AllGather path keeps the replicated batch unsplit.
+        moe_replicated_across_pcp = replicated_pcp is not None and moe_comm_type in (
+            MoECommType.MC2,
+            MoECommType.FUSED_MC2,
+            MoECommType.ALLTOALL,
+        )
+        if not moe_replicated_across_pcp:
+            moe_max_tokens = max_tokens_across_dp
 
         mc2_mask = None
         padded_num_tokens = None
         if num_tokens is not None:
             num_actual_tokens = num_tokens
+            if moe_replicated_across_pcp:
+                num_actual_tokens = split_replicated_pcp_tokens(num_tokens, *replicated_pcp)[1]
             # NOTE: token num which need to pad to when mc2
-            padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            padded_num_tokens = math.ceil(moe_max_tokens / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()
             if reserved_mc2_mask is not None:
                 mc2_mask = reserved_mc2_mask[:padded_num_tokens]
@@ -688,6 +713,7 @@ class NPUPlatform(Platform):
             "is_draft_model_prefill": is_draft_model_prefill,
             "in_profile_run": in_profile_run,
             "padded_num_tokens": padded_num_tokens,
+            "moe_replicated_across_pcp": moe_replicated_across_pcp,
             "sinks": sinks,
             "dynamic_mx_quant_scale_alg": dynamic_mx_quant_scale_alg,
         }
