@@ -57,6 +57,7 @@ from vllm_ascend.attention.utils import (
     notify_kv_cache_written,
     split_decodes_and_prefills,
     supports_strided_mla_cache,
+    uses_pcp_context,
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.compilation.acl_graph import (
@@ -586,7 +587,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         if self.flashmla_state is not None:
             return self._build_external_flashmla(common_prefix_len, common_attn_metadata)
         expanded_slot_mapping = (
-            common_attn_metadata.slot_mapping if common_attn_metadata.pcp_context is not None else None
+            common_attn_metadata.slot_mapping if uses_pcp_context(common_attn_metadata, self.use_pcp) else None
         )
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
@@ -3129,10 +3130,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         self,
         attn_metadata: AscendMLAMetadata,
     ) -> int:
-        prefill_metadata = attn_metadata.prefill
-        assert prefill_metadata is not None
-        local_num_input_tokens = prefill_metadata.pcp_local_num_input_tokens
-        if local_num_input_tokens is not None:
+        if self._uses_pcp_slot_layout(attn_metadata):
+            prefill_metadata = attn_metadata.prefill
+            assert prefill_metadata is not None
+            local_num_input_tokens = prefill_metadata.pcp_local_num_input_tokens
+            assert local_num_input_tokens is not None, "PCP MLA metadata must be finalized before execution."
             # Keep the PCP-padded prefill length so every rank processes the
             # same number of KV tokens; exec_kv_prefill trims gathered outputs.
             return local_num_input_tokens - attn_metadata.num_decode_tokens
