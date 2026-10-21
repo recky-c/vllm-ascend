@@ -25,6 +25,7 @@ from vllm_ascend.worker.v2.spec_decode import disable_profiling_chunk_for_draft
 from vllm_ascend.worker.v2.spec_decode.autoregressive import (
     speculator as speculator_module,
 )
+from vllm_ascend.worker.v2.spec_decode.dspark.speculator import _build_dspark_draft_config
 from vllm_ascend.worker.v2.spec_decode.eagle import (
     speculator as eagle_speculator_module,
 )
@@ -32,7 +33,6 @@ from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpecul
 from vllm_ascend.worker.v2.spec_decode.mtp.speculator import (
     AscendMTPSpeculator,
 )
-from vllm_ascend.worker.v2.spec_decode.pcp_utils import prepare_replicated_pcp_config
 
 
 @pytest.fixture(autouse=True)
@@ -166,14 +166,38 @@ def test_dspark_draft_eplb_policy(eplb_worker_config, tp_size, pcp_size, dp_size
             ),
         ),
     )
-    draft, _ = prepare_replicated_pcp_config(config)
-    assert draft.parallel_config.prefill_context_parallel_size == 1
+    draft = _build_dspark_draft_config(config)
+    # Upstream DFlashSpeculator.__init__ forces PCP=1 on the copied config.
+    assert draft.parallel_config.prefill_context_parallel_size == pcp_size
+    assert (draft is config) == (pcp_size == 1)
     assert draft.parallel_config.enable_expert_parallel
     assert draft.parallel_config.enable_eplb == expected
     assert draft.parallel_config.eplb_config.num_redundant_experts == (redundant if expected else 0)
     assert config.parallel_config.prefill_context_parallel_size == pcp_size
     assert config.parallel_config.enable_eplb == enabled
     assert config.parallel_config.eplb_config.num_redundant_experts == redundant
+
+
+def test_dspark_draft_config_leaves_dcp_to_upstream(eplb_worker_config):
+    """PCP=2/DCP=2 on TP=1 is valid for the target; the draft copy keeps it.
+
+    Re-validating PCP=1 with DCP=2 on TP=1 would fail, so the Ascend builder
+    must not change the PCP/DCP sizes; upstream DFlash derives them.
+    """
+    config = replace(
+        eplb_worker_config,
+        parallel_config=replace(
+            eplb_worker_config.parallel_config,
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=2,
+        ),
+    )
+    draft = _build_dspark_draft_config(config)
+    assert draft is not config
+    assert draft.parallel_config.prefill_context_parallel_size == 2
+    assert draft.parallel_config.decode_context_parallel_size == 2
+    assert not draft.parallel_config.enable_eplb
+    assert config.parallel_config.enable_eplb
 
 
 def test_mtp_draft_config_keeps_target_pcp_topology(eplb_worker_config):
