@@ -294,32 +294,6 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
 
-    def _restore_replicated_draft_target_states(self) -> None:
-        """Restore target states consumed by a replicated PCP draft (DSpark)."""
-        state = self.execute_model_state
-        pcp_manager = self.pcp_manager
-        if (
-            state is None
-            or pcp_manager is None
-            or not self.is_last_pp_rank
-            or not getattr(self.speculator, "replicated_pcp", False)
-        ):
-            return
-
-        # vLLM main captures draft_hidden_states before maybe_restore_pcp_for_sampling,
-        # so a replicated draft would read the PCP-local target output. Restore
-        # it to the global layout up front.
-        if state.hidden_states is not None:
-            replacements: dict[str, Any] = {"hidden_states": pcp_manager.restore_hidden_states(state.hidden_states)}
-            if state.aux_hidden_states is not None:
-                replacements["aux_hidden_states"] = [
-                    pcp_manager.restore_hidden_states(aux) for aux in state.aux_hidden_states
-                ]
-            state = state._replace(**replacements)
-            # Tell restore_for_sampling to skip its second all-gather for this step.
-            pcp_manager._sampling_hidden_restored = True
-        self.execute_model_state = state
-
     @runtime_guard_sample_tokens
     def sample_tokens(self, grammar_output):
         if (
@@ -338,11 +312,6 @@ class NPUModelRunner(GPUModelRunner):
                 "prompt logprobs and fixed-token prompt scoring are not supported with lmhead TP."
             )
 
-        # The pre-restore marker is scoped to this sampling step.
-        pcp_manager = self.pcp_manager
-        if pcp_manager is not None and isinstance(pcp_manager, AscendPCPManager):
-            pcp_manager._sampling_hidden_restored = False
-        self._restore_replicated_draft_target_states()
         output = super().sample_tokens(grammar_output)
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).

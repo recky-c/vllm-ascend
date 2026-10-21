@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed import get_pcp_group
 
 # vLLM main (#56888) replaced buffer_utils.async_copy_to_gpu with
 # torch_utils.async_tensor_h2d (gaining out=/device=None support).
@@ -78,10 +77,6 @@ class AscendPCPManager(PCPManager):
     global_input_buffers: AscendInputBuffers | None = None
     # Draft-only attention layers; metadata built only for them runs replicated.
     _draft_layer_names: frozenset[str] = frozenset()
-    # Whether the runner already restored the target hidden states to the
-    # global PCP layout for the current sampling step (replicated DSpark
-    # draft). A second all-gather in restore_for_sampling would reorder them.
-    _sampling_hidden_restored: bool = False
     # Whether the speculator shards draft prefill with the target, i.e. the
     # draft runs with the target's PCP topology (upstream MTP/Eagle3) rather
     # than replicated with PCP=1 (upstream DFlash/DSpark).
@@ -215,28 +210,6 @@ class AscendPCPManager(PCPManager):
                 chunk_len = min(chunk_size, query_len - chunk_offset)
                 if chunk_len > 0:
                     yield req_idx, chunk_offset, chunk_len
-
-    @staticmethod
-    def broadcast_replicated_hidden_states(
-        last_hidden_states: torch.Tensor,
-        hidden_states: torch.Tensor,
-        num_tokens: int,
-        replicated_pcp: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Broadcast actual draft hidden states only when target PCP is replicated."""
-        if not replicated_pcp:
-            return last_hidden_states, hidden_states
-
-        # Draft tokens are replicated: broadcast PCP rank 0 directly,
-        # matching target decode's gather-then-select behavior.
-        pcp_group = get_pcp_group()
-        shared_hidden_states = hidden_states is last_hidden_states
-        last_hidden_states = pcp_group.broadcast(last_hidden_states[:num_tokens].contiguous(), src=0)
-        if shared_hidden_states:
-            hidden_states = last_hidden_states
-        else:
-            hidden_states = pcp_group.broadcast(hidden_states[:num_tokens].contiguous(), src=0)
-        return last_hidden_states, hidden_states
 
     @staticmethod
     def validate_config(
@@ -541,13 +514,9 @@ class AscendPCPManager(PCPManager):
         """
         assert self._global_batch is not None
         local_aux_hidden_states = aux_hidden_states
-        if self._sampling_hidden_restored:
-            self._sampling_hidden_restored = False
-            global_batch = self._global_batch
-        else:
-            hidden_states, aux_hidden_states, global_batch = super().restore_for_sampling(
-                hidden_states, None if self._is_draft_prefill_sharded else aux_hidden_states
-            )
+        hidden_states, aux_hidden_states, global_batch = super().restore_for_sampling(
+            hidden_states, None if self._is_draft_prefill_sharded else aux_hidden_states
+        )
         if self._restore_unpadded_global_batch():
             global_batch = self._expose_unpadded_global_batch(global_batch)
             num_tokens = global_batch.num_tokens
