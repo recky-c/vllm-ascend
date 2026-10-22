@@ -616,6 +616,7 @@ class KVPoolWorker:
         self.layer_save_finished_events: list[threading.Event] | None = None
 
         self.next_layer_to_submit = 0
+        self.last_consumed_load_layer = -1
         self.layerwise_offload = False
         self.independent_layers: list[int] = []
         self.prefetch_layer_map: dict[int, int] = {}
@@ -1366,6 +1367,7 @@ class KVPoolWorker:
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         self.next_layer_to_submit = 0
+        self.last_consumed_load_layer = -1
         reset_attention_compute_start_gate()
         self._attention_saved_layers = set()
         self._save_disabled.clear()
@@ -3180,6 +3182,7 @@ class KVPoolWorker:
             if getattr(self, "use_block_key_layerwise", False):
                 self._finish_current_layerwise_load_sessions()
             raise
+        self.last_consumed_load_layer = self.current_layer
         self.layer_load_finished_events[self.current_layer].clear()
         if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
             # The final model layer can have no reachable load rows. Completion
@@ -3192,6 +3195,26 @@ class KVPoolWorker:
             self._finish_current_layerwise_load_sessions()
         if hasattr(self, "kv_role") and not is_kv_save_role(self.kv_role, getattr(self, "consumer_is_to_put", False)):
             self.current_layer += 1
+
+    def wait_for_layer_load_done(self, layer_name: str) -> None:
+        """Wait off the layer cursor until one layer's load is complete.
+
+        A KVPP owner calls this from its broadcast thread before sending the
+        layer. It neither submits loads nor consumes the finished event; the
+        cursor's ``wait_for_layer_load`` may consume the event first, which
+        already implies the load is complete.
+        """
+        physical_layer = self._extract_physical_layer_index(layer_name)
+        layer_id = self._global_to_local_layer.get(physical_layer, physical_layer)
+        if not self.layer_load_tasks[layer_id] and layer_id not in self.prefetch_layer_map:
+            return
+        assert self.layer_load_finished_events is not None
+        assert self.kv_recv_thread is not None
+        while self.last_consumed_load_layer < layer_id and not self.layer_load_finished_events[layer_id].wait(
+            timeout=0.01
+        ):
+            self.kv_recv_thread.raise_if_failed()
+        self.kv_recv_thread.raise_if_failed()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:

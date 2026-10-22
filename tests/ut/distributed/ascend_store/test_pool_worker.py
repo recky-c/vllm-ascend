@@ -1813,6 +1813,28 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
                         f"layer {layer_id} submitted at the wrong model layer",
                     )
 
+    def test_wait_for_layer_load_done_keeps_layer_cursor(self):
+        """The KVPP owner waits off the cursor: it must not consume or advance it."""
+        worker = make_worker(self, use_layerwise=True)
+        worker.hf_config = SimpleNamespace(num_hidden_layers=2)
+        worker._global_to_local_layer = {}
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[], [object()]]
+        worker.layer_load_finished_events = [threading.Event(), threading.Event()]
+        worker.layer_load_finished_events[1].set()
+        worker.kv_recv_thread = MagicMock()
+        worker.current_layer = 0
+        worker.last_consumed_load_layer = -1
+
+        worker.wait_for_layer_load_done("model.layers.1.self_attn.attn")
+
+        self.assertTrue(worker.layer_load_finished_events[1].is_set())
+        self.assertEqual(worker.current_layer, 0)
+        # Once the cursor consumed the event, the load is known complete.
+        worker.layer_load_finished_events[1].clear()
+        worker.last_consumed_load_layer = 1
+        worker.wait_for_layer_load_done("model.layers.1.self_attn.attn")
+
     def test_empty_layerwise_step_reowns_task_lists(self):
         worker = self._make_worker()
         worker.use_layerwise = True

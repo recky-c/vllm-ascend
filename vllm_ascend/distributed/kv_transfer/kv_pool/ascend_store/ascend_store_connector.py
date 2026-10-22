@@ -382,6 +382,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if self._mamba_state is not None:
             self._mamba_state.do_mamba_copy_for_layer(layer_name)
 
+    def wait_for_layer_load_done(self, layer_name: str) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_layer_load_done(layer_name)
+
     def prepare_mamba_state_copy(self, mamba_state_or_copy_bufs) -> bool:
         """Take over the mamba align pre-copy for this step.
 

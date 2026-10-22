@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -27,6 +28,7 @@ class KVPPRuntime:
         kv_cache_config: Any,
         static_forward_context: dict[str, Any],
         kv_caches: dict[str, Any] | None = None,
+        wait_for_layer_load_done: Callable[[str], None] | None = None,
     ) -> KVPPRuntime:
         config = KVPPConfig.from_vllm_config(vllm_config)
         if config.size <= 1:
@@ -57,6 +59,10 @@ class KVPPRuntime:
         scheduler = KVPPScheduler(
             transport=BroadcastKVPPTransport(group, plan.layer_owner_ranks, layer_buffers),
             attention_layer_names=tuple(layer_buffers),
+            owned_layer_names=frozenset(
+                name for name, owner in plan.layer_owner_ranks.items() if owner == group.rank_in_group
+            ),
+            wait_for_layer_load_done=wait_for_layer_load_done,
         )
         for name in layer_buffers:
             static_forward_context[name].impl.layerwise_kv_cache_hook = scheduler
@@ -74,9 +80,19 @@ class KVPPRuntime:
 class KVPPScheduler:
     """Prefetch one layer ahead; Target execution ordinal selects scratch."""
 
-    def __init__(self, transport: BroadcastKVPPTransport, attention_layer_names: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        transport: BroadcastKVPPTransport,
+        attention_layer_names: tuple[str, ...],
+        owned_layer_names: frozenset[str] = frozenset(),
+        wait_for_layer_load_done: Callable[[str], None] | None = None,
+    ) -> None:
         self.transport = transport
         self.attention_layer_names = attention_layer_names
+        self.owned_layer_names = owned_layer_names
+        # Layerwise KV pooling fills an owner's cache asynchronously. The
+        # owner must finish that load before broadcasting the layer.
+        self.wait_for_layer_load_done = wait_for_layer_load_done
         self._has_history = False
         self._next_attention_layer_index = 0
         self._prefetch_future: Future[None] | None = None
@@ -87,7 +103,9 @@ class KVPPScheduler:
     def schedule_forward(self, has_history: bool) -> None:
         self._has_history = has_history
         self._next_attention_layer_index = 0
-        if has_history:
+        # Layerwise loads are bound and submitted after this point, so the
+        # first broadcast starts from the first layer's wait instead.
+        if has_history and self.wait_for_layer_load_done is None:
             self.start_layer_prefetch(self.attention_layer_names[0])
 
     def start_layer_prefetch(self, layer_name: str) -> None:
@@ -97,11 +115,15 @@ class KVPPScheduler:
 
     def run_layer_prefetch(self, layer_name: str, cache_ready: Any) -> None:
         torch.npu.set_device(self._npu_device_id)
+        if self.wait_for_layer_load_done is not None and layer_name in self.owned_layer_names:
+            self.wait_for_layer_load_done(layer_name)
         self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)
 
     def wait_for_layer(self, layer_name: str) -> None:
         if not self._has_history:
             return
+        if self._prefetch_future is None:
+            self.start_layer_prefetch(layer_name)
         assert self._prefetch_future is not None
         self._prefetch_future.result()
         self._prefetch_future = None

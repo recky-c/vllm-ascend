@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -153,3 +154,31 @@ def test_hook_propagates_failed_future_without_scheduling_next(scheduler_device)
         scheduler.wait_for_layer(layer_name(0))
     assert raised.value is error
     assert len(scheduler._prefetch_executor.submitted) == 1
+
+
+def test_owner_waits_for_layer_load_before_broadcast(scheduler_device):
+    events, _, _ = scheduler_device
+    transport = Mock()
+    transport.prefetch.side_effect = lambda name, ready, stream: events.append(("prefetch", name))
+    names = tuple(layer_name(i) for i in range(2))
+    scheduler = kvpp.KVPPScheduler(
+        transport,
+        names,
+        owned_layer_names=frozenset({names[1]}),
+        wait_for_layer_load_done=lambda name: events.append(("load_done", name)),
+    )
+    executor = scheduler._prefetch_executor
+    scheduler.schedule_forward(True)
+    # Layerwise loads are bound after schedule_forward; layer 0 starts at its wait.
+    assert not executor.submitted
+
+    def run_now(fn, *args):
+        future: Future[None] = Future()
+        future.set_result(fn(*args))
+        return future
+
+    scheduler._prefetch_executor = SimpleNamespace(submit=run_now)
+    for name in names:
+        scheduler.wait_for_layer(name)
+    calls = [event for event in events if event[0] in ("prefetch", "load_done")]
+    assert calls == [("prefetch", names[0]), ("load_done", names[1]), ("prefetch", names[1])]

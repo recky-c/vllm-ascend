@@ -527,10 +527,17 @@ class NPUModelRunner(GPUModelRunner):
         if getattr(self.model_config, "enable_return_routed_experts", False):
             self.init_routed_experts_capturer()
 
+        # Only a layerwise AscendStore pool fills owner caches during forward.
+        kv_connector = get_kv_transfer_group() if has_kv_transfer_group() else None
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
             static_forward_context=self.compilation_config.static_forward_context,
+            wait_for_layer_load_done=(
+                getattr(kv_connector, "wait_for_layer_load_done", None)
+                if getattr(kv_connector, "use_layerwise", False)
+                else None
+            ),
         )
         self.model_state.kvpp_runtime = self.kvpp
 
