@@ -26,6 +26,7 @@ import pytest
 import torch
 from vllm.config import CUDAGraphMode, ParallelConfig
 from vllm.config.utils import replace
+from vllm.v1.worker.gpu import cudagraph_utils
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
