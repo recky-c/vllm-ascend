@@ -86,8 +86,9 @@ class AscendPCPManager(PCPManager):
     # FULL request capacity). Only the attention context and the local graph
     # padding read it; upstream partitions the unpadded global batch.
     _attn_global_batch: AscendInputBatch | None = None
-    # Draft input rows overwritten by staged rank-local draft prefill inputs.
-    _staged_draft_inputs: tuple[InputBuffers, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    # Draft input buffers and row count overwritten by staged rank-local
+    # draft prefill inputs; the rows are stashed in the _draft_*_stash buffers.
+    _staged_draft_inputs: tuple[InputBuffers, int] | None = None
 
     # vLLM main made `shard_decode_requests` a required PCPManager argument and
     # `maybe_build_pcp_manager` passes it; v0.31.0 has neither. Define the
@@ -146,6 +147,11 @@ class AscendPCPManager(PCPManager):
                 # normally reserves one additional FIA padding slot, but PCP never
                 # uses that slot; expose the exact upstream-sized view here.
                 self._input_buffers.query_start_loc = self._input_buffers.query_start_loc[:-1]
+                # Global draft input rows overwritten while the rank-local draft
+                # prefill inputs are staged; restore_draft_prefill copies them back.
+                self._draft_input_ids_stash = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
+                self._draft_positions_stash = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+                self._draft_is_padding_stash = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
 
     else:
 
@@ -207,6 +213,11 @@ class AscendPCPManager(PCPManager):
                 # normally reserves one additional FIA padding slot, but PCP never
                 # uses that slot; expose the exact upstream-sized view here.
                 self._input_buffers.query_start_loc = self._input_buffers.query_start_loc[:-1]
+                # Global draft input rows overwritten while the rank-local draft
+                # prefill inputs are staged; restore_draft_prefill copies them back.
+                self._draft_input_ids_stash = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
+                self._draft_positions_stash = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+                self._draft_is_padding_stash = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
 
     def set_runner_state(
         self,
@@ -591,12 +602,10 @@ class AscendPCPManager(PCPManager):
         if local_batch is None:
             return input_buffers
         num_tokens = local_batch.num_tokens_after_padding
-        self._staged_draft_inputs = (
-            input_buffers,
-            input_buffers.input_ids[:num_tokens].clone(),
-            input_buffers.positions[:num_tokens].clone(),
-            input_buffers.is_padding[:num_tokens].clone(),
-        )
+        self._draft_input_ids_stash[:num_tokens].copy_(input_buffers.input_ids[:num_tokens])
+        self._draft_positions_stash[:num_tokens].copy_(input_buffers.positions[:num_tokens])
+        self._draft_is_padding_stash[:num_tokens].copy_(input_buffers.is_padding[:num_tokens])
+        self._staged_draft_inputs = (input_buffers, num_tokens)
         input_buffers.input_ids[:num_tokens].copy_(local_batch.input_ids[:num_tokens])
         input_buffers.positions[:num_tokens].copy_(local_batch.positions[:num_tokens])
         input_buffers.is_padding[:num_tokens].copy_(local_batch.is_padding[:num_tokens])
@@ -610,11 +619,10 @@ class AscendPCPManager(PCPManager):
         staged = self._staged_draft_inputs
         if staged is not None:
             self._staged_draft_inputs = None
-            input_buffers, input_ids, positions, is_padding = staged
-            num_tokens = input_ids.shape[0]
-            input_buffers.input_ids[:num_tokens].copy_(input_ids)
-            input_buffers.positions[:num_tokens].copy_(positions)
-            input_buffers.is_padding[:num_tokens].copy_(is_padding)
+            input_buffers, num_tokens = staged
+            input_buffers.input_ids[:num_tokens].copy_(self._draft_input_ids_stash[:num_tokens])
+            input_buffers.positions[:num_tokens].copy_(self._draft_positions_stash[:num_tokens])
+            input_buffers.is_padding[:num_tokens].copy_(self._draft_is_padding_stash[:num_tokens])
         return super().restore_draft_prefill(last_hidden_states, hidden_states)
 
     def is_target_attn_groups(self, attn_groups: list[list[AttentionGroup]]) -> bool:
