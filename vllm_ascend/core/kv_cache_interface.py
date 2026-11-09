@@ -501,7 +501,7 @@ class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
     @property
     def unpadded_page_size_bytes(self) -> int:
         # The tail stores a fixed K/gate pair; the parent handles page padding.
-        return 2 * self.block_size * self.head_size * get_dtype_size(self.dtype)
+        return self.block_size * self.state_content_size_bytes
 
     def __post_init__(self) -> None:
         super().__post_init__()
