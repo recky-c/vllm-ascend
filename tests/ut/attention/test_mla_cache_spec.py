@@ -11,7 +11,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec, SparseCach
 
 from vllm_ascend.attention.mla_v1 import AscendMLAAttention, AscendMLAImpl
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, get_kv_cache_storage_head_size
 
 
 @pytest.mark.parametrize(
@@ -84,7 +84,8 @@ def test_sfa_spec_uses_execution_format_and_offload_decision(format_name, width,
     impl.store_kv_cache_on_host = offload
     source = AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16)
     spec = impl.apply_kv_cache_layout(source)
-    assert spec.head_size == width
+    assert spec.head_size == source.head_size
+    assert get_kv_cache_storage_head_size(spec) == width
     assert spec.dtype == (torch.bfloat16 if format_name == "bf16" else torch.int8)
     assert spec.store_on_host is offload
     assert spec.cache_sparse_sfa_c8 is (format_name in ("c8", "c8_nope"))
@@ -101,12 +102,12 @@ def test_fa_quant_spec_uses_execution_dtype():
     spec = impl.apply_kv_cache_layout(
         AscendMLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16)
     )
-    assert spec.head_size == 640
+    assert spec.head_size == 576
+    assert spec.state_content_bytes == 640
+    assert get_kv_cache_storage_head_size(spec) == 640
     assert spec.dtype == torch.int8
     assert spec.cache_dtype_str is None
     assert spec.page_size_bytes == 128 * 640
-
-
 
 
 def test_mla_unquantized_spec_keeps_layer_decision():
@@ -120,7 +121,12 @@ def test_worker_collects_mla_spec_without_reading_impl(monkeypatch):
     from vllm_ascend.worker.v2 import attn_utils
 
     source = AscendMLAAttentionSpec(
-        block_size=128, num_kv_heads=1, head_size=386, dtype=torch.int8, cache_sparse_sfa_turboquant=True
+        block_size=128,
+        num_kv_heads=1,
+        head_size=576,
+        state_content_bytes=386,
+        dtype=torch.int8,
+        cache_sparse_sfa_turboquant=True,
     )
 
     class Owner(MLAAttention):

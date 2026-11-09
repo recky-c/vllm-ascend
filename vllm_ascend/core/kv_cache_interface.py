@@ -13,6 +13,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     CircularBufferSpec,
     FullAttentionSpec,
     KVCacheSpec,
@@ -43,6 +44,24 @@ def get_storage_block_size(kv_cache_spec: KVCacheSpec) -> int:
     if isinstance(kv_cache_spec, MLAAttentionSpec):
         return kv_cache_spec.block_size
     return getattr(kv_cache_spec, "storage_block_size", kv_cache_spec.block_size)
+
+
+def get_kv_cache_storage_head_size(spec: AttentionSpec) -> int:
+    """Return the stored data width in dtype elements, excluding scale bytes.
+
+    Ascend specs without explicit state bytes retain the legacy convention
+    that head_size already describes the stored data width.
+    """
+    if not isinstance(spec, (AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec)):
+        return spec.head_size
+    if spec.state_content_bytes is None:
+        return spec.head_size
+    scale_bytes = spec.scale_dim * get_dtype_size(spec.scale_dtype)
+    data_bytes = spec.state_content_size_bytes - scale_bytes
+    dtype_size = get_dtype_size(spec.dtype)
+    if data_bytes <= 0 or data_bytes % dtype_size:
+        raise ValueError("Cache data bytes must be positive and divisible by the storage dtype size.")
+    return data_bytes // dtype_size
 
 
 def is_circular_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
@@ -231,12 +250,15 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         )
 
     @property
+    def state_content_size_bytes(self) -> int:
+        """Bytes per stored state, including scales but excluding page padding."""
+        if self.state_content_bytes is not None:
+            return self.state_content_bytes
+        return self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype)
+
+    @property
     def real_page_size_bytes(self) -> int:
-        return (
-            get_storage_block_size(self)
-            * self.num_kv_heads
-            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
-        )
+        return get_storage_block_size(self) * self.num_kv_heads * self.state_content_size_bytes
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -251,6 +273,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         )
         ascend_layouts = {
             (
+                spec.state_content_size_bytes,
                 spec.scale_dim,
                 spec.num_heads,
                 spec.scale_dtype,
@@ -274,6 +297,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         merged = super().merge(specs)
         return replace(
             merged,
+            is_draft=first_spec.is_draft,
+            state_content_bytes=first_spec.state_content_bytes,
             scale_dim=first_spec.scale_dim,
             num_heads=first_spec.num_heads,
             scale_dtype=first_spec.scale_dtype,
@@ -317,19 +342,23 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
         return self.real_page_size_bytes
 
     @property
+    def state_content_size_bytes(self) -> int:
+        """Bytes per stored state, including scales but excluding page padding."""
+        if self.state_content_bytes is not None:
+            return self.state_content_bytes
+        return self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype)
+
+    @property
     def real_page_size_bytes(self) -> int:
         num_heads_per_page = self.block_size * self.num_kv_heads
-        return (
-            self.sfa_dcp_replicated_indexer_size
-            * num_heads_per_page
-            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
-        )
+        return self.sfa_dcp_replicated_indexer_size * num_heads_per_page * self.state_content_size_bytes
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be AscendSFAIndexerCacheSpec."
         )
+        state_content_sizes = {spec.state_content_size_bytes for spec in specs}
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         dtype_set = set(spec.dtype for spec in specs)
         max_tp_shards_set = {spec.max_tp_shards for spec in specs}
@@ -339,7 +368,8 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
         cache_sparse_li_c4_set = set(spec.cache_sparse_li_c4 for spec in specs)
         sfa_dcp_replicated_indexer_size_set = set(spec.sfa_dcp_replicated_indexer_size for spec in specs)
         assert (
-            len(cache_dtype_str_set) == 1
+            len(state_content_sizes) == 1
+            and len(cache_dtype_str_set) == 1
             and len(dtype_set) == 1
             and len(max_tp_shards_set) == 1
             and len(scale_dim_set) == 1
@@ -352,11 +382,11 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
             "the same dtype, scale layout, quantization method, LI quant flags "
             "and DCP replication size."
         )
-        return cls(
-            block_size=specs[0].block_size,
-            num_kv_heads=specs[0].num_kv_heads,
-            head_size=specs[0].head_size,
+        return replace(
+            super().merge(specs),
+            is_draft=specs[0].is_draft,
             dtype=dtype_set.pop(),
+            state_content_bytes=specs[0].state_content_bytes,
             max_tp_shards=max_tp_shards_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             scale_dim=scale_dim_set.pop(),
