@@ -1419,6 +1419,8 @@
 #       specs through their owner construction and backend customize_spec hooks; the
 #       collector no longer reconstructs their formats or resolves indexer
 #       ownership through layer names.
+#       Cross-layer attention/state page alignment runs in planning before
+#       grouping. GLM-Next and QSA retain their existing page classes.
 #    Related PR (if no, explain why):
 #       No. This is a plugin-side compatibility patch for the current upstream
 #       helper path.
