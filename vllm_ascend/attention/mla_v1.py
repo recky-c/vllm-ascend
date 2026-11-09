@@ -19,7 +19,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.offloader.base import NoopOffloader, get_offloader
 from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv, round_down
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     AttentionCGSupport,
@@ -175,7 +175,7 @@ class AscendMLAAttention(MLAAttention):
         use_sfa_c8 = not use_sfa_turboquant and getattr(self.impl, "enable_sparse_sfa_c8", False)
         use_packed_sfa = use_sfa_turboquant or use_sfa_c8
         use_fa_quant = getattr(self.impl, "fa_quant_layer", False)
-        head_size = spec.head_size
+        state_content_bytes = spec.state_content_bytes
         dtype = spec.dtype
         cache_dtype_str = spec.cache_dtype_str
         if use_packed_sfa:
@@ -187,7 +187,7 @@ class AscendMLAAttention(MLAAttention):
         elif use_fa_quant:
             # FA quantization is selected per layer. The backend class hook
             # must not reselect it from global configuration.
-            head_size = self.impl.head_size + self.qk_rope_head_dim
+            state_content_bytes = (self.impl.head_size + self.qk_rope_head_dim) * get_dtype_size(self.impl.dtype)
             dtype = self.impl.dtype
             cache_dtype_str = None
 
@@ -204,7 +204,7 @@ class AscendMLAAttention(MLAAttention):
             cache_sparse_sfa_turboquant=use_sfa_turboquant,
             cache_sparse_sfa_c8=use_sfa_c8,
             store_on_host=getattr(self.impl, "store_kv_cache_on_host", False),
-            head_size=head_size,
+            state_content_bytes=state_content_bytes,
             dtype=dtype,
             cache_dtype_str=cache_dtype_str,
         )

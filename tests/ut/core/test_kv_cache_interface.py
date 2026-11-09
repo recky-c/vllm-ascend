@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     declared_kwarg,
     get_kv_cache_compression_ratio,
+    get_kv_cache_storage_head_size,
     get_storage_block_size,
     register_ascend_kv_cache_specs,
     resolve_bounded_replay,
@@ -351,3 +353,66 @@ def test_a_layer_that_may_replay_warns_about_nothing():
         resolve_bounded_replay(_vllm_config(), _cache_config())
 
     warning.assert_not_called()
+
+
+@pytest.mark.parametrize("spec_type", [AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec])
+def test_explicit_state_bytes_keep_storage_width_and_merge_metadata(spec_type):
+    """Logical dimensions must not inflate packed data or lose scale capacity."""
+    spec = spec_type(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        state_content_bytes=68,
+        scale_dim=4,
+        scale_dtype=torch.float8_e8m0fnu,
+        is_index_group_leader=True,
+        topk_buffer_width=2048,
+        block_stride_alignment=256,
+    )
+    merged = spec_type.merge([spec, spec])
+    assert merged.head_size == 128
+    assert merged.state_content_size_bytes == 68
+    assert merged.real_page_size_bytes == 128 * 68
+    assert get_kv_cache_storage_head_size(merged) == 64
+    assert merged.is_index_group_leader
+    assert merged.topk_buffer_width == 2048
+    assert merged.block_stride_alignment == 256
+
+
+@pytest.mark.parametrize("spec_type", [AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec])
+def test_legacy_packed_spec_keeps_existing_storage_width(spec_type):
+    spec = spec_type(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.uint8,
+        scale_dim=4,
+        scale_dtype=torch.float8_e8m0fnu,
+    )
+    assert spec.state_content_bytes is None
+    assert spec.state_content_size_bytes == 68
+    assert get_kv_cache_storage_head_size(spec) == 64
+    assert spec.real_page_size_bytes == 128 * 68
+
+
+@pytest.mark.parametrize("spec_type", [AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec])
+def test_merge_rejects_different_physical_state_bytes(spec_type):
+    spec = spec_type(block_size=128, num_kv_heads=1, head_size=128, dtype=torch.uint8, state_content_bytes=64)
+    with pytest.raises(AssertionError):
+        spec_type.merge([spec, replace(spec, state_content_bytes=68)])
+
+
+@pytest.mark.parametrize("state_bytes", [1, 3])
+def test_storage_width_rejects_incomplete_typed_data(state_bytes):
+    spec = AscendSFAIndexerCacheSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        state_content_bytes=state_bytes,
+        scale_dim=1,
+        scale_dtype=torch.float16,
+    )
+    with pytest.raises(ValueError, match="storage dtype size"):
+        get_kv_cache_storage_head_size(spec)

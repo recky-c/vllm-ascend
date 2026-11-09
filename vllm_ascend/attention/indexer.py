@@ -10,7 +10,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -275,20 +275,24 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         """Describe the data/scale format selected once in backend initialization."""
         if self.enable_sparse_li_c4:
             # Two 4-bit values per byte, with one scale per 32 values.
-            head_size = self.head_dim // 2
+            data_head_size = self.head_dim // 2
             dtype = self.c4_k_cache_dtype
             scale_dim = self.head_dim // 32
             scale_dtype = self.c4_k_scale_cache_dtype
         elif self.enable_sparse_li_c8:
-            head_size = self.head_dim
+            data_head_size = self.head_dim
             dtype = self.c8_k_cache_dtype
             scale_dim = 1
             scale_dtype = self.c8_k_scale_cache_dtype
         else:
-            head_size = self.head_dim
+            data_head_size = self.head_dim
             dtype = vllm_config.model_config.dtype
             scale_dim = 0
             scale_dtype = torch.int8  # Unused when there is no scale component.
+
+        data_bytes = data_head_size * get_dtype_size(dtype)
+        scale_bytes = scale_dim * get_dtype_size(scale_dtype)
+        state_content_bytes = data_bytes + scale_bytes
 
         cache_dtype_str = vllm_config.cache_config.cache_dtype
         if not self.enable_sparse_li_quant:
@@ -306,7 +310,8 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         # storage layout supplied by this backend.
         spec_fields = {field.name: getattr(source, field.name) for field in fields(source) if field.init}
         spec_fields.update(
-            head_size=head_size,
+            head_size=self.head_dim,
+            state_content_bytes=state_content_bytes,
             dtype=dtype,
             cache_dtype_str=cache_dtype_str,
             scale_dim=scale_dim,
