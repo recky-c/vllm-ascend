@@ -394,3 +394,48 @@ def test_glm53_flash_tail_owner_publishes_complete_key_gate_record():
     assert spec.state_content_bytes == 2 * 128 * 4
     assert spec.unpadded_page_size_bytes == 7 * 2 * 128 * 4
     assert spec.page_size_bytes == replace(spec, state_content_bytes=None).page_size_bytes
+
+
+@pytest.mark.parametrize("pool", [4, 16])
+def test_glm53_flash_planning_preserves_owner_specs_and_two_page_classes(pool):
+    specs = make_specs(pool)
+    owner_padding = {name: spec.page_size_padded for name, spec in specs.items()}
+    owner_blocks = {name: spec.block_size for name, spec in specs.items()}
+    groups = get_glm5_next_kv_cache_groups(make_config(), specs)
+    layout = _get_glm5_next_cache_layout(groups)
+    assert layout is not None
+    assert layout.main_page_size > layout.small_page_size
+    assert {name: spec.page_size_padded for name, spec in specs.items()} == owner_padding
+    assert {name: spec.block_size for name, spec in specs.items()} == owner_blocks
+    assert layout.main_page_size == specs["model.layers.3.attn"].page_size_bytes
+    assert layout.small_page_size == specs["model.layers.3.indexer.k_cache"].page_size_bytes
+    repeated = get_glm5_next_kv_cache_groups(make_config(), specs)
+    assert _get_glm5_next_cache_layout(repeated) == layout
+
+
+@pytest.mark.parametrize("large_owner", ["indexer", "tail"])
+def test_glm53_flash_small_pool_does_not_pad_main_pool(large_owner):
+    specs = make_specs()
+    main_name = "model.layers.3.attn"
+    indexer_name = "model.layers.3.indexer.k_cache"
+    tail_name = "model.layers.3.indexer.tail_cache"
+    main_page = specs[main_name].page_size_bytes
+    small_page = 2 * main_page
+    large_name = indexer_name if large_owner == "indexer" else tail_name
+    specs[large_name] = replace(specs[large_name], page_size_padded=small_page)
+    original = dict(specs)
+
+    config = make_config()
+    groups = get_glm5_next_kv_cache_groups(config, specs)
+    layout = _get_glm5_next_cache_layout(groups)
+    assert layout is not None
+    assert layout.main_page_size == main_page
+    assert layout.small_page_size == small_page
+    assert all(group.kv_cache_spec.page_size_bytes == main_page for group in layout.mamba_groups)
+    cost = layout.main_slot_count * main_page + layout.small_slot_count * small_page
+    assert get_glm5_next_pool_bytes_per_block(groups) == cost
+    physical = get_glm5_next_kv_cache_config(config, groups, 7 * cost)
+    assert physical.num_blocks == 7
+    assert sum(tensor.size for tensor in physical.kv_cache_tensors) == 7 * cost
+    assert {tensor.block_stride for tensor in physical.kv_cache_tensors} == {main_page, small_page}
+    assert all(specs[name] is spec for name, spec in original.items())
