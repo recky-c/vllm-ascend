@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
@@ -107,13 +108,21 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
         ratio_kwargs: dict[str, Any] = {"tokens_per_state": self.compress_ratio}
+        scale_dim = 0
+        scale_dtype = torch.int8
+        if self.dtype == torch.float8_e4m3fn:
+            scale_dim = 1
+            scale_dtype = torch.float32
+        data_bytes = self.head_dim * get_dtype_size(self.dtype)
+        scale_bytes = scale_dim * get_dtype_size(scale_dtype)
         return AscendMLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            scale_dim=1 if self.dtype == torch.float8_e4m3fn else 0,
-            scale_dtype=torch.float32 if self.dtype == torch.float8_e4m3fn else torch.int8,
+            state_content_bytes=data_bytes + scale_bytes,
+            scale_dim=scale_dim,
+            scale_dtype=scale_dtype,
             cache_dtype_str=None,
             model_version="glm5_next",
             indexes_kv_by_block_stride=True,
@@ -170,6 +179,7 @@ class Glm5NextTailCache(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            state_content_bytes=2 * self.head_dim * get_dtype_size(self.dtype),
             sliding_window=self.compress_ratio,
             compress_ratio=self.compress_ratio,
         )
