@@ -60,6 +60,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     OFFLOAD_KV_CACHE_TUPLE_LEN,
     OFFLOAD_V_CACHE_NPU_INDEX,
 )
+from vllm_ascend.ops.triton.paged_cache_store import store_paged_cache
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.pcp_kv_cache import copy_pcp_kv_cache
 from vllm_ascend.quantization.methods import (
@@ -1313,7 +1314,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert self.kv_a_layernorm is not None
             values = self.kv_a_layernorm(kv_no_split.reshape(-1, self.kv_lora_rank))
             cache = kv_cache[0]
-            # The hybrid cache configuration keeps NoPE main KV pages packed.
+            if not cache.is_contiguous():
+                store_paged_cache(values.to(cache.dtype), slots[: values.shape[0]], cache)
+                return None, None
             torch_npu.npu_scatter_nd_update_(
                 cache.view(-1, self.kv_lora_rank),
                 slots[: values.shape[0]].view(-1, 1),
@@ -1758,6 +1761,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
         assert packed_kv.shape[-1] == packed_head_dim
         packed_kv = packed_kv.view(-1, packed_head_dim)
+        if not kv_cache[0].is_contiguous():
+            store_paged_cache(packed_kv, slot_mapping_sfa[: packed_kv.shape[0]], kv_cache[0])
+            return
         DeviceOperator.scatter_cache(
             kv_cache[0].view(-1, packed_head_dim),
             slot_mapping_sfa[: packed_kv.shape[0]].view(-1, 1),

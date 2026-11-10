@@ -513,3 +513,42 @@ def test_glm_roles_are_not_inferred_from_compression():
     specs["model.layers.3.indexer.k_cache"] = uncompressed_indexer
     with pytest.raises(ValueError, match="uncompressed main and a compressed indexer"):
         get_glm5_next_kv_cache_groups(make_config(), specs)
+
+
+def test_flash_descriptor_views_preserve_offsets_stride_and_aliases():
+    from vllm_ascend.models.glm5next.cache_views import view_glm_indexer_descriptor, view_glm_tail_descriptor
+
+    spec = AscendMLAAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.float8_e4m3fn,
+        state_content_bytes=132, scale_dim=1, scale_dtype=torch.float32,
+        tokens_per_state=4, model_version="glm5_next", cache_role="indexer",
+    )
+    stride, offset, blocks = 8192, 1024, 3
+    raw = torch.zeros(blocks * stride, dtype=torch.int8)
+    descriptor = KVCacheTensor(size=raw.numel(), layers=["indexer"], offset=offset,
+                               layer_stride=spec.page_size_bytes, block_stride=stride)
+    keys, scales = view_glm_indexer_descriptor(raw, spec, descriptor, blocks, 128)
+    assert keys.stride(0) == scales.stride(0) * 4 == stride
+    assert keys.data_ptr() == raw.data_ptr() + offset
+    assert scales.data_ptr() == keys.data_ptr() + 32 * 128
+    scales[1].fill_(3)
+    assert raw[offset + stride + 4096:offset + stride + 4224].view(torch.float32).eq(3).all()
+    assert raw[:offset].eq(0).all()
+    tail = AscendIndexerKPoolTailSpec(block_size=4, compress_ratio=4, num_kv_heads=1,
+                                     head_size=128, dtype=torch.float32)
+    (ring,) = view_glm_tail_descriptor(raw, tail, descriptor, blocks)
+    assert ring.stride(0) * ring.element_size() == stride
+    assert ring.data_ptr() == keys.data_ptr()
+    assert ring.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+
+
+def test_flash_descriptor_rejects_nonuniform_virtual_split():
+    from vllm_ascend.models.glm5next.cache_views import view_glm_indexer_descriptor
+
+    spec = make_specs()["model.layers.3.indexer.k_cache"]
+    descriptor = KVCacheTensor(size=2 * (spec.page_size_bytes + 1024), layers=["indexer"],
+                               offset=0, layer_stride=spec.page_size_bytes,
+                               block_stride=spec.page_size_bytes + 1024)
+    raw = torch.zeros(descriptor.size, dtype=torch.int8)
+    with pytest.raises(ValueError, match="virtually split"):
+        view_glm_indexer_descriptor(raw, spec, descriptor, 2, 128)
