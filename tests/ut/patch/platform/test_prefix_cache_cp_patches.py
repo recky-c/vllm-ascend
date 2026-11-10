@@ -150,7 +150,7 @@ def test_disabled_prefix_cache_preserves_private_tail_allocation(with_private_ta
     groups = [KVCacheGroupSpec(["full"], full)]
     if with_private_tail:
         tail = AscendIndexerKPoolTailSpec(
-            block_size=9, sliding_window=4, compress_ratio=4, num_kv_heads=1, head_size=8, dtype=torch.float32
+            block_size=9, compress_ratio=4, num_kv_heads=1, head_size=8, dtype=torch.float32
         )
         groups.append(KVCacheGroupSpec(["tail"], UniformTypeKVCacheSpecs.from_specs({"tail": tail})))
     cfg = KVCacheConfig(num_blocks=32, kv_cache_tensors=[], kv_cache_groups=groups)
@@ -204,7 +204,7 @@ def test_real_tail_coordinator_preserves_prefix_hit_and_private_lifecycle(wrappe
     register_ascend_kv_cache_specs()
     full = FullAttentionSpec(block_size=scheduler_size, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
     tail = AscendIndexerKPoolTailSpec(
-        block_size=4, sliding_window=4, compress_ratio=4, num_kv_heads=1, head_size=8, dtype=torch.float32
+        block_size=4, compress_ratio=4, num_kv_heads=1, head_size=8, dtype=torch.float32
     )
     group_tail = UniformTypeKVCacheSpecs.from_specs({"tail": tail}) if wrapped else tail
     cfg = KVCacheConfig(
@@ -261,7 +261,7 @@ def test_partial_hash_alignment_reaches_real_managers_and_cached_blocks():
         MambaSpec(block_size=64, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"),
         SlidingWindowMLASpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16, sliding_window=16),
         AscendIndexerKPoolTailSpec(
-            block_size=4, sliding_window=4, compress_ratio=4, num_kv_heads=1, head_size=8, dtype=torch.float32
+            block_size=4, compress_ratio=4, num_kv_heads=1, head_size=8, dtype=torch.float32
         ),
     ]
     cfg = KVCacheConfig(
@@ -569,11 +569,11 @@ def test_glm5_next_hashes_exclude_private_tail_after_engine_min_block_update(
         head_size=128,
         dtype=torch.bfloat16,
         model_version="glm5_next",
+        cache_role="indexer",
         **_ratio_kwargs(16),
     )
     state_spec = AscendIndexerKPoolTailSpec(
         block_size=16,
-        sliding_window=16,
         compress_ratio=16,
         num_kv_heads=1,
         head_size=256,
@@ -666,7 +666,6 @@ def test_glm5_next_single_cacheable_group_ignores_private_tail_block_size() -> N
     )
     tail_spec = AscendIndexerKPoolTailSpec(
         block_size=16,
-        sliding_window=16,
         compress_ratio=16,
         num_kv_heads=1,
         head_size=256,

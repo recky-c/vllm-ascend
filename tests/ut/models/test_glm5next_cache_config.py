@@ -83,6 +83,7 @@ def make_config():
         max_in_flight_tokens=32,
         cache_config=SimpleNamespace(
             num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
             mamba_cache_mode="none",
             enable_prefix_caching=False,
         ),
@@ -104,11 +105,11 @@ def make_specs(pool: int = 16):
             head_size=128,
             dtype=torch.bfloat16,
             model_version="glm5_next",
+            cache_role="indexer",
             **_ratio_kwargs(pool),
         ),
         "model.layers.3.indexer.tail_cache": AscendIndexerKPoolTailSpec(
             block_size=pool,
-            sliding_window=pool,
             compress_ratio=pool,
             num_kv_heads=1,
             head_size=128,
@@ -211,6 +212,7 @@ def test_fp8_shared_pages_preserve_tail_rows_and_kernel_scale_alignment():
         scale_dim=1,
         scale_dtype=torch.float32,
         model_version="glm5_next",
+        cache_role="indexer",
         tokens_per_state=4,
     )
     groups = get_glm5_next_kv_cache_groups(make_config(), specs)
@@ -250,6 +252,7 @@ def test_fp8_cache_budget_accounts_for_scales_tail_and_padding(block_size, looka
             scale_dim=1 if dtype == torch.float8_e4m3fn else 0,
             scale_dtype=torch.float32 if dtype == torch.float8_e4m3fn else torch.int8,
             model_version="glm5_next",
+            cache_role="indexer",
             tokens_per_state=4,
         )
         specs["model.layers.3.indexer.tail_cache"] = replace(
@@ -294,6 +297,12 @@ def test_pipeline_projection_supports_a_mamba_only_worker():
     assert plan.num_blocks == 10
     assert len(plan.kv_cache_tensors) == 1
     assert get_kv_cache_tensor_layers(plan.kv_cache_tensors[0]) == [local_mamba_name]
+
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+
+    direct = AscendKVCacheConfigBuilder().get_kv_cache_config_from_groups(config, projected_groups, 10)
+    assert direct.num_blocks == plan.num_blocks
+    assert direct.kv_cache_tensors == plan.kv_cache_tensors
 
 
 def test_missing_paired_cache_is_rejected():
@@ -369,6 +378,7 @@ def test_glm53_flash_indexer_owner_publishes_data_and_scale_bytes(pool, dtype, s
     owner.head_dim = 128
     owner.dtype = dtype
     owner.compress_ratio = pool
+    owner.cache_role = "indexer"
     spec = owner.get_kv_cache_spec(None)
     assert spec.head_size == 128
     assert spec.state_content_bytes == state_bytes
@@ -439,3 +449,67 @@ def test_glm53_flash_small_pool_does_not_pad_main_pool(large_owner):
     assert sum(tensor.size for tensor in physical.kv_cache_tensors) == 7 * cost
     assert {tensor.block_stride for tensor in physical.kv_cache_tensors} == {main_page, small_page}
     assert all(specs[name] is spec for name, spec in original.items())
+
+
+@pytest.mark.parametrize("num_blocks", [0, 7])
+@pytest.mark.parametrize("with_mamba", [False, True])
+def test_glm_builder_materializes_core_block_count_without_module_planner(monkeypatch, num_blocks, with_mamba):
+    from vllm.v1.core import kv_cache_planning
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+
+    config = make_config()
+    config.cache_config.num_gpu_blocks_override = 99
+    config.cache_config.prefix_cache_retention_interval = 128
+    config.kv_transfer_config = SimpleNamespace(kv_role="kv_producer")
+    specs = make_specs()
+    if not with_mamba:
+        specs = {name: spec for name, spec in specs.items() if not isinstance(spec, MambaSpec)}
+    groups = get_glm5_next_kv_cache_groups(config, specs)
+
+    def reject_module_planner(*args, **kwargs):
+        raise AssertionError("Flash builder must not call the module-level planner")
+
+    monkeypatch.setattr(kv_cache_planning, "get_kv_cache_config_from_groups", reject_module_planner)
+    builder = AscendKVCacheConfigBuilder()
+    plan = builder.get_kv_cache_config_from_groups(config, groups, num_blocks)
+    cost = builder._get_pool_bytes_per_block(config, groups)
+    assert plan.num_blocks == num_blocks
+    assert sum(tensor.size for tensor in plan.kv_cache_tensors) == num_blocks * cost
+    assert plan.kv_transfer_config is config.kv_transfer_config
+    assert plan.prefix_cache_retention_interval == 128
+    assert config.cache_config.num_gpu_blocks_override == 99
+    assert all(tensor.offset == tensor.layer_stride == 0 for tensor in plan.kv_cache_tensors)
+
+
+def test_glm_builder_delegates_non_flash_materialization(monkeypatch):
+    from vllm.v1.core.kv_cache_planning import DefaultKVCacheConfigBuilder
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+
+    config = make_config()
+    groups = []
+    expected = object()
+    calls = []
+
+    def default_builder(self, actual_config, actual_groups, num_blocks):
+        calls.append((actual_config, actual_groups, num_blocks))
+        return expected
+
+    monkeypatch.setattr(DefaultKVCacheConfigBuilder, "get_kv_cache_config_from_groups", default_builder)
+    assert AscendKVCacheConfigBuilder().get_kv_cache_config_from_groups(config, groups, 7) is expected
+    assert calls == [(config, groups, 7)]
+
+
+def test_glm_roles_are_not_inferred_from_compression():
+    from vllm_ascend.models.glm5next.cache_config import (
+        _is_glm5_next_indexer_spec,
+        _is_glm5_next_main_spec,
+    )
+
+    specs = make_specs()
+    indexer = specs["model.layers.3.indexer.k_cache"]
+    uncompressed_indexer = replace(indexer, tokens_per_state=1)
+    assert _is_glm5_next_indexer_spec(uncompressed_indexer)
+    assert not _is_glm5_next_main_spec(uncompressed_indexer)
+    specs["model.layers.3.indexer.k_cache"] = uncompressed_indexer
+    with pytest.raises(ValueError, match="uncompressed main and a compressed indexer"):
+        get_glm5_next_kv_cache_groups(make_config(), specs)

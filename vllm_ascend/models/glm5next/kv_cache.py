@@ -13,7 +13,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, SparseCacheRole
 from vllm.v1.request import Request
 
 from vllm_ascend.core.kv_cache_interface import (
@@ -94,7 +94,7 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
         if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise ValueError(f"GLM KPool cache requires BF16 or FP8, got {dtype}.")
         self.dtype = dtype
-        self.cache_role = cache_role
+        self.cache_role = SparseCacheRole(cache_role)
         self.cache_config = cache_config
         self.compress_ratio = compress_ratio
         self.prefix = prefix
@@ -125,6 +125,7 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
             scale_dtype=scale_dtype,
             cache_dtype_str=None,
             model_version="glm5_next",
+            cache_role=self.cache_role,
             indexes_kv_by_block_stride=True,
             **ratio_kwargs,
         )
@@ -180,7 +181,6 @@ class Glm5NextTailCache(nn.Module, AttentionLayerBase):
             head_size=self.head_dim,
             dtype=self.dtype,
             state_content_bytes=2 * self.head_dim * get_dtype_size(self.dtype),
-            sliding_window=self.compress_ratio,
             compress_ratio=self.compress_ratio,
         )
 

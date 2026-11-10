@@ -77,7 +77,6 @@ def make_kpool_tail_spec(block_size: int = 16) -> AscendIndexerKPoolTailSpec:
         num_kv_heads=1,
         head_size=8,
         dtype=torch.float32,
-        sliding_window=8,
         compress_ratio=8,
     )
 

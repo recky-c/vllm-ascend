@@ -307,8 +307,10 @@
 #       accounting.
 #    How:
 #       Both supported versions select AscendKVCacheConfigBuilder through
-#       NPUPlatform. Its default materialization delegates to the patched
-#       planning functions.
+#       NPUPlatform. GLM-Next materializes directly in the builder using
+#       Core-resolved block counts. Other layouts and legacy budget callers
+#       retain the patched planning functions. Both entries share the
+#       PD/DSpark config metadata bridge.
 #    Related PR:
 #       https://github.com/vllm-project/vllm/pull/53558
 #

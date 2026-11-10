@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SparseCacheRole,
     UniformTypeKVCacheSpecs,
 )
 
@@ -81,11 +82,19 @@ def _layer_indices(layer_names: tuple[str, ...]) -> tuple[int, ...] | None:
 
 
 def _is_glm5_next_main_spec(spec: KVCacheSpec) -> bool:
-    return isinstance(spec, MLAAttentionSpec) and _is_glm5_next_spec(spec) and get_kv_cache_compression_ratio(spec) == 1
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and _is_glm5_next_spec(spec)
+        and spec.cache_role == SparseCacheRole.SPARSE
+    )
 
 
 def _is_glm5_next_indexer_spec(spec: KVCacheSpec) -> bool:
-    return isinstance(spec, MLAAttentionSpec) and _is_glm5_next_spec(spec) and get_kv_cache_compression_ratio(spec) > 1
+    return (
+        isinstance(spec, MLAAttentionSpec)
+        and _is_glm5_next_spec(spec)
+        and spec.cache_role == SparseCacheRole.INDEXER
+    )
 
 
 def _is_glm5_next_tail_spec(spec: KVCacheSpec) -> bool:
@@ -177,6 +186,8 @@ def _create_glm5_next_attention_groups(
         assert isinstance(tail_spec, AscendIndexerKPoolTailSpec)
 
         compress_ratio = get_kv_cache_compression_ratio(indexer_spec)
+        if get_kv_cache_compression_ratio(main_spec) != 1 or compress_ratio <= 1:
+            raise ValueError("GLM-Next requires an uncompressed main and a compressed indexer cache.")
         if main_spec.block_size % compress_ratio:
             raise ValueError(
                 "GLM-Next logical block size must be divisible by the indexer "
@@ -405,14 +416,21 @@ def get_glm5_next_kv_cache_config(
     groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> KVCacheConfig:
-    """Describe one standard unpacked tensor per physical cache slot."""
+    """Compatibility entry for callers that provide a byte budget."""
+    bytes_per_block = get_glm5_next_pool_bytes_per_block(groups)
+    num_blocks = may_override_num_blocks(vllm_config, max(available_memory // bytes_per_block, 0))
+    return build_glm5_next_kv_cache_config(vllm_config, groups, num_blocks)
 
+
+def build_glm5_next_kv_cache_config(
+    vllm_config: VllmConfig,
+    groups: list[KVCacheGroupSpec],
+    num_blocks: int,
+) -> KVCacheConfig:
+    """Materialize the existing two pools with Core's resolved block count."""
     layout = _get_glm5_next_cache_layout(groups)
     if layout is None:
         raise ValueError("Expected GLM-Next cache groups.")
-
-    bytes_per_block = get_glm5_next_pool_bytes_per_block(groups)
-    num_blocks = may_override_num_blocks(vllm_config, max(available_memory // bytes_per_block, 0))
     tensors: list[KVCacheTensor] = []
 
     def make_tensor(size: int, layer_names: list[str], page_size: int) -> KVCacheTensor:
@@ -456,6 +474,7 @@ def get_glm5_next_kv_cache_config(
         num_blocks=num_blocks,
         kv_cache_tensors=tensors,
         kv_cache_groups=groups,
+        prefix_cache_retention_interval=getattr(vllm_config.cache_config, "prefix_cache_retention_interval", None),
     )
 
 
