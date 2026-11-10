@@ -7,24 +7,36 @@ Scope: MRV2, GLM and GLM-5.3-Flash. Hardware validation is deferred at the reque
 | upstream #21370 | main | Owners produce MLA/indexer specs; collection stops rebuilding specs. |
 | fork #11 | #21370 | Physical state bytes, including indexer scales and Flash tail state. |
 | fork #12 | #11 | Page alignment belongs to planning. |
-| fork #13 | #12 | Flash circular owner, sparse roles, physical config builder. |
-| fork #15 | #13 | Flash descriptor planning, shared backing allocation, owner runtime views and page-strided writes; includes former #14. |
+| fork #13 | #12 | Flash circular owner, sparse roles and Core block-count materialization; retain dedicated grouping. |
+| fork #15 | #13 | Descriptor-aware owner views and page-strided writes for the existing Flash two-pool layout; includes former #14. Generic grouping and packed allocation are withdrawn. |
 | fork #16 | #15 | Ordinary GLM indexer kernel-page K/scale layout, owner views, strided writes/reads and transfer metadata. |
 | fork #17 (WIP) | #16 | Complete ordinary GLM main MLA token-fused migration, including allocation and all affected consumers. Only view/store primitives are implemented so far. |
 
-Eight PRs were originally created. After consolidation there are seven open draft
-PRs: #14 is superseded by #15 and closed without deleting its branch. #15 contains
-both original commits and targets #13 directly. No code is removed by this reorganization.
+Eight PRs were originally created; seven remain open drafts. #14 is superseded
+by #15. The original commits are retained: #15 appends a withdrawal of its packed
+planning/allocation commit, rather than rewriting the earlier changes.
 
-#17 is the working PR for the complete main MLA migration, not a separately
-mergeable preparatory delivery. Keep it draft until allocation and all affected
-consumers are included. Seven is the current number of review boundaries, not a
-claim that all work from the three analysis documents is complete.
+## Current scope decision: defer GLM Flash grouping unification
 
-The base chain also records the chosen integration order. In particular, #16
-uses the paged-store primitive introduced by former #14; ordinary indexer storage
-does not intrinsically require Flash packed allocation. Keeping #16 after the
-combined #15 makes the shared primitive available without duplicating it.
+`get_glm5_next_kv_cache_groups` keeps its dedicated model-specific path. Unifying
+it with upstream generic grouping is deferred and is not a prerequisite for the
+remaining Spec, planning and allocation work.
+
+- #12 retains page alignment in planning, including necessary dispatch to model-specific planners.
+- #13 retains explicit owner roles and materialization using Core's resolved block count. It does not replace Flash grouping.
+- #15 retains owner views that consume descriptor offsets, strides and explicit block counts from the existing two-pool plan.
+- #15 withdraws the block-outermost opt-in to upstream grouping, packed byte-cost accounting and one-shared-backing allocation together. The allocator compatibility module introduced for that path is also withdrawn.
+- #16 continues ordinary GLM indexer migration; it uses the paged-store primitive retained in #15, not Flash packed planning.
+- #17 remains the WIP ordinary GLM main MLA migration. Flash grouping unification must not be introduced as its prerequisite.
+
+The dedicated Flash grouping and existing two-pool allocation can remain in
+place. Default Flash layout switching, removal of the dedicated grouping path,
+and its coupled packed allocation are deferred work, not missing requirements
+for this active chain.
+
+#17 must stay draft until its allocation and affected consumers are complete.
+The seven open review boundaries do not mean that all remaining ordinary GLM
+migration work has been completed.
 
 ## Indexer contract (#16)
 
@@ -54,7 +66,7 @@ not routed into these descriptor views yet. Before enabling it, fused MLAPO and
 PROLOG writers, attention readers, PCP/DCP, host offload and transfer consumers
 must agree on this layout within #17 before that PR is ready to merge. A partial native-write fallback
 is insufficient because fused weight preparation can discard the original weights.
-The unfinished default Flash planner replacement is also excluded from this PR.
+Flash grouping unification and the coupled packed allocator are explicitly deferred outside this PR.
 
 This decision supersedes the earlier requirement to preserve component-major
 main MLA bytes. It is recorded in all three local analysis documents on 2026-11-10.
@@ -65,8 +77,8 @@ whose MLA cache kernel writes NoPE then RoPE within each token record.
 
 This is a draft code chain, not a claim that every target in the analysis documents is enabled or verified:
 
-- Flash packed planning is selected by the existing block-outermost layout setting. Its legacy two-pool path remains. Packed Flash currently requires 128-token blocks and does not support KVPP or host offload.
+- Flash retains its dedicated grouping and two-pool allocation. This chain no longer introduces the block-outermost packed opt-in or its additional block-size/KVPP/offload restrictions.
 - Ordinary indexer page layout is selected for GLM with no connector or a modern Mooncake Pull/Push connector and no sparse host offload. Other connectors and host offload retain their existing pool ABI. Their wire/copy contracts require a separate migration before enabling page layout.
 - Ordinary GLM main MLA allocation has not been converted to the Flash shared-backing path. This PR does not claim that the entire generic allocation migration is complete.
 - Tests were added but not run. Before merging, validate byte/alias boundaries, graph replay stores, INT8/FP8/C4 QLI reads, DCP/PCP, KVPP, Mooncake cross-rank transfers and GLM model outputs on the matching Ascend runtimes.
-- Switching the default Flash layout and deleting compatibility branches should follow that validation. These follow-ups are not hidden inside the PR count above.
+- Flash grouping unification and coupled default-layout changes are deferred by scope decision, independently of validation. They are not prerequisites for the active chain.
