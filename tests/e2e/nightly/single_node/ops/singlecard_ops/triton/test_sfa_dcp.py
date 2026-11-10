@@ -279,3 +279,40 @@ def test_page_interleaved_indexer_store_preserves_padding_and_other_pages(fused)
         assert scales[slot // 128, slot % 128, 0, 0].item() == row + 0.5
     assert torch.all(backing[2 * spec.page_size_bytes:3 * spec.page_size_bytes] == 19)
     assert torch.all(backing[size:] == 19)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_token_fused_mla_store_preserves_other_component_and_padding(dtype):
+    from vllm.v1.kv_cache_interface import KVCacheTensor
+
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+    from vllm_ascend.models.glm5next.cache_views import view_glm_main_descriptor
+    from vllm_ascend.ops.triton.paged_cache_store import store_paged_cache
+
+    torch.npu.set_device(0)
+    blocks, tokens, nope_dim, rope_dim = 3, 128, 128, 64
+    width = nope_dim + rope_dim
+    spec = AscendMLAAttentionSpec(
+        block_size=tokens, num_kv_heads=1, head_size=width, dtype=dtype,
+    )
+    offset, padding = 32, 64
+    stride = spec.page_size_bytes + padding
+    expected = torch.full((offset + blocks * stride,), 19, dtype=torch.uint8)
+    backing = expected.to("npu")
+    descriptor = KVCacheTensor(
+        size=backing.numel(), layers=["main"], offset=offset,
+        layer_stride=spec.page_size_bytes, block_stride=stride,
+    )
+    nope, rope = view_glm_main_descriptor(backing, spec, descriptor, blocks, tokens, nope_dim, rope_dim)
+    selected = [0, 127, 128, blocks * tokens - 1, -1, blocks * tokens]
+    slots = torch.tensor(selected, dtype=torch.int64, device="npu")
+    for component, start, component_width in [(nope, 0, nope_dim), (rope, nope_dim, rope_dim)]:
+        values = torch.arange(len(selected) * component_width).reshape(len(selected), component_width).to(dtype)
+        store_paged_cache(values.to("npu"), slots, component)
+        for row, slot in enumerate(selected):
+            if 0 <= slot < blocks * tokens:
+                address = offset + slot // tokens * stride + (slot % tokens * width + start) * 2
+                expected[address:address + component_width * 2].copy_(values[row].view(torch.uint8))
+        # Compare all bytes after each component write, including untouched
+        # records, the other component, descriptor gaps and invalid slots.
+        assert torch.equal(backing.cpu(), expected)
