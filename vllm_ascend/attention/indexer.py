@@ -40,10 +40,12 @@ from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
+from vllm_ascend.ops.triton.paged_cache_store import store_paged_cache
 from vllm_ascend.ops.triton.sfa_indexer_store import store_indexer_key_scale
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.utils import (
     _round_up,
+    _is_glm_model,
     enable_sfa_dcp_replicated_indexer,
     is_pd_decode_recompute_scheduler_enabled,
 )
@@ -91,6 +93,23 @@ class AscendSFAIndexerMetadata:
     topk_selector: Any | None = None
 
 
+def use_page_interleaved_indexer(vllm_config: VllmConfig) -> bool:
+    """GLM pages use K/scale records when the transfer contract carries strides.
+
+    Older connectors and host offload retain their existing pool ABI until
+    their wire/copy contracts are migrated. This is a format choice at the
+    owner, never a reinterpretation decided by the allocator.
+    """
+    if not _is_glm_model(vllm_config.model_config):
+        return False
+    transfer = vllm_config.kv_transfer_config
+    if transfer is not None and transfer.kv_connector not in ("MooncakePullConnector", "MooncakePushConnector"):
+        return False
+    if get_ascend_config().sparse_kv_offload_config.enabled:
+        return False
+    return True
+
+
 class AscendSFAIndexerCache(DeepseekV32IndexerCache):
     """Cache owner whose storage spec is supplied by its indexer backend."""
 
@@ -111,6 +130,11 @@ class AscendSFAIndexerCache(DeepseekV32IndexerCache):
         if not self.cache_enabled:
             return None
         return replace(self.cache_spec, block_size=vllm_config.cache_config.block_size)
+
+    def get_kv_cache_runtime_view(self, backing, spec, num_blocks, kernel_block_size):
+        from vllm_ascend.attention.indexer_cache import view_indexer_pages
+
+        return view_indexer_pages(backing, spec, num_blocks, kernel_block_size)
 
     def get_attn_backend(self):
         return AscendSFAIndexerBackend
@@ -306,6 +330,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         # storage layout supplied by this backend.
         spec_fields = {field.name: getattr(source, field.name) for field in fields(source) if field.init}
         spec_fields.update(
+            page_interleaved=use_page_interleaved_indexer(vllm_config),
             head_size=head_size,
             dtype=dtype,
             cache_dtype_str=cache_dtype_str,
@@ -368,11 +393,14 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
             indexer_k_cache = indexer_k_cache.view(torch.uint8)
             k_li = k_li.view(torch.uint8)
-        DeviceOperator.scatter_cache(
-            indexer_k_cache.view(-1, k_li.shape[-1]),
-            slot_mapping.view(-1, 1),
-            k_li.view(-1, k_li.shape[-1]),
-        )
+        if self.k_cache.cache_spec.page_interleaved:
+            store_paged_cache(k_li.view(-1, k_li.shape[-1]), slot_mapping, indexer_k_cache)
+        else:
+            DeviceOperator.scatter_cache(
+                indexer_k_cache.view(-1, k_li.shape[-1]),
+                slot_mapping.view(-1, 1),
+                k_li.view(-1, k_li.shape[-1]),
+            )
         if self.enable_sparse_li_quant:
             assert k_li_scale is not None
             # C4 scale is multi-dimensional (b*s, d/64, 2); C8 is (b*s, 1).
@@ -382,11 +410,14 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             if indexer_scale_cache.dtype == torch.float8_e8m0fnu:
                 indexer_scale_cache = indexer_scale_cache.view(torch.uint8)
                 k_li_scale = k_li_scale.view(torch.uint8)
-            DeviceOperator.scatter_cache(
-                indexer_scale_cache.view(-1, *scale_per_token),
-                slot_mapping.view(-1, 1),
-                k_li_scale.view(-1, *scale_per_token),
-            )
+            if self.k_cache.cache_spec.page_interleaved:
+                store_paged_cache(k_li_scale, slot_mapping, indexer_scale_cache)
+            else:
+                DeviceOperator.scatter_cache(
+                    indexer_scale_cache.view(-1, *scale_per_token),
+                    slot_mapping.view(-1, 1),
+                    k_li_scale.view(-1, *scale_per_token),
+                )
 
     def forward_k(
         self,
@@ -584,6 +615,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         topk_selector = getattr(indexer_metadata, "topk_selector", None)
         if topk_selector is not None:
             return topk_selector(q_li, weights, self, indexer_metadata, q_li_scale)
+        if self.k_cache.cache_spec.page_interleaved and self.enable_sparse_li_quant:
+            from vllm_ascend.attention.indexer_cache import select_paged_indexer_topk
+
+            return select_paged_indexer_topk(
+                q_li, q_li_scale, q_li_shape_ori, weights, self.k_cache.kv_cache,
+                indexer_metadata, self.enable_sparse_li_c4,
+            )
         return DeviceOperator.indexer_select_post_process(
             q_li,
             q_li_scale,

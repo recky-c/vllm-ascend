@@ -339,6 +339,7 @@ class MooncakeBaseConnectorWorker:
                 shared_page_metadata = (
                     self._get_shared_page_metadata(caches)
                     if isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+                    and not isinstance(spec, AscendSFAIndexerCacheSpec)
                     else None
                 )
                 if shared_page_metadata is not None and _is_component_major_mla_binding(spec, caches):

@@ -250,3 +250,32 @@ def test_native_quantized_cache_bytes_and_changing_graph_slots(capacity, slot_dt
             assert bool((backing[-64:] == 19).all())
         retained.append((graph, backing, keys, scales, slots))
     torch.npu.synchronize()
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_page_interleaved_indexer_store_preserves_padding_and_other_pages(fused):
+    from vllm_ascend.ops.triton.paged_cache_store import store_paged_cache
+    from vllm_ascend.attention.indexer_cache import view_indexer_pages
+    from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+
+    torch.npu.set_device(0)
+    spec = AscendSFAIndexerCacheSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.int8,
+        scale_dim=1, scale_dtype=torch.float16, cache_sparse_li_c8=True, page_interleaved=True,
+    )
+    size = 4 * spec.page_size_bytes
+    backing = torch.full((size + 32,), 19, dtype=torch.int8, device="npu")
+    keys, scales = view_indexer_pages(backing[:size], spec, 4, 128)
+    slots = torch.tensor([0, 127, 128, 511, -1], dtype=torch.int64, device="npu")
+    values = torch.arange(5 * 128, device="npu").to(torch.int8).view(5, 128)
+    scale_values = torch.arange(5, dtype=torch.float32, device="npu").view(5, 1) + 0.5
+    if fused:
+        store_indexer_key_scale(values, scale_values, slots, keys, scales)
+    else:
+        store_paged_cache(values, slots, keys)
+        store_paged_cache(scale_values.half(), slots, scales)
+    for row, slot in enumerate([0, 127, 128, 511]):
+        assert torch.equal(keys[slot // 128, slot % 128, 0], values[row])
+        assert scales[slot // 128, slot % 128, 0, 0].item() == row + 0.5
+    assert torch.all(backing[2 * spec.page_size_bytes:3 * spec.page_size_bytes] == 19)
+    assert torch.all(backing[size:] == 19)

@@ -57,3 +57,63 @@ def test_mixed_views_share_one_allocation_and_keep_transfer_geometry(c8_first, r
     data.fill_(-3)
     scales.fill_(2)
     assert torch.all(data == -3) and torch.all(scales == 2)
+
+
+@pytest.mark.parametrize("replication", [1, 2, 4])
+@pytest.mark.parametrize("manager_block_size", [128, 256])
+@pytest.mark.parametrize("c4", [False, True])
+def test_page_indexer_components_alias_and_preserve_neighbor_pages(replication, manager_block_size, c4):
+    from vllm_ascend.attention.indexer_cache import view_indexer_pages
+
+    # uint8 exercises the packed C4 byte ABI without requiring FP4 arithmetic.
+    key_width = 64 if c4 else 128
+    scale_dim = 4 if c4 else 1
+    scale_dtype = torch.uint8 if c4 else torch.float16
+    spec = AscendSFAIndexerCacheSpec(
+        block_size=manager_block_size, num_kv_heads=1, head_size=128,
+        dtype=torch.uint8 if c4 else torch.int8,
+        state_content_bytes=key_width + scale_dim * torch.tensor([], dtype=scale_dtype).element_size(),
+        scale_dim=scale_dim, scale_dtype=scale_dtype, cache_sparse_li_c4=c4,
+        cache_sparse_li_c8=not c4, page_interleaved=True,
+        sfa_dcp_replicated_indexer_size=replication,
+    )
+    size = 3 * spec.page_size_bytes
+    backing = torch.full((size + 32,), 19, dtype=torch.uint8)
+    keys, scales = view_indexer_pages(backing[:size], spec, 3, 128)
+    pages = 3 * manager_block_size // 128 * replication
+    assert keys.shape == (pages, 128, 1, key_width)
+    if c4:
+        assert scales.shape == (pages, 128, 1, 2, 2)
+    page_bytes = spec.page_size_bytes // (manager_block_size // 128 * replication)
+    assert keys.stride(0) * keys.element_size() == page_bytes
+    assert scales.stride(0) * scales.element_size() == page_bytes
+    assert scales.data_ptr() - keys.data_ptr() == 128 * key_width
+    assert keys.untyped_storage().data_ptr() == scales.untyped_storage().data_ptr()
+    keys[1].fill_(7)
+    scales[1].fill_(2)
+    assert torch.all(backing[:page_bytes] == 19)
+    assert torch.all(backing[2 * page_bytes:] == 19)
+    assert torch.all(keys[1] == 7) and torch.all(scales[1] == 2)
+
+
+def test_shared_page_indexer_slot_keeps_explicit_layer_capacity():
+    from vllm_ascend.attention.indexer_cache import view_indexer_pages
+    from dataclasses import replace
+
+    small = AscendSFAIndexerCacheSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.int8,
+        scale_dim=1, scale_dtype=torch.float16, cache_sparse_li_c8=True, page_interleaved=True,
+    )
+    large = replace(small, block_size=256)
+    allocations = []
+
+    def allocate(size):
+        allocations.append(size)
+        return torch.zeros(size, dtype=torch.int8)
+
+    raw = allocate_shared_indexer_cache({"small": small, "large": large}, 3, allocate)
+    assert allocations == [3 * large.page_size_bytes]
+    small_keys, _ = view_indexer_pages(raw["small"], small, 3, 128)
+    large_keys, _ = view_indexer_pages(raw["large"], large, 3, 128)
+    assert small_keys.shape[0] == 3 and large_keys.shape[0] == 6
+    assert small_keys.data_ptr() == large_keys.data_ptr()

@@ -977,7 +977,11 @@ def _allocate_kv_cache(
         # Indexer reshape expects a tuple even without a quantization scale.
         # Single-component main MLA caches still use a raw Tensor.
         return {
-            name: parts if isinstance(specs[name], AscendSFAIndexerCacheSpec) or len(parts) > 1 else parts[0]
+            name: parts if (
+                len(parts) > 1 or (
+                    isinstance(specs[name], AscendSFAIndexerCacheSpec) and not specs[name].page_interleaved
+                )
+            ) else parts[0]
             for name, parts in caches.items()
         }
     is_dsv4_model = _is_dsv4_model(vllm_config)
@@ -1283,6 +1287,11 @@ def _allocate_kv_cache(
         assert isinstance(example_spec, AttentionSpec)
 
         if isinstance(example_spec, AscendSFAIndexerCacheSpec):
+            if example_spec.page_interleaved:
+                for name in shared_names:
+                    size = kv_cache_config.num_blocks * layer_kv_cache_spec[name].page_size_bytes
+                    kv_cache_raw_tensors[name] = _allocate_int8_cache_tensor(size, alignment, device)
+                continue
             num_blocks = kv_cache_tensor.size // example_spec.page_size_bytes
             # vLLM #51718 packs all group layers into one tensor;
             # kv_cache_config.num_blocks is the per-layer block count.
@@ -1751,6 +1760,12 @@ def _reshape_kv_cache_v2(
             if isinstance(group_spec, AscendSFAIndexerCacheSpec):
                 assert kv_cache_config is not None
                 raw_cache = kv_cache_raw_tensors[layer_name]
+                if kv_cache_spec.page_interleaved:
+                    owner = vllm_config.compilation_config.static_forward_context[layer_name]
+                    kv_caches[layer_name] = owner.get_kv_cache_runtime_view(
+                        raw_cache, kv_cache_spec, kv_cache_config.num_blocks, kernel_block_size,
+                    )
+                    continue
                 assert isinstance(raw_cache, tuple)
 
                 if group_spec.scale_dim:
