@@ -1161,7 +1161,6 @@ def test_preempt_offload_ring_uses_single_private_block(glm_tail, uniform, load_
             num_kv_heads=1,
             head_size=8,
             dtype=torch.float32,
-            sliding_window=4,
             compress_ratio=4,
         )
     else:

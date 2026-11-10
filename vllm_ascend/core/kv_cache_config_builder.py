@@ -5,8 +5,8 @@
 vLLM plans the KV cache in ``vllm.v1.core.kv_cache_planning`` and resolves the
 planner through ``Platform.get_kv_cache_config_builder_cls`` (see
 ``NPUPlatform.get_kv_cache_config_builder_cls``). Ascend-specific grouping and
-pool accounting live here; materialization stays in the patched planning
-functions (see ``patch_kv_cache_utils.py``), which
+pool accounting live here. GLM-Next materializes directly through this builder;
+other layouts retain the patched planning functions, which
 ``DefaultKVCacheConfigBuilder.get_kv_cache_config_from_groups`` calls with the
 Core-resolved ``num_blocks``.
 """
@@ -23,6 +23,7 @@ from vllm.v1.core.kv_cache_planning import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
@@ -31,7 +32,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_planning import align_hybrid_kv_cache_specs
+from vllm_ascend.core.kv_cache_planning import (
+    align_hybrid_kv_cache_specs,
+    attach_kv_cache_config_metadata,
+)
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_pool_bytes_per_block,
     group_cache_specs,
@@ -40,6 +44,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 )
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
+    build_glm5_next_kv_cache_config,
     get_glm5_next_kv_cache_groups,
     get_glm5_next_pool_bytes_per_block,
 )
@@ -96,6 +101,19 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
             return kimi_k3_groups
 
         return super().get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+    def get_kv_cache_config_from_groups(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_groups: list[KVCacheGroupSpec],
+        num_blocks: int,
+    ) -> KVCacheConfig:
+        if _get_glm5_next_cache_layout(kv_cache_groups) is None:
+            return super().get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks)
+        # Core has already converged the block count across workers. Do not
+        # turn it back into a budget or apply num_gpu_blocks_override again.
+        config = build_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, num_blocks)
+        return attach_kv_cache_config_metadata(vllm_config, config)
 
     def _get_pool_bytes_per_block(
         self,

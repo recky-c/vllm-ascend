@@ -102,12 +102,12 @@ def _make_specs(main_head_size=4):
             head_size=4,
             dtype=torch.bfloat16,
             model_version="glm5_next",
+            cache_role="indexer",
             indexes_kv_by_block_stride=True,
             **_ratio_kwargs(2),
         ),
         STATE: AscendIndexerKPoolTailSpec(
             block_size=2,
-            sliding_window=2,
             compress_ratio=2,
             num_kv_heads=1,
             head_size=1,
