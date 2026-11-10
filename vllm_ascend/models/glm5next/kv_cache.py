@@ -120,6 +120,11 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
             **ratio_kwargs,
         )
 
+    def get_kv_cache_runtime_view(self, backing, spec, descriptor, num_blocks, kernel_block_size):
+        from vllm_ascend.models.glm5next.cache_views import view_glm_indexer_descriptor
+
+        return view_glm_indexer_descriptor(backing, spec, descriptor, num_blocks, kernel_block_size)
+
     def get_attn_backend(self):
         from vllm_ascend.attention.indexer_kpool import (
             AscendIndexerKPoolBackend,
@@ -172,6 +177,11 @@ class Glm5NextTailCache(nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
         )
+
+    def get_kv_cache_runtime_view(self, backing, spec, descriptor, num_blocks, kernel_block_size):
+        from vllm_ascend.models.glm5next.cache_views import view_glm_tail_descriptor
+
+        return view_glm_tail_descriptor(backing, spec, descriptor, num_blocks)
 
     def get_attn_backend(self):
         from vllm_ascend.attention.indexer_kpool import (

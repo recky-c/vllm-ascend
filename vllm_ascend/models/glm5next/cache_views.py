@@ -3,11 +3,12 @@
 """Pooled-cache physical views for GLM-Next."""
 
 from collections.abc import Callable
+from math import prod
 
 import torch
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, KVCacheTensor
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
@@ -166,3 +167,89 @@ def view_glm5_next_cache(
         if v_dim == 0:
             return _view_nope_main_mla_cache(kv_cache_spec, raw_cache, attn_backend, kernel_block_size)
     return None
+
+
+def view_cache_component(
+    backing: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    num_blocks: int,
+    shape: tuple[int, ...],
+    offset: int,
+    block_stride: int,
+) -> torch.Tensor:
+    """Interpret one page component; offsets and strides are byte quantities."""
+    width = get_dtype_size(dtype)
+    content_bytes = prod(shape) * width
+    if backing.ndim != 1 or backing.element_size() != 1:
+        raise ValueError("Descriptor views require a flat byte backing")
+    if offset < 0 or block_stride < content_bytes or offset % width or block_stride % width:
+        raise ValueError("Cache component has invalid or misaligned descriptor geometry")
+    end = offset if num_blocks == 0 else offset + (num_blocks - 1) * block_stride + content_bytes
+    if end > backing.numel():
+        raise ValueError("Cache component exceeds its backing allocation")
+    # Narrow first so dtype reinterpretation also works for an aligned owner
+    # region in a backing whose total byte count is not divisible by dtype.
+    region = backing[offset:end].view(dtype)
+    strides = _row_major_strides((num_blocks, *shape))
+    strides[0] = block_stride // width
+    return torch.as_strided(region, (num_blocks, *shape), tuple(strides))
+
+
+def view_glm_indexer_descriptor(backing, spec, descriptor, num_blocks, kernel_block_size):
+    """Expose K/scale within each kernel page, preserving the planned stride."""
+    ratio = get_kv_cache_compression_ratio(spec)
+    if kernel_block_size <= 0 or spec.block_size % kernel_block_size or kernel_block_size % ratio:
+        raise ValueError("Indexer manager/kernel blocks must preserve compression boundaries")
+    pieces = spec.block_size // kernel_block_size
+    if pieces > 1 and descriptor.block_stride != spec.page_size_bytes:
+        raise ValueError("Packed indexer pages cannot be virtually split across other owners")
+    if descriptor.block_stride % pieces:
+        raise ValueError("Indexer stride must divide into complete kernel pages")
+    stride = descriptor.block_stride // pieces
+    states = kernel_block_size // ratio
+    shape = (states, spec.num_kv_heads, get_kv_cache_storage_head_size(spec))
+    key_bytes = prod(shape) * get_dtype_size(spec.dtype)
+    keys = view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
+                                shape=shape, offset=descriptor.offset, block_stride=stride)
+    if not spec.scale_dim:
+        return (keys,)
+    scale_shape = (states, spec.num_kv_heads, spec.scale_dim)
+    scale_bytes = prod(scale_shape) * get_dtype_size(spec.scale_dtype)
+    if key_bytes + scale_bytes > stride:
+        raise ValueError("Indexer K and scales overlap the next physical page")
+    scales = view_cache_component(backing, dtype=spec.scale_dtype, num_blocks=num_blocks * pieces,
+                                  shape=scale_shape, offset=descriptor.offset + key_bytes, block_stride=stride)
+    return keys, scales
+
+
+def view_glm_tail_descriptor(backing, spec, descriptor, num_blocks):
+    return (view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks,
+                                shape=(spec.block_size, 2 * spec.head_size),
+                                offset=descriptor.offset, block_stride=descriptor.block_stride),)
+
+
+def view_glm_main_descriptor(backing, spec, descriptor, num_blocks, kernel_block_size, nope_dim, rope_dim):
+    if kernel_block_size <= 0 or spec.block_size % kernel_block_size:
+        raise ValueError("MLA manager block must contain complete kernel blocks")
+    pieces = spec.block_size // kernel_block_size
+    if pieces > 1 and descriptor.block_stride != spec.page_size_bytes:
+        raise ValueError("Packed MLA pages cannot be virtually split across other owners")
+    if descriptor.block_stride % pieces:
+        raise ValueError("MLA stride must divide into complete kernel pages")
+    stride = descriptor.block_stride // pieces
+    if spec.uses_packed_sfa_main_cache:
+        return (view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
+                                    shape=(kernel_block_size, spec.num_kv_heads, get_kv_cache_storage_head_size(spec)),
+                                    offset=descriptor.offset, block_stride=stride),)
+    shape = (kernel_block_size, spec.num_kv_heads, nope_dim)
+    key_bytes = prod(shape) * get_dtype_size(spec.dtype)
+    rope_bytes = kernel_block_size * spec.num_kv_heads * rope_dim * get_dtype_size(spec.dtype)
+    if key_bytes + rope_bytes > stride:
+        raise ValueError("MLA components exceed the physical kernel page")
+    keys = view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
+                               shape=shape, offset=descriptor.offset, block_stride=stride)
+    rope = view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
+                               shape=(kernel_block_size, spec.num_kv_heads, rope_dim),
+                               offset=descriptor.offset + key_bytes, block_stride=stride)
+    return keys, rope

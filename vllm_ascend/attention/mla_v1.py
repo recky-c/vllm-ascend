@@ -159,6 +159,14 @@ class AscendMLAAttention(MLAAttention):
 
     supports_pcp_dcp: ClassVar[bool] = True
 
+    def get_kv_cache_runtime_view(self, backing, spec, descriptor, num_blocks, kernel_block_size):
+        from vllm_ascend.models.glm5next.cache_views import view_glm_main_descriptor
+
+        return view_glm_main_descriptor(
+            backing, spec, descriptor, num_blocks, kernel_block_size,
+            self.kv_lora_rank, self.qk_rope_head_dim,
+        )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AscendMLAAttentionSpec:
         """Publish the complete cache demand using the selected execution format."""
         spec = super().get_kv_cache_spec(vllm_config)

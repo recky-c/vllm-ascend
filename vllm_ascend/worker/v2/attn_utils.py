@@ -1521,6 +1521,17 @@ def _reshape_kv_cache_v2(
     is_dsv4_model = _is_dsv4_model(vllm_config)
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     kv_caches: dict[str, Any] = {}
+    flash_owners = {}
+    flash_descriptors = {}
+    if any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_kv_cache_spec.values()):
+        flash_owners = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+        for descriptor in kv_cache_config.kv_cache_tensors:
+            for index, name in enumerate(get_kv_cache_tensor_layers(descriptor)):
+                flash_descriptors[name] = replace(
+                    descriptor, layers=[name],
+                    offset=descriptor.offset + index * descriptor.layer_stride,
+                )
+
     # Qwen4 QSA hybrids (Qwen3.8 Flash Next) reconstruct every owner's
     # view from the same deterministic layout that _allocate_kv_cache used:
     # Shared slabs hold QSA/GDN slots and indexer regions; PLE/hidden banks are private.
@@ -1568,6 +1579,17 @@ def _reshape_kv_cache_v2(
                 continue
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
+            owner = flash_owners.get(layer_name)
+            if owner is not None and hasattr(owner, "get_kv_cache_runtime_view"):
+                raw = kv_cache_raw_tensors[layer_name]
+                if not isinstance(raw, torch.Tensor):
+                    raise ValueError("GLM descriptor views require one raw byte backing")
+                kv_caches[layer_name] = owner.get_kv_cache_runtime_view(
+                    raw, kv_cache_spec, flash_descriptors[layer_name], kv_cache_config.num_blocks,
+                    kernel_block_sizes[group.kv_cache_group_id],
+                )
+                continue
+
 
             if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
                 raw_cache = kv_cache_raw_tensors[layer_name]
