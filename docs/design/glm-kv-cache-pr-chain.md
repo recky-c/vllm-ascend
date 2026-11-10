@@ -8,12 +8,23 @@ Scope: MRV2, GLM and GLM-5.3-Flash. Hardware validation is deferred at the reque
 | fork #11 | #21370 | Physical state bytes, including indexer scales and Flash tail state. |
 | fork #12 | #11 | Page alignment belongs to planning. |
 | fork #13 | #12 | Flash circular owner, sparse roles, physical config builder. |
-| fork #14 | #13 | Flash descriptor-aware owner runtime views and page-strided writes. |
-| fork #15 | #14 | Standard Flash packed planning and one shared backing when block-outermost layout is selected. |
+| fork #15 | #13 | Flash descriptor planning, shared backing allocation, owner runtime views and page-strided writes; includes former #14. |
 | fork #16 | #15 | Ordinary GLM indexer kernel-page K/scale layout, owner views, strided writes/reads and transfer metadata. |
-| current PR | #16 | Upstream token-fused MLA descriptor views and token-strided component stores; ordinary MLA activation remains a separate atomic migration. |
+| fork #17 (WIP) | #16 | Complete ordinary GLM main MLA token-fused migration, including allocation and all affected consumers. Only view/store primitives are implemented so far. |
 
-Eight PRs have been prepared in this chain. This count describes the current delivery, not completion of the three analysis documents.
+Eight PRs were originally created. After consolidation there are seven open draft
+PRs: #14 is superseded by #15 and closed without deleting its branch. #15 contains
+both original commits and targets #13 directly. No code is removed by this reorganization.
+
+#17 is the working PR for the complete main MLA migration, not a separately
+mergeable preparatory delivery. Keep it draft until allocation and all affected
+consumers are included. Seven is the current number of review boundaries, not a
+claim that all work from the three analysis documents is complete.
+
+The base chain also records the chosen integration order. In particular, #16
+uses the paged-store primitive introduced by former #14; ordinary indexer storage
+does not intrinsically require Flash packed allocation. Keeping #16 after the
+combined #15 makes the shared primitive available without duplicating it.
 
 ## Indexer contract (#16)
 
@@ -23,7 +34,7 @@ Stores address pages explicitly, including the fused native INT8 store. Quantize
 
 MooncakePullConnector and MooncakePushConnector retain separate K and scale transfer records. Each record publishes its own content length, true stride and physical-to-manager block scale; they are not collapsed into a misleading single K-shaped record. DCP block ID expansion is unchanged.
 
-## Token-fused MLA contract (current PR)
+## Token-fused MLA contract (#17, work in progress)
 
 The nonquantized main MLA descriptor view follows upstream's per-token layout:
 `[token 0 NoPE | RoPE][token 1 NoPE | RoPE]...` within each block.
@@ -37,11 +48,11 @@ The generic paged store accepts these token-strided component aliases and checks
 that each component is contiguous within a token. It addresses block and token
 strides separately, preserving the other component and descriptor padding.
 
-This PR prepares the view/store primitives. Existing Flash NoPE-only records have
+The current implementation only prepares the view/store primitives. Existing Flash NoPE-only records have
 zero RoPE width, so their byte ordering is unchanged. Ordinary GLM main MLA is
 not routed into these descriptor views yet. Before enabling it, fused MLAPO and
 PROLOG writers, attention readers, PCP/DCP, host offload and transfer consumers
-must agree on this layout in the same enabling PR. A partial native-write fallback
+must agree on this layout within #17 before that PR is ready to merge. A partial native-write fallback
 is insufficient because fused weight preparation can discard the original weights.
 The unfinished default Flash planner replacement is also excluded from this PR.
 
