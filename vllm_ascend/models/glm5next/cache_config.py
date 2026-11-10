@@ -8,7 +8,6 @@ Physical storage uses standard unpacked KV cache descriptors with two page-size
 classes: main MLA/KDA pages and compressed-indexer/tail pages.
 """
 
-from copy import copy
 from dataclasses import dataclass, replace
 from math import lcm
 
@@ -18,9 +17,6 @@ from vllm.utils.torch_utils import get_dtype_size
 
 # Both supported versions expose planning helpers in kv_cache_planning.
 from vllm.v1.core.kv_cache_planning import (
-    _get_kv_cache_bytes_per_block,
-    get_kv_cache_groups as upstream_get_kv_cache_groups,
-    get_kv_cache_config_from_groups as upstream_get_kv_cache_config,
     create_kv_cache_group_specs,
     may_override_num_blocks,
 )
@@ -40,40 +36,6 @@ from vllm_ascend.core.kv_cache_interface import (
     get_kv_cache_compression_ratio,
     get_storage_block_size,
 )
-
-
-def uses_glm_packed_layout(vllm_config, specs_or_groups) -> bool:
-    """The existing layout selection opts into the standard packed contract."""
-    if isinstance(specs_or_groups, dict):
-        specs = specs_or_groups.values()
-    else:
-        specs = [
-            spec
-            for group in specs_or_groups
-            for spec in (
-                group.kv_cache_spec.kv_cache_specs.values()
-                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                else (group.kv_cache_spec,)
-            )
-        ]
-    if not any(_is_glm5_next_spec(spec) for spec in specs):
-        return False
-    resolve = getattr(vllm_config.cache_config, "get_resolved_kv_cache_layout", None)
-    return resolve is not None and resolve().is_block_outermost
-
-
-def get_glm_packed_bytes_per_block(vllm_config, groups) -> int:
-    return _get_kv_cache_bytes_per_block(groups, vllm_config.cache_config.get_resolved_kv_cache_layout())
-
-
-def build_glm_packed_config(vllm_config, groups, num_blocks):
-    # The upstream budget interface applies overrides. Core has already done
-    # that and converged ranks; use a local config copy to preserve its count.
-    config = copy(vllm_config)
-    config.cache_config = copy(vllm_config.cache_config)
-    config.cache_config.num_gpu_blocks_override = None
-    cost = get_glm_packed_bytes_per_block(config, groups)
-    return upstream_get_kv_cache_config(config, groups, num_blocks * cost)
 
 
 @dataclass(frozen=True)
@@ -413,15 +375,6 @@ def get_glm5_next_kv_cache_groups(
 
     # Each pool owns its padding. An indexer/tail page must not inflate the
     # independent main/KDA pool. Keep the owners' original specs unchanged.
-    if uses_glm_packed_layout(vllm_config, kv_cache_spec):
-        attention_specs = {name: spec for name, spec in kv_cache_spec.items() if not isinstance(spec, MambaSpec)}
-        _create_glm5_next_attention_groups(attention_specs)
-        for spec in attention_specs.values():
-            if isinstance(spec, MLAAttentionSpec) and spec.block_size != 128:
-                raise ValueError("GLM Flash packed layout requires --block-size 128; SFA cannot split packed pages")
-            if getattr(spec, "store_on_host", False):
-                raise ValueError("GLM Flash packed layout does not support host KV offload")
-        return upstream_get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
     kv_cache_spec = dict(kv_cache_spec)
     _align_glm5_next_cache_specs(kv_cache_spec)
     mamba_specs = {name: spec for name, spec in kv_cache_spec.items() if isinstance(spec, MambaSpec)}
@@ -452,8 +405,6 @@ def get_glm5_next_kv_cache_config(
     available_memory: int,
 ) -> KVCacheConfig:
     """Compatibility entry for callers that provide a byte budget."""
-    if uses_glm_packed_layout(vllm_config, groups):
-        return upstream_get_kv_cache_config(vllm_config, groups, available_memory)
     bytes_per_block = get_glm5_next_pool_bytes_per_block(groups)
     num_blocks = may_override_num_blocks(vllm_config, max(available_memory // bytes_per_block, 0))
     return build_glm5_next_kv_cache_config(vllm_config, groups, num_blocks)

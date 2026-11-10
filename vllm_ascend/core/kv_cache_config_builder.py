@@ -45,9 +45,6 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     build_glm5_next_kv_cache_config,
-    build_glm_packed_config,
-    get_glm_packed_bytes_per_block,
-    uses_glm_packed_layout,
     get_glm5_next_kv_cache_groups,
     get_glm5_next_pool_bytes_per_block,
 )
@@ -111,9 +108,6 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         kv_cache_groups: list[KVCacheGroupSpec],
         num_blocks: int,
     ) -> KVCacheConfig:
-        if uses_glm_packed_layout(vllm_config, kv_cache_groups):
-            config = build_glm_packed_config(vllm_config, kv_cache_groups, num_blocks)
-            return attach_kv_cache_config_metadata(vllm_config, config)
         if _get_glm5_next_cache_layout(kv_cache_groups) is None:
             return super().get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks)
         # Core has already converged the block count across workers. Do not
@@ -132,8 +126,6 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         single device backing size, which the DSV4 shared-tuple, the TurboQuant
         packed, the DSV4.1, and the GLM-Next layouts all violate.
         """
-        if uses_glm_packed_layout(vllm_config, kv_cache_groups):
-            return get_glm_packed_bytes_per_block(vllm_config, kv_cache_groups)
         if is_deepseek_v41_cache(kv_cache_groups):
             return get_deepseek_v41_pool_bytes_per_block(kv_cache_groups)
         if _get_glm5_next_cache_layout(kv_cache_groups) is not None:

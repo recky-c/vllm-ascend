@@ -40,8 +40,6 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 )
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
-    get_glm_packed_bytes_per_block,
-    uses_glm_packed_layout,
     get_glm5_next_kv_cache_config,
     get_glm5_next_max_memory_usage,
     get_glm5_next_pool_bytes_per_block,
@@ -478,8 +476,6 @@ def _ascend_get_packed_kv_cache_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Preserve Ascend's DSV4 grouping on the live packed-group hook."""
-    if uses_glm_packed_layout(vllm_config, kv_cache_spec):
-        return _orig_get_packed_kv_cache_groups(vllm_config, kv_cache_spec)
     if is_deepseek_v41_cache(kv_cache_spec):
         grouped_specs = group_cache_specs(kv_cache_spec)
         groups = make_cache_groups(grouped_specs)
@@ -632,8 +628,6 @@ def _ascend_pool_bytes_per_block(  # type: ignore[misc]
     layout, so using the upstream value changes ``num_blocks`` during the
     re-plan and leaves ranks inconsistent.
     """
-    if uses_glm_packed_layout(vllm_config, kv_cache_groups):
-        return get_glm_packed_bytes_per_block(vllm_config, kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.pool_bytes_per_block(kv_cache_groups)
     if is_deepseek_v41_cache(kv_cache_groups):
@@ -656,8 +650,6 @@ def _ascend_max_memory_usage_bytes_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Keep Ascend admission accounting with the upstream builder API."""
-    if uses_glm_packed_layout(vllm_config, kv_cache_groups):
-        return _orig_max_memory_usage_bytes_from_groups(builder, vllm_config, kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -699,9 +691,6 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
-    if uses_glm_packed_layout(vllm_config, kv_cache_groups):
-        config = _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
-        return attach_kv_cache_config_metadata(vllm_config, config)
     qwen_config = (
         None
         if vllm_version_is("0.28.0")
