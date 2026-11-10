@@ -1436,7 +1436,6 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
-    del layout
     vllm_config = get_current_vllm_config()
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
     shared_layers = {
@@ -1444,6 +1443,33 @@ def allocate_kv_cache_main(
         for layer_name, layer in attn_layers.items()
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
+
+    from vllm_ascend.models.glm5next.cache_config import uses_glm_packed_layout
+
+    if uses_glm_packed_layout(vllm_config, kv_cache_config.kv_cache_groups):
+        from vllm_ascend.worker.v2.descriptor_cache import allocate_descriptor_cache
+
+        if KVPPConfig.from_vllm_config(vllm_config).size > 1:
+            raise ValueError("GLM Flash packed backing requires KVPP size 1")
+        raw, manager_views = allocate_descriptor_cache(
+            kv_cache_config, device, layout,
+            lambda size: _allocate_int8_cache_tensor(size, 2 * 1024 * 1024, device),
+        )
+        specs = _get_layer_kv_cache_specs(kv_cache_config)
+        group_ids = {name: i for i, group in enumerate(kv_cache_config.kv_cache_groups) for name in group.layer_names}
+        runtime = {}
+        for descriptor in kv_cache_config.kv_cache_tensors:
+            for index, name in enumerate(get_kv_cache_tensor_layers(descriptor)):
+                owner = attn_layers[name]
+                if not hasattr(owner, "get_kv_cache_runtime_view"):
+                    raise ValueError(f"Owner {name} does not implement descriptor runtime binding")
+                single = replace(descriptor, layers=[name], offset=descriptor.offset + index * descriptor.layer_stride)
+                runtime[name] = owner.get_kv_cache_runtime_view(
+                    raw, specs[name], single, kv_cache_config.num_blocks, kernel_block_sizes[group_ids[name]],
+                )
+        for name, target in shared_layers.items():
+            runtime[name] = runtime[target]
+        return runtime
 
     raw_tensors = _allocate_kv_cache(
         kv_cache_config,
