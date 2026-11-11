@@ -649,6 +649,8 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
             vllm_config.scheduler_config.max_num_seqs, vllm_config.scheduler_config.max_num_batched_tokens
         )
         self._tail_inputs: dict[int, dict[str, torch.Tensor]] = {}
+        static_context = getattr(getattr(vllm_config, "compilation_config", None), "static_forward_context", {})
+        self._tail_owner = static_context.get(layer_names[0])
         self._pool_size = kv_cache_spec.compress_ratio
         self._page_rows = kv_cache_spec.page_size_bytes // (2 * kv_cache_spec.head_size * 4)
         self._lookahead = self.block_size > self._pool_size
@@ -663,6 +665,13 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
+        cache = getattr(self._tail_owner, "kv_cache", ())
+        # Before cache binding (profiling), retain the owner's page geometry.
+        if isinstance(cache, (list, tuple)) and cache and cache[0].ndim == 3:
+            tail = cache[0]
+            if tail.stride(0) % tail.shape[-1]:
+                raise ValueError("Tail block stride must contain whole K/gate rows")
+            self._page_rows = tail.stride(0) // tail.shape[-1]
         key = common_attn_metadata.slot_mapping.data_ptr()
         block_table = common_attn_metadata.block_table_tensor[:num_reqs, :1]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]

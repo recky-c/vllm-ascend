@@ -416,6 +416,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         shard_size = param.shape[2]
         default_weight_loader(param, loaded_weight.narrow(2, self.tp_rank * shard_size, shard_size))
 
+    def get_kv_cache_runtime_view(self, backing, spec, descriptor, num_blocks, kernel_block_size):
+        from vllm_ascend.models.glm5next.cache_views import view_cache_component
+
+        manager_view = view_cache_component(
+            backing, dtype=torch.int8, num_blocks=num_blocks,
+            shape=(1, 1, spec.state_content_size_bytes),
+            offset=descriptor.offset, block_stride=descriptor.block_stride,
+        )
+        # Reuse upstream's state-shape/dtype unpacking. It preserves page strides.
+        self.bind_kv_cache(manager_view)
+        return self.kv_cache
+
     def get_attn_backend(self):
         return Glm5NextGDNHostMetadataBackend
 
