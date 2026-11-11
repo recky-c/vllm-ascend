@@ -242,14 +242,18 @@ def view_glm_main_descriptor(backing, spec, descriptor, num_blocks, kernel_block
         return (view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
                                     shape=(kernel_block_size, spec.num_kv_heads, spec.head_size),
                                     offset=descriptor.offset, block_stride=stride),)
-    shape = (kernel_block_size, spec.num_kv_heads, nope_dim)
-    key_bytes = prod(shape) * get_dtype_size(spec.dtype)
-    rope_bytes = kernel_block_size * spec.num_kv_heads * rope_dim * get_dtype_size(spec.dtype)
-    if key_bytes + rope_bytes > stride:
-        raise ValueError("MLA components exceed the physical kernel page")
-    keys = view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
-                               shape=shape, offset=descriptor.offset, block_stride=stride)
-    rope = view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
-                               shape=(kernel_block_size, spec.num_kv_heads, rope_dim),
-                               offset=descriptor.offset + key_bytes, block_stride=stride)
-    return keys, rope
+    # Match upstream MLA: each token is one [NoPE | RoPE] record. Backends
+    # taking two arguments receive aliases of that record, not two page-wide
+    # component regions. Both aliases retain the complete token stride.
+    fused_dim = nope_dim + rope_dim
+    if fused_dim != spec.head_size:
+        raise ValueError("MLA token width does not match the cache spec")
+    fused = view_cache_component(
+        backing,
+        dtype=spec.dtype,
+        num_blocks=num_blocks * pieces,
+        shape=(kernel_block_size, spec.num_kv_heads, fused_dim),
+        offset=descriptor.offset,
+        block_stride=stride,
+    )
+    return fused[..., :nope_dim], fused[..., nope_dim:]
