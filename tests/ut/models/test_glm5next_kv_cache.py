@@ -222,7 +222,6 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
         dtype=torch.bfloat16,
         tokens_per_state=pool_size,
         model_version="glm5_next",
-        cache_role="indexer",
     )
     builders = [
         AscendIndexerKPoolMetadataBuilder(spec, ["layer.indexer.k_cache"], config, torch.device("cpu"))
@@ -277,7 +276,6 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
         indexer = Glm5NextIndexerCache(
             head_dim=128,
             dtype=dtype,
-            cache_role="indexer",
             cache_config=cache_config,
             prefix="model.layers.0.indexer.k_cache",
             compress_ratio=16,
@@ -296,7 +294,6 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
     assert indexer_spec.block_size == 256
     assert get_storage_block_size(indexer_spec) == 16
     assert get_kv_cache_compression_ratio(indexer_spec) == 16
-    assert indexer_spec.cache_role == "indexer"
     assert indexer_spec.model_version == "glm5_next"
     assert indexer_spec.indexes_kv_by_block_stride
     assert indexer_spec.dtype == dtype
@@ -322,7 +319,6 @@ def test_indexer_cache_rejects_unsupported_dtype():
         Glm5NextIndexerCache(
             head_dim=128,
             dtype=torch.float16,
-            cache_role="indexer",
             cache_config=SimpleNamespace(block_size=128),
             prefix="indexer.k_cache",
             compress_ratio=4,
@@ -349,7 +345,6 @@ def test_indexer_metadata_preserves_raw_request_boundaries(keypool_kernels):
             head_size=128,
             dtype=torch.bfloat16,
             model_version="glm5_next",
-            cache_role="indexer",
             **_ratio_kwargs(16),
         ),
         ["model.layers.0.indexer.k_cache"],
@@ -401,7 +396,6 @@ def test_pcp_kpool_metadata_writes_global_token_order(keypool_kernels, capture, 
             head_size=128,
             dtype=torch.bfloat16,
             model_version="glm5_next",
-            cache_role="indexer",
             **_ratio_kwargs(4),
         ),
         ["model.layers.0.indexer.k_cache"],
@@ -526,7 +520,6 @@ def test_indexer_metadata_request_buffers_cover_graph_token_padding():
             head_size=128,
             dtype=torch.bfloat16,
             model_version="glm5_next",
-            cache_role="indexer",
             **_ratio_kwargs(16),
         ),
         ["model.layers.0.indexer.k_cache"],
@@ -575,7 +568,6 @@ def test_indexer_metadata_buffers_are_stable_per_draft_step():
             head_size=128,
             dtype=torch.bfloat16,
             model_version="glm5_next",
-            cache_role="indexer",
             **_ratio_kwargs(16),
         ),
         ["model.layers.0.indexer.k_cache"],
@@ -659,7 +651,6 @@ def _builder(config):
         head_size=128,
         dtype=torch.bfloat16,
         model_version="glm5_next",
-        cache_role="indexer",
         **_ratio_kwargs(4),
     )
     return AscendIndexerKPoolMetadataBuilder(spec, ["layer.indexer.k_cache"], config, torch.device("cpu"))

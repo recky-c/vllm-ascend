@@ -27,7 +27,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    SparseCacheRole,
     UniformTypeKVCacheSpecs,
 )
 
@@ -82,19 +81,11 @@ def _layer_indices(layer_names: tuple[str, ...]) -> tuple[int, ...] | None:
 
 
 def _is_glm5_next_main_spec(spec: KVCacheSpec) -> bool:
-    return (
-        isinstance(spec, MLAAttentionSpec)
-        and _is_glm5_next_spec(spec)
-        and spec.cache_role == SparseCacheRole.SPARSE
-    )
+    return isinstance(spec, MLAAttentionSpec) and _is_glm5_next_spec(spec) and get_kv_cache_compression_ratio(spec) == 1
 
 
 def _is_glm5_next_indexer_spec(spec: KVCacheSpec) -> bool:
-    return (
-        isinstance(spec, MLAAttentionSpec)
-        and _is_glm5_next_spec(spec)
-        and spec.cache_role == SparseCacheRole.INDEXER
-    )
+    return isinstance(spec, MLAAttentionSpec) and _is_glm5_next_spec(spec) and get_kv_cache_compression_ratio(spec) > 1
 
 
 def _is_glm5_next_tail_spec(spec: KVCacheSpec) -> bool:
@@ -185,8 +176,6 @@ def _create_glm5_next_attention_groups(
         assert isinstance(tail_spec, AscendIndexerKPoolTailSpec)
 
         compress_ratio = get_kv_cache_compression_ratio(indexer_spec)
-        if get_kv_cache_compression_ratio(main_spec) != 1 or compress_ratio <= 1:
-            raise ValueError("GLM-Next requires an uncompressed main and a compressed indexer cache.")
         if main_spec.block_size % compress_ratio:
             raise ValueError(
                 "GLM-Next logical block size must be divisible by the indexer "

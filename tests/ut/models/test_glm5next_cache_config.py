@@ -101,7 +101,6 @@ def make_specs(pool: int = 16):
             head_size=128,
             dtype=torch.bfloat16,
             model_version="glm5_next",
-            cache_role="indexer",
             **_ratio_kwargs(pool),
         ),
         "model.layers.3.indexer.tail_cache": AscendIndexerKPoolTailSpec(
@@ -208,7 +207,6 @@ def test_fp8_shared_pages_preserve_tail_rows_and_kernel_scale_alignment():
         scale_dim=1,
         scale_dtype=torch.float32,
         model_version="glm5_next",
-        cache_role="indexer",
         tokens_per_state=4,
     )
     groups = get_glm5_next_kv_cache_groups(make_config(), specs)
@@ -248,7 +246,6 @@ def test_fp8_cache_budget_accounts_for_scales_tail_and_padding(block_size, looka
             scale_dim=1 if dtype == torch.float8_e4m3fn else 0,
             scale_dtype=torch.float32 if dtype == torch.float8_e4m3fn else torch.int8,
             model_version="glm5_next",
-            cache_role="indexer",
             tokens_per_state=4,
         )
         specs["model.layers.3.indexer.tail_cache"] = replace(
@@ -455,18 +452,3 @@ def test_glm_builder_delegates_non_flash_materialization(monkeypatch):
     assert AscendKVCacheConfigBuilder().get_kv_cache_config_from_groups(config, groups, 7) is expected
     assert calls == [(config, groups, 7)]
 
-
-def test_glm_roles_are_not_inferred_from_compression():
-    from vllm_ascend.models.glm5next.cache_config import (
-        _is_glm5_next_indexer_spec,
-        _is_glm5_next_main_spec,
-    )
-
-    specs = make_specs()
-    indexer = specs["model.layers.3.indexer.k_cache"]
-    uncompressed_indexer = replace(indexer, tokens_per_state=1)
-    assert _is_glm5_next_indexer_spec(uncompressed_indexer)
-    assert not _is_glm5_next_main_spec(uncompressed_indexer)
-    specs["model.layers.3.indexer.k_cache"] = uncompressed_indexer
-    with pytest.raises(ValueError, match="uncompressed main and a compressed indexer"):
-        get_glm5_next_kv_cache_groups(make_config(), specs)
