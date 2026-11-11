@@ -246,7 +246,7 @@ def view_glm_main_descriptor(backing, spec, descriptor, num_blocks, kernel_block
     # taking two arguments receive aliases of that record, not two page-wide
     # component regions. Both aliases retain the complete token stride.
     fused_dim = nope_dim + rope_dim
-    if fused_dim != get_kv_cache_storage_head_size(spec):
+    if fused_dim != spec.head_size:
         raise ValueError("MLA token width does not match the cache spec")
     fused = view_cache_component(
         backing,

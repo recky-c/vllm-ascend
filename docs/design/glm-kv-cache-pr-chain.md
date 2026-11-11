@@ -5,16 +5,33 @@ Scope: MRV2, GLM and GLM-5.3-Flash. Hardware validation is deferred at the reque
 | PR | Dependency | Review boundary |
 | --- | --- | --- |
 | upstream #21370 | main | Owners produce MLA/indexer specs; collection stops rebuilding specs. |
-| fork #11 | #21370 | Physical state bytes, including indexer scales and Flash tail state. |
-| fork #12 | #11 | Page alignment belongs to planning. |
+| fork #12 | #21370 | Page alignment belongs to planning. |
 | fork #13 | #12 | Flash circular owner, sparse roles and Core block-count materialization; retain dedicated grouping. |
 | fork #15 | #13 | Descriptor-aware owner views and page-strided writes for the existing Flash two-pool layout; includes former #14. Generic grouping and packed allocation are withdrawn. |
 | fork #16 | #15 | Ordinary GLM indexer kernel-page K/scale layout, owner views, strided writes/reads and transfer metadata. |
 | fork #17 (WIP) | #16 | Complete ordinary GLM main MLA token-fused migration, including allocation and all affected consumers. Only view/store primitives are implemented so far. |
 
-Eight PRs were originally created; seven remain open drafts. #14 is superseded
-by #15. The original commits are retained: #15 appends a withdrawal of its packed
+Eight PRs were originally created. Six PRs form the active chain; #11 remains an open deferred draft outside this chain. #14 is closed and superseded by #15. The original commits are retained: #15 appends a withdrawal of its packed
 planning/allocation commit, rather than rewriting the earlier changes.
+
+## Deferred separately: #11 logical dimensions and storage bytes
+
+The active chain is #21370 -> #12 -> #13 -> #15 -> #16 -> #17.
+#12 targets `codex/mla-spec-owner` directly. #11 and its
+`codex/kv-spec-storage-bytes` branch are retained unchanged for later review;
+none of its commits are prerequisites of the active chain.
+
+For this phase, Ascend quantized specs retain the existing convention that
+`head_size` describes the stored data width. C4 indexer stores half the logical
+width as byte elements; scale dimensions/dtypes remain separate. Main SFA keeps
+its packed width. Descriptor views and indexer page layout consume that physical
+width directly, without `get_kv_cache_storage_head_size` or #11's explicit
+state-byte migration. Existing page-size formulas continue to include scales.
+
+Logical/storage field unification, including Flash owner state-byte publication,
+can be rebased and reviewed independently after the larger layout work. This
+scope decision does not remove upstream's `state_content_bytes` API or unrelated
+uses elsewhere in the repository.
 
 ## Current scope decision: defer GLM Flash grouping unification
 
@@ -35,7 +52,7 @@ and its coupled packed allocation are deferred work, not missing requirements
 for this active chain.
 
 #17 must stay draft until its allocation and affected consumers are complete.
-The seven open review boundaries do not mean that all remaining ordinary GLM
+The six active review boundaries do not mean that all remaining ordinary GLM
 migration work has been completed.
 
 ## Indexer contract (#16)
