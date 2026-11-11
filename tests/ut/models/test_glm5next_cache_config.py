@@ -17,7 +17,11 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
-from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolTailSpec,
+    AscendMLAAttentionSpec,
+    get_kv_cache_storage_head_size,
+)
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     get_glm5_next_kv_cache_config,
@@ -352,3 +356,41 @@ def test_worker_preserves_glm5_next_physical_pool_budget(monkeypatch, use_sparse
     plan = get_glm5_next_kv_cache_config(config, groups, budget)
     assert plan.num_blocks * get_glm5_next_pool_bytes_per_block(groups) == required
     assert sum(tensor.size for tensor in plan.kv_cache_tensors) == required
+
+
+@pytest.mark.parametrize("pool", [4, 16])
+@pytest.mark.parametrize("dtype,state_bytes", [(torch.bfloat16, 256), (torch.float8_e4m3fn, 132)])
+def test_glm53_flash_indexer_owner_publishes_data_and_scale_bytes(pool, dtype, state_bytes):
+    from vllm_ascend.models.glm5next.kv_cache import Glm5NextIndexerCache
+
+    owner = Glm5NextIndexerCache.__new__(Glm5NextIndexerCache)
+    torch.nn.Module.__init__(owner)
+    owner.cache_config = SimpleNamespace(block_size=512)
+    owner.head_dim = 128
+    owner.dtype = dtype
+    owner.compress_ratio = pool
+    spec = owner.get_kv_cache_spec(None)
+    assert spec.head_size == 128
+    assert spec.state_content_bytes == state_bytes
+    assert get_kv_cache_storage_head_size(spec) == 128
+    assert spec.real_page_size_bytes == 512 // pool * state_bytes
+    merged = AscendMLAAttentionSpec.merge([spec, spec])
+    assert merged.state_content_bytes == state_bytes
+    assert merged.tokens_per_state == pool
+    assert merged.scale_dim == (1 if dtype == torch.float8_e4m3fn else 0)
+
+
+def test_glm53_flash_tail_owner_publishes_complete_key_gate_record():
+    from vllm_ascend.models.glm5next.kv_cache import Glm5NextTailCache
+
+    owner = Glm5NextTailCache.__new__(Glm5NextTailCache)
+    torch.nn.Module.__init__(owner)
+    owner.block_size = 7
+    owner.head_dim = 128
+    owner.dtype = torch.float32
+    owner.compress_ratio = 4
+    spec = owner.get_kv_cache_spec(None)
+    assert spec.head_size == 128
+    assert spec.state_content_bytes == 2 * 128 * 4
+    assert spec.unpadded_page_size_bytes == 7 * 2 * 128 * 4
+    assert spec.page_size_bytes == replace(spec, state_content_bytes=None).page_size_bytes

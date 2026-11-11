@@ -17,7 +17,7 @@ from vllm_ascend.attention.indexer import (
     AscendSFAIndexerMetadata,
     AscendSFAIndexerMetadataBuilder,
 )
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, get_kv_cache_storage_head_size
 from vllm_ascend.device.device_op import A5DeviceAdaptor
 
 _KERNEL_BLOCK_SIZE = 128
@@ -507,7 +507,9 @@ def test_indexer_owner_reports_data_scale_and_replication(monkeypatch, c4, c8, r
     assert spec.cache_role is source.cache_role and spec.is_draft
     assert spec.sfa_dcp_replicated_indexer_size == replicas
     assert spec.scale_dim == (4 if c4 else 1 if c8 else 0)
-    assert spec.head_size == (64 if c4 else 128)
+    assert spec.head_size == 128
+    assert get_kv_cache_storage_head_size(spec) == (64 if c4 else 128)
+    assert spec.state_content_bytes == (68 if c4 else 130 if c8 else 256)
     assert spec.page_size_bytes == replicas * 128 * (68 if c4 else 130 if c8 else 256)
 
     prefix = "model.layers.0.self_attn.indexer.k_cache"

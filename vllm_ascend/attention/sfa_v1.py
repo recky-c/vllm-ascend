@@ -13,7 +13,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     AttentionCGSupport,
@@ -369,7 +369,7 @@ class AscendSFABackend(AttentionBackend):
             width = get_tq_fused_slot_bytes(spec.kv_lora_rank, spec.qk_rope_head_dim)
         else:
             width = get_sfa_qsfa_packed_head_dim(spec.kv_lora_rank, spec.qk_rope_head_dim, SFA_QSFA_TILE_SIZE)
-        return replace(spec, head_size=width)
+        return replace(spec, state_content_bytes=width * get_dtype_size(spec.dtype))
 
     accept_output_buffer: bool = True
 
