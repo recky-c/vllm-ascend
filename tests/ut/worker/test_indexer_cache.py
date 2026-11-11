@@ -70,9 +70,8 @@ def test_page_indexer_components_alias_and_preserve_neighbor_pages(replication, 
     scale_dim = 4 if c4 else 1
     scale_dtype = torch.uint8 if c4 else torch.float16
     spec = AscendSFAIndexerCacheSpec(
-        block_size=manager_block_size, num_kv_heads=1, head_size=128,
+        block_size=manager_block_size, num_kv_heads=1, head_size=key_width,
         dtype=torch.uint8 if c4 else torch.int8,
-        state_content_bytes=key_width + scale_dim * torch.tensor([], dtype=scale_dtype).element_size(),
         scale_dim=scale_dim, scale_dtype=scale_dtype, cache_sparse_li_c4=c4,
         cache_sparse_li_c8=not c4, page_interleaved=True,
         sfa_dcp_replicated_indexer_size=replication,

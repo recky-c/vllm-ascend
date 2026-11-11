@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from vllm.utils.torch_utils import get_dtype_size
 
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, get_kv_cache_storage_head_size
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.models.glm5next.cache_views import view_cache_component
 
 
@@ -29,7 +29,7 @@ def view_indexer_pages(
         raise ValueError("Indexer manager blocks must contain whole kernel pages")
     pieces = spec.block_size // kernel_block_size * spec.sfa_dcp_replicated_indexer_size
     page_stride = spec.page_size_bytes // pieces
-    shape = (kernel_block_size, spec.num_kv_heads, get_kv_cache_storage_head_size(spec))
+    shape = (kernel_block_size, spec.num_kv_heads, spec.head_size)
     key_bytes = prod(shape) * get_dtype_size(spec.dtype)
     keys = view_cache_component(
         backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
