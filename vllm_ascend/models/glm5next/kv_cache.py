@@ -170,7 +170,6 @@ class Glm5NextTailCache(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            sliding_window=self.compress_ratio,
             compress_ratio=self.compress_ratio,
         )
 

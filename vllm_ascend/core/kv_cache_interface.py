@@ -456,7 +456,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
 
 
 @dataclass(frozen=True, kw_only=True)
-class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
+class AscendIndexerKPoolTailSpec(CircularBufferSpec):
     """One fixed FP32 ``[ring_capacity, 2 * head_size]`` page per request.
 
     ``block_size`` is the physical ring capacity; ``compress_ratio`` defines
@@ -473,8 +473,10 @@ class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
         return True
 
     @property
-    def prefix_cacheable(self) -> bool:
-        return False
+    def uses_slot_mapping(self) -> bool:
+        # Ascend's KPool writer still consumes circular slot mappings, unlike
+        # upstream circular backends that address the ring from block IDs.
+        return True
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -489,22 +491,13 @@ class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
             raise ValueError("Indexer K-pool tail requires one K/gate pair with positive head size.")
         if self.compress_ratio <= 1 or self.block_size < self.compress_ratio:
             raise ValueError("Tail ring capacity must be at least the compression ratio, which must exceed one.")
-        if self.sliding_window != self.compress_ratio:
-            raise ValueError("Tail sliding_window describes the logical pool size and must equal compress_ratio.")
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, cls) for spec in specs)
         return super().merge(specs)
 
-    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        del vllm_config
-        return self.page_size_bytes
-
     def max_admission_blocks_per_request(self, max_in_flight_tokens: int, max_model_len: int) -> int:
-        return 1
-
-    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         return 1
 
     def is_uniform_with_collection(self, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:

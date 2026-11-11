@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowSpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.attention.attention_v1 import AscendCommonAttentionMetadata
@@ -72,7 +73,6 @@ def test_tail_uses_one_full_precision_page(capacity):
     register_ascend_kv_cache_specs()
     spec = AscendIndexerKPoolTailSpec(
         block_size=capacity,
-        sliding_window=4,
         compress_ratio=4,
         num_kv_heads=1,
         head_size=128,
@@ -96,6 +96,10 @@ def test_tail_uses_one_full_precision_page(capacity):
     assert spec.max_admission_blocks_per_request(8192, 131072) == 1
     assert not spec.prefix_cacheable
     assert not is_prefix_cacheable(spec)
+    assert isinstance(spec, CircularBufferSpec)
+    assert not isinstance(spec, SlidingWindowSpec)
+    assert spec.block_table_token_alignment is None
+    assert spec.uses_slot_mapping  # Ascend KPool still consumes ring slot mappings.
     assert spec.is_circular
     context_parallel_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=1024),
@@ -108,17 +112,16 @@ def test_tail_uses_one_full_precision_page(capacity):
 
 
 @pytest.mark.parametrize(
-    ("dtype", "block_size", "sliding_window"),
+    ("dtype", "block_size"),
     [
-        (torch.bfloat16, 4, 4),
-        (torch.float32, 2, 4),
+        (torch.bfloat16, 4),
+        (torch.float32, 2),
     ],
 )
-def test_invalid_state_layout_is_rejected(dtype, block_size, sliding_window):
+def test_invalid_state_layout_is_rejected(dtype, block_size):
     with pytest.raises(ValueError):
         AscendIndexerKPoolTailSpec(
             block_size=block_size,
-            sliding_window=sliding_window,
             compress_ratio=4,
             num_kv_heads=1,
             head_size=256,
@@ -136,7 +139,6 @@ def test_completed_pool_slots_preserve_logical_block_padding():
 def test_tail_manager_retains_one_private_block_until_free():
     spec = AscendIndexerKPoolTailSpec(
         block_size=4,
-        sliding_window=4,
         compress_ratio=4,
         num_kv_heads=1,
         head_size=128,
@@ -173,7 +175,6 @@ def test_tail_manager_retains_one_private_block_until_free():
 def test_tail_manager_prefix_hit_has_no_shared_blocks():
     spec = AscendIndexerKPoolTailSpec(
         block_size=4,
-        sliding_window=4,
         compress_ratio=4,
         num_kv_heads=1,
         head_size=128,
@@ -275,7 +276,6 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
         indexer = Glm5NextIndexerCache(
             head_dim=128,
             dtype=dtype,
-            cache_role="indexer",
             cache_config=cache_config,
             prefix="model.layers.0.indexer.k_cache",
             compress_ratio=16,
@@ -301,7 +301,7 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
     if dtype == torch.float8_e4m3fn:
         assert indexer_spec.scale_dtype == torch.float32
         assert indexer_spec.real_page_size_bytes == 16 * (128 + 4)
-    assert state_spec.block_size == state_spec.sliding_window == 16
+    assert state_spec.block_size == state_spec.compress_ratio == 16
     assert state_spec.head_size == 128
     assert state_spec.dtype == torch.float32
     assert state_spec.model_version == "glm5_next"
@@ -319,7 +319,6 @@ def test_indexer_cache_rejects_unsupported_dtype():
         Glm5NextIndexerCache(
             head_dim=128,
             dtype=torch.float16,
-            cache_role="indexer",
             cache_config=SimpleNamespace(block_size=128),
             prefix="indexer.k_cache",
             compress_ratio=4,
@@ -483,7 +482,6 @@ def test_pcp_kpool_metadata_writes_global_token_order(keypool_kernels, capture, 
     tail_builder = AscendIndexerKPoolTailMetadataBuilder(
         AscendIndexerKPoolTailSpec(
             block_size=4,
-            sliding_window=4,
             compress_ratio=4,
             num_kv_heads=1,
             head_size=128,
@@ -711,7 +709,6 @@ def test_tail_inputs_pass_page_stride_and_isolate_step_buffers(width, keypool_ke
         num_kv_heads=1,
         head_size=128,
         dtype=torch.float32,
-        sliding_window=4,
         compress_ratio=4,
         page_size_padded=81920,
     )
