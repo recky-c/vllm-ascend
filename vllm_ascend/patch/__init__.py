@@ -283,6 +283,9 @@
 #       removes the EAGLE last-block drop for verified prompt blocks.
 #
 # ** 10. File: platform/patch_kv_cache_utils.py**
+# Public get_kv_cache_groups is no longer patched. Ascend model dispatch and
+# cross-layer page alignment belong to AscendKVCacheConfigBuilder; worker
+# callers, including 310P, resolve grouping through that builder.
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes`
 #      `vllm.v1.engine.core.resolve_kv_cache_block_sizes`

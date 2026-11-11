@@ -30,7 +30,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.core.kv_cache_interface import (
     is_prefix_cacheable,
 )
-from vllm_ascend.core.kv_cache_planning import align_hybrid_kv_cache_specs
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
@@ -41,14 +40,11 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     get_glm5_next_kv_cache_config,
-    get_glm5_next_kv_cache_groups,
     get_glm5_next_max_memory_usage,
     get_glm5_next_pool_bytes_per_block,
 )
-from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.models.qwen4_exp.cache_config import (
     get_qwen4_exp_kv_cache_config,
-    get_qwen4_exp_kv_cache_groups,
     get_qwen4_exp_max_memory_usage,
     get_qwen4_exp_pool_bytes_per_block,
 )
@@ -60,7 +56,6 @@ _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups_uniform_page_size = _kv_cache_planning._get_kv_cache_groups_uniform_page_size
-_orig_get_kv_cache_groups = _kv_cache_planning.get_kv_cache_groups
 _orig_get_packed_kv_cache_groups = _kv_cache_planning._get_packed_kv_cache_groups
 _orig_annotate_eagle_groups = getattr(_kv_cache_planning, "_annotate_eagle_groups", None)
 _orig_get_kv_cache_config_from_groups = _kv_cache_planning.get_kv_cache_config_from_groups
@@ -680,19 +675,6 @@ def _ascend_max_memory_usage_bytes_from_groups(
     )
 
 
-def _get_ascend_kv_cache_groups(
-    vllm_config: VllmConfig,
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
-    if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
-        return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
-    groups = get_qwen4_exp_kv_cache_groups(vllm_config, kv_cache_spec, _orig_get_kv_cache_groups)
-    if groups is not None:
-        return groups
-    kv_cache_spec = align_hybrid_kv_cache_specs(kv_cache_spec)
-    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
-
-
 def _ascend_get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -767,7 +749,6 @@ if _orig_annotate_eagle_groups is not None:
     _kv_cache_planning._annotate_eagle_groups = _ascend_annotate_eagle_groups
 _kv_cache_planning._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
 _kv_cache_planning._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
-_kv_cache_planning.get_kv_cache_groups = _get_ascend_kv_cache_groups
 KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
     _kv_cache_config_has_mamba_layers
 )
