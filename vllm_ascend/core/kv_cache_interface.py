@@ -313,6 +313,7 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
 
     # Indexer keys and their scales are replicated across TP ranks.
     max_tp_shards: int | None = 1
+    page_interleaved: bool = False
     scale_dim: int = 0
     scale_dtype: torch.dtype = torch.int8
     cache_sparse_li_c8: bool = False
@@ -338,6 +339,7 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
         assert all(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be AscendSFAIndexerCacheSpec."
         )
+        assert len({spec.page_interleaved for spec in specs}) == 1
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         dtype_set = set(spec.dtype for spec in specs)
         max_tp_shards_set = {spec.max_tp_shards for spec in specs}
@@ -364,6 +366,7 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
+            page_interleaved=specs[0].page_interleaved,
             dtype=dtype_set.pop(),
             max_tp_shards=max_tp_shards_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),

@@ -34,13 +34,20 @@ def allocate_shared_indexer_cache(
     specs: dict[str, AscendSFAIndexerCacheSpec],
     num_blocks: int,
     allocate: Callable[[int], torch.Tensor],
-) -> dict[str, tuple[torch.Tensor, ...]]:
+) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
     """Share raw bytes while retaining each layer's data and scale layout.
 
     The caller must fence reuse between layers. Returned byte views contain
     exactly the layer's logical capacity, so reshape and transfer code never
     mistake spare backing capacity for extra blocks.
     """
+    if any(spec.page_interleaved for spec in specs.values()):
+        if not all(spec.page_interleaved for spec in specs.values()):
+            raise ValueError("Shared indexer slots cannot mix pool and page layouts")
+        capacity = max(num_blocks * spec.page_size_bytes for spec in specs.values())
+        backing = allocate(capacity)
+        return {name: backing[:num_blocks * spec.page_size_bytes] for name, spec in specs.items()}
+
     regions: dict[str, tuple[int, int, int]] = {}
     capacity = 0
     for name, spec in specs.items():
