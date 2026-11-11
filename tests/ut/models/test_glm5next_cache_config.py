@@ -458,7 +458,7 @@ def test_flash_descriptor_views_preserve_offsets_stride_and_aliases():
 
     spec = AscendMLAAttentionSpec(
         block_size=128, num_kv_heads=1, head_size=128, dtype=torch.float8_e4m3fn,
-        state_content_bytes=132, scale_dim=1, scale_dtype=torch.float32,
+        scale_dim=1, scale_dtype=torch.float32,
         tokens_per_state=4, model_version="glm5_next", cache_role="indexer",
     )
     stride, offset, blocks = 8192, 1024, 3

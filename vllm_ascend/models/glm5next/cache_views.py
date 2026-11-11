@@ -208,7 +208,7 @@ def view_glm_indexer_descriptor(backing, spec, descriptor, num_blocks, kernel_bl
         raise ValueError("Indexer stride must divide into complete kernel pages")
     stride = descriptor.block_stride // pieces
     states = kernel_block_size // ratio
-    shape = (states, spec.num_kv_heads, get_kv_cache_storage_head_size(spec))
+    shape = (states, spec.num_kv_heads, spec.head_size)
     key_bytes = prod(shape) * get_dtype_size(spec.dtype)
     keys = view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
                                 shape=shape, offset=descriptor.offset, block_stride=stride)
@@ -240,7 +240,7 @@ def view_glm_main_descriptor(backing, spec, descriptor, num_blocks, kernel_block
     stride = descriptor.block_stride // pieces
     if spec.uses_packed_sfa_main_cache:
         return (view_cache_component(backing, dtype=spec.dtype, num_blocks=num_blocks * pieces,
-                                    shape=(kernel_block_size, spec.num_kv_heads, get_kv_cache_storage_head_size(spec)),
+                                    shape=(kernel_block_size, spec.num_kv_heads, spec.head_size),
                                     offset=descriptor.offset, block_stride=stride),)
     shape = (kernel_block_size, spec.num_kv_heads, nope_dim)
     key_bytes = prod(shape) * get_dtype_size(spec.dtype)
