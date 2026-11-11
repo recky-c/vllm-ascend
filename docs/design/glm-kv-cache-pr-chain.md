@@ -6,7 +6,7 @@ Scope: MRV2, GLM and GLM-5.3-Flash. Hardware validation is deferred at the reque
 | --- | --- | --- |
 | upstream #21370 | main | Owners produce MLA/indexer specs; collection stops rebuilding specs. |
 | fork #12 | #21370 | Page alignment belongs to planning. |
-| fork #13 | #12 | Flash circular owner, sparse roles and Core block-count materialization; retain dedicated grouping. |
+| fork #13 | #12 | Flash circular owner and Core block-count materialization; retain dedicated grouping. |
 | fork #15 | #13 | Descriptor-aware owner views and page-strided writes for the existing Flash two-pool layout; includes former #14. Generic grouping and packed allocation are withdrawn. |
 | fork #16 | #15 | Ordinary GLM indexer kernel-page K/scale layout, owner views, strided writes/reads and transfer metadata. |
 | fork #17 (WIP) | #16 | Complete ordinary GLM main MLA token-fused migration, including allocation and all affected consumers. Only view/store primitives are implemented so far. |
@@ -40,7 +40,7 @@ it with upstream generic grouping is deferred and is not a prerequisite for the
 remaining Spec, planning and allocation work.
 
 - #12 retains page alignment in planning, including necessary dispatch to model-specific planners.
-- #13 retains explicit owner roles and materialization using Core's resolved block count. It does not replace Flash grouping.
+- #13 retains the tail circular-buffer contract and materialization using Core's resolved block count. It does not replace Flash grouping.
 - #15 retains owner views that consume descriptor offsets, strides and explicit block counts from the existing two-pool plan.
 - #15 withdraws the block-outermost opt-in to upstream grouping, packed byte-cost accounting and one-shared-backing allocation together. The allocator compatibility module introduced for that path is also withdrawn.
 - #16 continues ordinary GLM indexer migration; it uses the paged-store primitive retained in #15, not Flash packed planning.
@@ -99,3 +99,13 @@ This is a draft code chain, not a claim that every target in the analysis docume
 - Ordinary GLM main MLA allocation has not been converted to the Flash shared-backing path. This PR does not claim that the entire generic allocation migration is complete.
 - Tests were added but not run. Before merging, validate byte/alias boundaries, graph replay stores, INT8/FP8/C4 QLI reads, DCP/PCP, KVPP, Mooncake cross-rank transfers and GLM model outputs on the matching Ascend runtimes.
 - Flash grouping unification and coupled default-layout changes are deferred by scope decision, independently of validation. They are not prerequisites for the active chain.
+
+## Deferred separately: GLM Flash explicit cache roles
+
+The role migration introduced in #13 is withdrawn by an appended commit. Flash
+keeps its existing dedicated classification: compression ratio 1 identifies main
+MLA, and a ratio greater than 1 identifies the indexer. Publishing and consuming
+upstream `SparseCacheRole` for these owners can be reviewed later alongside
+Flash grouping unification. It is not a prerequisite for descriptor views,
+ordinary GLM indexer page layout, or the main MLA layout migration. The tail
+circular-buffer contract and Core block-count materialization remain in #13.
