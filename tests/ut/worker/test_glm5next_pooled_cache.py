@@ -317,3 +317,62 @@ def test_padded_page_layout_rejected_for_packed_hybrid_pool():
         ),
     ]
     assert not requires_padded_page_layout(specs)
+
+
+@pytest.fixture(autouse=True)
+def legacy_slot_allocation(monkeypatch):
+    # Existing cases exercise the retained transfer/release slot ABI.
+    monkeypatch.setattr(
+        "vllm_ascend.models.glm5next.cache_config.uses_glm5_next_unified_cache", lambda config: False
+    )
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("kernel_tokens", [4, 8])
+def test_unified_flash_views_preserve_aliases_and_kernel_pages(monkeypatch, quantized, kernel_tokens):
+    from vllm_ascend.attention.indexer_kpool import AscendIndexerKPoolBackend, AscendIndexerKPoolTailBackend
+    from vllm_ascend.attention.sfa_v1 import AscendSFABackend
+    from vllm_ascend.models.glm5next import cache_config
+
+    config = _make_config()
+    register_all_kvcache_specs(None)
+    specs = _make_specs()
+    specs[MAIN] = replace(specs[MAIN], kv_lora_rank=4, qk_rope_head_dim=0)
+    if quantized:
+        specs[INDEXER] = replace(specs[INDEXER], dtype=torch.float8_e4m3fn, scale_dim=1, scale_dtype=torch.float32)
+    groups = get_glm5_next_kv_cache_groups(config, specs)
+    monkeypatch.setattr(cache_config, "uses_glm5_next_unified_cache", lambda config: True)
+    plan = get_glm5_next_kv_cache_config(config, groups, 3 * get_glm5_next_pool_bytes_per_block(groups))
+    backends = {MAIN: AscendSFABackend, INDEXER: AscendIndexerKPoolBackend, STATE: AscendIndexerKPoolTailBackend}
+    layers = {
+        name: SimpleNamespace(get_attn_backend=lambda backend=backends.get(name, AscendSFABackend): backend)
+        for group in groups for name in group.layer_names
+    }
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *args: layers)
+    sizes = []
+
+    def allocate(size, alignment, device):
+        sizes.append(size)
+        return torch.zeros(size, dtype=torch.int8)
+
+    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", allocate)
+    caches = attn_utils.unified_allocate_kv_cache(
+        plan, torch.device("cpu"), None, [kernel_tokens, 2, 8]
+    )
+    assert sizes == [plan.kv_cache_tensors[0].size]
+    components = [component for cache in caches.values() for component in cache]
+    assert len({component.untyped_storage().data_ptr() for component in components}) == 1
+    assert caches[MAIN][0].data_ptr() == caches[MAMBA][0].data_ptr()
+    assert caches[INDEXER][0].data_ptr() == caches[STATE][0].data_ptr()
+    assert caches[MAIN][0].data_ptr() != caches[INDEXER][0].data_ptr()
+    assert caches[MAIN][0].shape == (3 * (8 // kernel_tokens), kernel_tokens, 1, 4)
+    assert caches[MAIN][1].shape[-1] == 0
+    assert caches[INDEXER][0].shape == (3 * (8 // kernel_tokens), kernel_tokens // 2, 1, 4)
+    assert caches[STATE][0].shape == (3, 2, 2)
+    assert caches[MAMBA][1].shape == (3, 1, 2, 2)
+    if quantized:
+        key, scale = caches[INDEXER]
+        assert scale.dtype == torch.float32
+        assert scale.data_ptr() - key.data_ptr() == (kernel_tokens // 2) * 4
+        assert key.stride(0) == scale.stride(0) * 4

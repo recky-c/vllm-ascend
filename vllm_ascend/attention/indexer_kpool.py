@@ -20,6 +20,7 @@ from vllm.distributed import (
     get_tp_group,
 )
 from vllm.forward_context import get_forward_context
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -37,6 +38,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.models.glm5next.cache_config import uses_glm5_next_unified_cache
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
 
@@ -563,6 +565,22 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
 class AscendIndexerKPoolBackend(AttentionBackend):
     """Cache-only backend for the compressed indexer keys."""
 
+    @classmethod
+    def get_runtime_shapes(cls, spec, num_blocks, layout, kernel_block_size=None):
+        ratio = get_kv_cache_compression_ratio(spec)
+        kernel_tokens = kernel_block_size or spec.block_size
+        if spec.block_size % kernel_tokens or kernel_tokens % ratio:
+            raise ValueError("KPool kernel pages must divide logical pages and contain complete pools.")
+        prefix = (num_blocks * (spec.block_size // kernel_tokens), spec.num_kv_heads, kernel_tokens // ratio)
+        shapes = [(*prefix, spec.head_size * get_dtype_size(spec.dtype))]
+        if spec.scale_dim:
+            shapes.append((*prefix, spec.scale_dim * get_dtype_size(spec.scale_dtype)))
+        return tuple(shapes)
+
+    @staticmethod
+    def get_runtime_dtypes(spec):
+        return (spec.dtype, spec.scale_dtype) if spec.scale_dim else (spec.dtype,)
+
     @staticmethod
     def get_impl_cls():
         return None
@@ -651,6 +669,11 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
         self._tail_inputs: dict[int, dict[str, torch.Tensor]] = {}
         self._pool_size = kv_cache_spec.compress_ratio
         self._page_rows = kv_cache_spec.page_size_bytes // (2 * kv_cache_spec.head_size * 4)
+        self._tail_cache_layer = (
+            vllm_config.compilation_config.static_forward_context[layer_names[0]]
+            if uses_glm5_next_unified_cache(vllm_config)
+            else None
+        )
         self._lookahead = self.block_size > self._pool_size
 
     def build(
@@ -687,11 +710,18 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
         retained_width = (
             min(self.block_size, getattr(write_common, "max_query_len", self.block_size)) if self._lookahead else 0
         )
+        page_rows = self._page_rows
+        if self._tail_cache_layer is not None:
+            tail = self._tail_cache_layer.kv_cache[0]
+            row_width = tail.shape[-1]
+            if tail.stride(0) % row_width:
+                raise ValueError("KPool tail block stride must contain whole K/gate rows.")
+            page_rows = tail.stride(0) // row_width
         cann_inputs = build_tail_inputs(
             write_common,
             self._pool_size,
             self.block_size,
-            self._page_rows,
+            page_rows,
             max(1, retained_width) if self._lookahead else 0,
             self._tail_inputs[key],
         )
@@ -725,6 +755,19 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
 
 class AscendIndexerKPoolTailBackend(AttentionBackend):
     """Cache-only backend for the GLM-Next compressor tail."""
+
+    @classmethod
+    def get_runtime_shapes(cls, spec, num_blocks, layout, kernel_block_size=None):
+        return ((num_blocks, 1, spec.block_size, 2 * spec.head_size * get_dtype_size(spec.dtype)),)
+
+    @staticmethod
+    def get_runtime_dtypes(spec):
+        return (spec.dtype,)
+
+    @staticmethod
+    def format_runtime_views(components):
+        # The tail ABI is [blocks, ring rows, K+gate], without a head axis.
+        return (components[0].squeeze(2),)
 
     @staticmethod
     def get_impl_cls():

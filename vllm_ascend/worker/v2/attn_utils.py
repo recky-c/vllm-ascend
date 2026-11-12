@@ -96,6 +96,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
+from vllm_ascend.models.glm5next.cache_config import _get_glm5_next_cache_layout, uses_glm5_next_unified_cache
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
 from vllm_ascend.models.qwen4_exp.cache_config import (
     GDN,
@@ -1471,6 +1472,12 @@ def create_cache_component_views(
     create_kv_cache_runtime_views, which resolves attention backends, layer
     placements and shared-layer aliases for the unified allocation path.
     """
+    component_bytes = sum(
+        math.prod(shape[1:]) * get_dtype_size(dtype)
+        for shape, dtype in zip(cache_shapes, cache_dtypes, strict=True)
+    )
+    if component_bytes > block_stride:
+        raise ValueError("Cache components do not fit one physical kernel page.")
     base = raw_tensor.storage_offset() * raw_tensor.element_size()
     offset = base
     views = []
@@ -1514,6 +1521,13 @@ def create_kv_cache_runtime_views(
                 continue
             spec = specs[name]
             descriptor = placements[name]
+            if isinstance(spec, MambaSpec):
+                # State components keep their own rank/dtype and dense page interiors.
+                shapes = [(kv_cache_config.num_blocks_of(descriptor), *shape) for shape in spec.shapes]
+                caches[name] = tuple(
+                    create_cache_component_views(raw_tensors[name], shapes, spec.dtypes, descriptor.block_stride)
+                )
+                continue
             shapes = group.backend.get_runtime_shapes(
                 spec,
                 kv_cache_config.num_blocks_of(descriptor),
@@ -1526,9 +1540,16 @@ def create_kv_cache_runtime_views(
                 (blocks, tokens, heads, *content[:-1], content[-1] // get_dtype_size(dtype))
                 for (blocks, heads, tokens, *content), dtype in zip(shapes, dtypes, strict=True)
             ]
-            caches[name] = tuple(
-                create_cache_component_views(raw_tensors[name], cache_shapes, dtypes, descriptor.block_stride)
-            )
+            manager_blocks = kv_cache_config.num_blocks_of(descriptor)
+            kernel_blocks_per_manager = cache_shapes[0][0] // manager_blocks
+            if kernel_blocks_per_manager > 1 and descriptor.block_stride != spec.page_size_bytes:
+                raise ValueError("Splitting manager pages requires adjacent physical kernel slots.")
+            if descriptor.block_stride % kernel_blocks_per_manager:
+                raise ValueError("Physical page stride must divide into whole kernel slots.")
+            kernel_stride = descriptor.block_stride // kernel_blocks_per_manager
+            components = tuple(create_cache_component_views(raw_tensors[name], cache_shapes, dtypes, kernel_stride))
+            format_views = getattr(group.backend, "format_runtime_views", tuple)
+            caches[name] = format_views(components)
     for name, target in shared_layers.items():
         caches[name] = caches[target]
     return caches
@@ -1630,6 +1651,12 @@ def allocate_kv_cache_main(
         for layer_name, layer in attn_layers.items()
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
+
+    if (
+        _get_glm5_next_cache_layout(kv_cache_config.kv_cache_groups) is not None
+        and uses_glm5_next_unified_cache(vllm_config)
+    ):
+        return unified_allocate_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
 
     if _uses_glm_component_views(vllm_config, kv_cache_config, attn_layers, kernel_block_sizes):
         return unified_allocate_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
