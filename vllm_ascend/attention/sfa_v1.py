@@ -30,6 +30,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.glm_cache_views import GLMCacheComponents, store_paged_components
 from vllm_ascend.attention.indexer import AscendSFAIndexerCache
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.attention.utils import (
@@ -1752,6 +1753,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
         assert packed_kv.shape[-1] == packed_head_dim
         packed_kv = packed_kv.view(-1, packed_head_dim)
+        if isinstance(kv_cache, GLMCacheComponents):
+            store_paged_components(
+                kv_cache, (packed_kv,), slot_mapping_sfa[: packed_kv.shape[0]], DeviceOperator.reshape_and_cache
+            )
+            return
         DeviceOperator.scatter_cache(
             kv_cache[0].view(-1, packed_head_dim),
             slot_mapping_sfa[: packed_kv.shape[0]].view(-1, 1),

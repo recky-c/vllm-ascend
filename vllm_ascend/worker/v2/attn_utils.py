@@ -69,6 +69,7 @@ from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
 from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
+from vllm_ascend.attention.glm_cache_views import allocate_glm_cache_views
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -1444,6 +1445,29 @@ def allocate_kv_cache_main(
         for layer_name, layer in attn_layers.items()
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
+
+    if vllm_config.additional_config.get("glm_component_kv_cache", False):
+        parallel = vllm_config.parallel_config
+        if (
+            vllm_config.model_config.hf_text_config.model_type != "glm_moe_dsa"
+            or not enable_sfa(vllm_config)
+            or parallel.decode_context_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or vllm_config.kv_transfer_config is not None
+            or KVPPConfig.from_vllm_config(vllm_config).size > 1
+            or shared_layers
+            or get_ascend_config().sparse_kv_offload_config.enabled
+        ):
+            raise ValueError("glm_component_kv_cache requires resident ordinary GLM SFA without CP/PD/KVPP/sharing.")
+        for group in kv_cache_config.kv_cache_groups:
+            for name in group.layer_names:
+                if attn_layers[name].get_attn_backend().__name__ not in ("AscendSFABackend", "AscendSFAIndexerBackend"):
+                    raise ValueError("glm_component_kv_cache excludes Flash and mixed backend configurations.")
+        return allocate_glm_cache_views(
+            kv_cache_config,
+            kernel_block_sizes,
+            lambda size: _allocate_int8_cache_tensor(size, 2 * 1024 * 1024, device),
+        )
 
     raw_tensors = _allocate_kv_cache(
         kv_cache_config,
