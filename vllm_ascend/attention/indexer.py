@@ -15,7 +15,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -43,7 +43,6 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
     get_sfa_pcp_global_metadata,
 )
 from vllm_ascend.attention.context_parallel.sharded_indexer import use_local_topk_output
-from vllm_ascend.attention.glm_cache_views import GLMCacheComponents, store_paged_components
 from vllm_ascend.attention.utils import split_decodes_and_prefills, uses_pcp_sharded_layout
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.device.device_op import DeviceOperator
@@ -186,6 +185,25 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
     Indexer hardcodes the CUDA fp8 path.
     TODO: Will be removed once original Indexer supports different quantization methods.
     """
+
+    @classmethod
+    def get_runtime_shapes(
+        cls, spec: AscendSFAIndexerCacheSpec, num_blocks: int, layout: Any,
+        kernel_block_size: int | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """K followed by scale inside each page; C4 retains its scale axes."""
+        prefix = (num_blocks, spec.num_kv_heads, spec.block_size)
+        shapes = [(*prefix, spec.head_size * get_dtype_size(spec.dtype))]
+        if spec.scale_dim:
+            scale_shape = (spec.scale_dim * get_dtype_size(spec.scale_dtype),)
+            if spec.cache_sparse_li_c4:
+                scale_shape = (spec.scale_dim // 2, 2 * get_dtype_size(spec.scale_dtype))
+            shapes.append((*prefix, *scale_shape))
+        return tuple(shapes)
+
+    @staticmethod
+    def get_runtime_dtypes(spec: AscendSFAIndexerCacheSpec) -> tuple[torch.dtype, ...]:
+        return (spec.dtype, spec.scale_dtype) if spec.scale_dim else (spec.dtype,)
 
     accept_output_buffer: bool = True
 
@@ -513,40 +531,22 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         with a different cache layout should override it. Page-strided views
         require the builder's matching ``cache_scatter_indices``.
         """
-        if isinstance(self.k_cache.kv_cache, GLMCacheComponents):
-            updates = (k_li,)
-            if self.enable_sparse_li_quant:
-                assert k_li_scale is not None
-                updates += (k_li_scale,)
-            store_paged_components(self.k_cache.kv_cache, updates, slot_mapping, DeviceOperator.reshape_and_cache)
-            return
         indexer_k_cache = self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT]
         # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter
         # kernel; view as uint8 (same 1-byte layout) for the cache write.
         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
             indexer_k_cache = indexer_k_cache.view(torch.uint8)
             k_li = k_li.view(torch.uint8)
-        self._write_cache_tensor(
-            indexer_k_cache,
-            k_li.view(-1, k_li.shape[-1]),
-            slot_mapping,
-            cache_scatter_indices,
-        )
+        DeviceOperator.scatter_paged_cache(indexer_k_cache, slot_mapping, k_li)
         if self.enable_sparse_li_quant:
             assert k_li_scale is not None
             # C4 scale is multi-dimensional (b*s, d/64, 2); C8 is (b*s, 1).
             # Keep all trailing dims beyond the token axis for the scatter.
-            scale_per_token = k_li_scale.shape[1:]
             indexer_scale_cache = self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT]
             if indexer_scale_cache.dtype == torch.float8_e8m0fnu:
                 indexer_scale_cache = indexer_scale_cache.view(torch.uint8)
                 k_li_scale = k_li_scale.view(torch.uint8)
-            self._write_cache_tensor(
-                indexer_scale_cache,
-                k_li_scale.view(-1, *scale_per_token),
-                slot_mapping,
-                cache_scatter_indices,
-            )
+            DeviceOperator.scatter_paged_cache(indexer_scale_cache, slot_mapping, k_li_scale)
 
     def _project_k(
         self,
