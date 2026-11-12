@@ -10,7 +10,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -144,6 +144,25 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
     Indexer hardcodes the CUDA fp8 path.
     TODO: Will be removed once original Indexer supports different quantization methods.
     """
+
+    @classmethod
+    def get_runtime_shapes(
+        cls, spec: AscendSFAIndexerCacheSpec, num_blocks: int, layout: Any,
+        kernel_block_size: int | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """K followed by scale inside each page; C4 retains its scale axes."""
+        prefix = (num_blocks, spec.num_kv_heads, spec.block_size)
+        shapes = [(*prefix, spec.head_size * get_dtype_size(spec.dtype))]
+        if spec.scale_dim:
+            scale_shape = (spec.scale_dim * get_dtype_size(spec.scale_dtype),)
+            if spec.cache_sparse_li_c4:
+                scale_shape = (spec.scale_dim // 2, 2 * get_dtype_size(spec.scale_dtype))
+            shapes.append((*prefix, *scale_shape))
+        return tuple(shapes)
+
+    @staticmethod
+    def get_runtime_dtypes(spec: AscendSFAIndexerCacheSpec) -> tuple[torch.dtype, ...]:
+        return (spec.dtype, spec.scale_dtype) if spec.scale_dim else (spec.dtype,)
 
     accept_output_buffer: bool = True
 
@@ -368,25 +387,16 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
             indexer_k_cache = indexer_k_cache.view(torch.uint8)
             k_li = k_li.view(torch.uint8)
-        DeviceOperator.scatter_cache(
-            indexer_k_cache.view(-1, k_li.shape[-1]),
-            slot_mapping.view(-1, 1),
-            k_li.view(-1, k_li.shape[-1]),
-        )
+        DeviceOperator.scatter_paged_cache(indexer_k_cache, slot_mapping, k_li)
         if self.enable_sparse_li_quant:
             assert k_li_scale is not None
             # C4 scale is multi-dimensional (b*s, d/64, 2); C8 is (b*s, 1).
             # Keep all trailing dims beyond the token axis for the scatter.
-            scale_per_token = k_li_scale.shape[1:]
             indexer_scale_cache = self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT]
             if indexer_scale_cache.dtype == torch.float8_e8m0fnu:
                 indexer_scale_cache = indexer_scale_cache.view(torch.uint8)
                 k_li_scale = k_li_scale.view(torch.uint8)
-            DeviceOperator.scatter_cache(
-                indexer_scale_cache.view(-1, *scale_per_token),
-                slot_mapping.view(-1, 1),
-                k_li_scale.view(-1, *scale_per_token),
-            )
+            DeviceOperator.scatter_paged_cache(indexer_scale_cache, slot_mapping, k_li_scale)
 
     def forward_k(
         self,

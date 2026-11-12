@@ -19,6 +19,9 @@ def _store_indexer_key_scale(
     scale_cache_ptr,
     capacity,
     KEY_WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    KEY_BLOCK_STRIDE: tl.constexpr,
+    SCALE_BLOCK_STRIDE: tl.constexpr,
 ):
     row = tl.program_id(0)
     column = tl.arange(0, KEY_WIDTH)
@@ -26,8 +29,10 @@ def _store_indexer_key_scale(
     scale = tl.load(scales_ptr + row)
     slot = tl.load(slots_ptr + row).to(tl.int64)
     valid = (slot >= 0) & (slot < capacity)
-    tl.store(cache_ptr + slot * KEY_WIDTH + column, key, valid)
-    tl.store(scale_cache_ptr + slot, scale, valid)
+    block = slot // BLOCK_SIZE
+    token = slot % BLOCK_SIZE
+    tl.store(cache_ptr + block * KEY_BLOCK_STRIDE + token * KEY_WIDTH + column, key, valid)
+    tl.store(scale_cache_ptr + block * SCALE_BLOCK_STRIDE + token, scale, valid)
 
 
 def store_indexer_key_scale(
@@ -41,4 +46,7 @@ def store_indexer_key_scale(
     rows = slots.numel()
     key_width = quant.shape[-1]
     # Rows only set the launch grid; 12 was a test setting, not a kernel limit.
-    _store_indexer_key_scale[(rows,)](quant, scales, slots, cache, scale_cache, cache.numel() // key_width, key_width)
+    _store_indexer_key_scale[(rows,)](
+        quant, scales, slots, cache, scale_cache, cache.numel() // key_width, key_width,
+        cache.shape[1], cache.stride(0), scale_cache.stride(0),
+    )
