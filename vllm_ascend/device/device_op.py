@@ -91,6 +91,22 @@ class BaseDeviceAdaptor:
         return x
 
     @classmethod
+    def scatter_paged_cache(cls, cache: torch.Tensor, slots: torch.Tensor, updates: torch.Tensor) -> None:
+        """Write token rows without flattening a strided page dimension."""
+        if cache.is_contiguous():
+            cls.scatter_cache(cache.view(-1, *updates.shape[1:]), slots.view(-1, 1), updates)
+            return
+        if slots.numel() == 0:
+            return
+        # Norm requires matching K/V types. Copy the row bytes, including
+        # quantization scales, with the existing single-cache K/V alias ABI.
+        blocks, tokens = cache.shape[:2]
+        byte_width = cache[0, 0].numel() * cache.element_size()
+        destination = cache.view(torch.int8).view(blocks, tokens, 1, byte_width)
+        source = updates.contiguous().view(torch.int8).view(-1, 1, byte_width)
+        cls.reshape_and_cache(source, source, destination, destination, slots.view(-1))
+
+    @classmethod
     def scatter_cache(cls, var: torch.Tensor, indices: torch.Tensor, updates: torch.Tensor) -> None:
         """Dispatch a cache scatter with the original operator's arguments.
 

@@ -1,65 +1,52 @@
-# GLM component KV cache draft
+# GLM component KV cache
 
-This stacked draft builds on `codex/kv-page-planning` (recky-c/vllm-ascend#12),
-which builds on vllm-project/vllm-ascend#21370. It does not depend on #21083.
+This draft builds on recky-c/vllm-ascend#12 and vllm-project/vllm-ascend#21370.
+It follows the allocation/view structure of #21083 at
+`5597e6566547e204c9697c79286e0f0b5de8b401`, without merging that branch.
 
-## Enable for development
+## Allocation and views
 
-Pass `--additional-config '{"glm_component_kv_cache": true}'` to opt in.
-Default allocation remains unchanged until hardware correctness is established.
-This is an experimental implementation, not a claim of validated model support.
+`init_kv_cache -> allocate_kv_cache_main -> unified_allocate_kv_cache`
+allocates the descriptor-backed byte pool once. Layer regions use descriptor
+`offset + layer_index * layer_stride`, with `block_stride` between pages.
 
-The initial route accepts ordinary `glm_moe_dsa` SFA main/indexer backends,
-resident caches, no CP/PD/KVPP/offload/sharing, and equal manager/kernel block
-sizes. Flash, mixed backends, compressed or replicated caches, host pages and
-zero-layer-stride descriptors are rejected when this option is enabled.
+`create_kv_cache_runtime_views -> backend.get_runtime_shapes/get_runtime_dtypes
+-> create_cache_component_views` builds ordinary tuples of component tensors.
+These functions live in the existing worker allocation module, following
+#21083. Shapes and dtypes belong to the main/indexer backends, not a separate
+GLM format dispatcher. Alignment and storage bounds remain checked.
 
-## Allocation and binding
+Main pages retain `[all token NoPE][all token RoPE]`; packed C8/TurboQuant main
+retains its packed token records. Indexer pages retain `[all K][all scale]`.
+C4 keeps its scale grouping axes. Only the block dimension is strided.
 
-`init_kv_cache -> allocate_kv_cache_main -> allocate_glm_cache_views`
-validates the full cache configuration and allocates one byte backing. Each
-component's address is computed from descriptor offset, layer stride and block
-stride; it does not infer block count from total allocation bytes.
+Existing Ascend binding assigns these tuples directly. A small AttentionGroup
+mapping adapter accepts SFA component tuples when manager/kernel block sizes
+match; upstream Tensor mapping remains in place for Tensor caches. Remove the
+adapter when upstream supports backend component views.
 
-Ordinary main pages retain `[all token NoPE][all token RoPE]`. Indexer pages
-retain `[all token K][all token scales]`. Packed C8/TurboQuant main pages retain
-their existing packed token records. All component inner dimensions are dense;
-only the first dimension carries the physical page stride.
+There is no GLMCacheComponents class, glm_cache_views.py module or new option.
+Ordinary resident GLM SFA configurations use the new allocator automatically.
+The entry-point scope predicate leaves Flash/mixed backends, CP, PD, KVPP,
+offload, host cache and block-splitting configurations on their existing path.
 
-The returned `GLMCacheComponents` is a tuple tag without additional storage.
-`map_glm_cache_components` passes these already kernel-ready views through and
-delegates all other caches to the original upstream mapping function. Existing
-Ascend `bind_kv_cache_to_layers` assigns the tuple directly to each owner.
-Main and indexer remain separate owners.
+## Cache writes
 
-## Writes
+Indexer and packed main call `DeviceOperator.scatter_paged_cache`. Dense
+caches retain the existing scatter path. Strided pages use byte views with
+`reshape_and_cache -> npu_scatter_pa_kv_cache`, preserving the destination's
+block stride. The single-component K/V alias convention follows the existing
+PCP path; native correctness still requires hardware verification.
 
-`AscendSFAIndexerBackend.forward -> write_cache -> store_paged_components`
-disables the flattened fused Triton store only for the tagged views. The normal
-quantization path converts scales to their cache dtype before writing.
+The existing fused INT8 indexer store remains enabled. Its addressing changes
+from `slot * width` to `block * block_stride + token * width`, independently
+for K and FP16 scales. Quantization and scale conversion stay unchanged.
 
-`AscendSFAImpl._store_packed_kv_cache -> store_paged_components` handles packed
-main records. Ordinary main continues using its existing native preprocessing
-operator with NoPE/RoPE component views.
+## Validation status
 
-`store_paged_components -> DeviceOperator.reshape_and_cache ->
-npu_scatter_pa_kv_cache(cache_mode="Norm")` reinterprets both components as
-INT8 bytes because the Norm K/V interface requires matching dtypes. Historical
-cache is never copied or flattened across blocks. Only current-token updates
-may be made contiguous. The single-component case passes identical K/V inputs
-and destinations, following the existing PCP convention.
-
-## Review and validation status
-
-Tests were added for descriptor placement, shared storage, component formats,
-padding preservation, negative-slot reference behavior, mapping, and invalid
-configuration. These tests have not been executed. Local Ruff checks/formatting
-were performed during development; verification was stopped at the author's
-request before publication.
-
-Before enabling by default, validate real A3/A5 PA scatter behavior for INT8
-byte views, narrow FP16 scale rows, aliased single-component destinations,
-negative slots, and entire-backing writeback. CPU reference tests cannot prove
-native kernel support. GLM 5.2/5.3 non-quantized, C8/C4 indexer and packed C8/TQ
-main combinations still need end-to-end accuracy, graph replay and performance
-checks. No new Ascend C kernel is introduced in this draft.
+The implementation and tests were rewritten for this structure. Per the
+request to publish before validation, no tests, NPU runs, benchmarks or lint
+checks were run for this revision. Previous draft checks do not validate this
+rewrite. Before merge, validate A3/A5 narrow-scale byte writes, alias writes,
+negative slots, full-backing isolation, graph replay, and model correctness
+and performance for non-quantized, C8/C4 indexer and C8/TQ main combinations.

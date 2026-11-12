@@ -13,7 +13,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     AttentionCGSupport,
@@ -30,7 +30,6 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
-from vllm_ascend.attention.glm_cache_views import GLMCacheComponents, store_paged_components
 from vllm_ascend.attention.indexer import AscendSFAIndexerCache
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.attention.utils import (
@@ -371,6 +370,22 @@ class AscendSFABackend(AttentionBackend):
         else:
             width = get_sfa_qsfa_packed_head_dim(spec.kv_lora_rank, spec.qk_rope_head_dim, SFA_QSFA_TILE_SIZE)
         return replace(spec, head_size=width)
+
+    @classmethod
+    def get_runtime_shapes(
+        cls, spec: AscendMLAAttentionSpec, num_blocks: int, layout: Any,
+        kernel_block_size: int | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Page components in byte shapes [B,H,N,C], as in the DSA backend."""
+        widths = (spec.kv_lora_rank, spec.qk_rope_head_dim)
+        if spec.uses_packed_sfa_main_cache:
+            widths = (spec.head_size,)
+        prefix = (num_blocks, spec.num_kv_heads, spec.block_size)
+        return tuple((*prefix, width * get_dtype_size(spec.dtype)) for width in widths)
+
+    @staticmethod
+    def get_runtime_dtypes(spec: AscendMLAAttentionSpec) -> tuple[torch.dtype, ...]:
+        return (spec.dtype,) if spec.uses_packed_sfa_main_cache else (spec.dtype, spec.dtype)
 
     accept_output_buffer: bool = True
 
@@ -1753,15 +1768,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
         assert packed_kv.shape[-1] == packed_head_dim
         packed_kv = packed_kv.view(-1, packed_head_dim)
-        if isinstance(kv_cache, GLMCacheComponents):
-            store_paged_components(
-                kv_cache, (packed_kv,), slot_mapping_sfa[: packed_kv.shape[0]], DeviceOperator.reshape_and_cache
-            )
-            return
-        DeviceOperator.scatter_cache(
-            kv_cache[0].view(-1, packed_head_dim),
-            slot_mapping_sfa[: packed_kv.shape[0]].view(-1, 1),
-            packed_kv,
+        DeviceOperator.scatter_paged_cache(
+            kv_cache[0], slot_mapping_sfa[: packed_kv.shape[0]], packed_kv
         )
 
     def _sync_pcp_kv_cache(self, kv_cache: tuple[torch.Tensor, ...], attn_metadata: M) -> None:

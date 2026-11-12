@@ -7,8 +7,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterf
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 
-from vllm_ascend.attention.glm_cache_views import map_glm_cache_components
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
+from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.patch.worker.patch_bind_kv_cache import (
     bind_kv_cache,
     bind_kv_cache_to_layers,
@@ -106,18 +106,20 @@ v1_worker_utils.bind_kv_cache_to_layers = bind_kv_cache_to_layers
 vllm.v1.worker.gpu.model_runner.get_kv_cache_spec = get_kv_cache_spec
 
 
-# Upstream maps a manager Tensor; GLM components are already kernel-ready.
-# Remove this bridge when upstream mapping supports backend component views.
-def _install_glm_component_mapping():
-    original = v1_worker_utils.map_kv_caches_to_kernel_blocks
+# Upstream AttentionGroup mapping accepts a Tensor, while Ascend SFA binds
+# component tuples. Remove this adapter when upstream supports backend views.
+def _install_sfa_component_mapping():
+    original = v1_worker_utils.AttentionGroup.map_kv_cache_to_kernel_blocks
 
-    def map_components(kv_caches, attn_groups):
-        return map_glm_cache_components(kv_caches, attn_groups, original)
+    def map_components(group, kv_cache):
+        if group.backend not in (AscendSFABackend, AscendSFAIndexerBackend) or isinstance(kv_cache, torch.Tensor):
+            return original(group, kv_cache)
+        if any(component.shape[1] != group.kernel_block_size for component in kv_cache):
+            raise ValueError("SFA component views require equal manager and kernel block sizes.")
+        return kv_cache
 
-    v1_worker_utils.map_kv_caches_to_kernel_blocks = map_components
-    vllm.v1.worker.gpu.attn_utils.map_kv_caches_to_kernel_blocks = map_components
-    gpu_model_runner_v2.init_kv_cache.__globals__["map_kv_caches_to_kernel_blocks"] = map_components
+    v1_worker_utils.AttentionGroup.map_kv_cache_to_kernel_blocks = map_components
 
 
 if not vllm_version_is("0.33.0"):
-    _install_glm_component_mapping()
+    _install_sfa_component_mapping()

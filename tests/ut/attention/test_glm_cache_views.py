@@ -3,20 +3,16 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import patch
 
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
-from vllm_ascend.attention.glm_cache_views import (
-    GLMCacheComponents,
-    allocate_glm_cache_views,
-    component_layout,
-    map_glm_cache_components,
-    store_paged_components,
-)
+from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
+from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.worker.v2 import attn_utils
 
 
 def make_config():
@@ -50,135 +46,76 @@ def make_config():
     )
 
 
-def allocate(config=None, device="cpu"):
-    raw = torch.full((1024,), 33, dtype=torch.int8, device=device)
-    allocator = Mock(return_value=raw)
-    caches = allocate_glm_cache_views(config or make_config(), [4, 4], allocator)
-    allocator.assert_called_once_with(1024)
+
+def allocate(config=None):
+    config = config or make_config()
+    raw = torch.full((1024,), 33, dtype=torch.int8)
+    layers = {
+        name: SimpleNamespace(get_attn_backend=lambda backend=backend: backend)
+        for group, backend in zip(config.kv_cache_groups, (AscendSFABackend, AscendSFAIndexerBackend))
+        for name in group.layer_names
+    }
+    with (
+        patch.object(attn_utils, "get_current_vllm_config"),
+        patch.object(attn_utils, "get_layers_from_vllm_config", return_value=layers),
+        patch.object(attn_utils, "_allocate_int8_cache_tensor", return_value=raw) as allocator,
+    ):
+        caches = attn_utils.unified_allocate_kv_cache(config, torch.device("cpu"), None, [4, 4])
+        allocator.assert_called_once_with(1024, 2 * 1024 * 1024, torch.device("cpu"))
     return raw, caches
 
 
-def test_page_major_components_alias_backing_without_touching_neighbors():
+def test_component_views_preserve_page_format_and_storage():
     raw, caches = allocate()
     nope, rope = caches["main.0"]
     key, scale = caches["indexer.0"]
-    assert isinstance(caches["main.0"], GLMCacheComponents)
+    assert type(caches["main.0"]) is tuple
     assert nope.shape == (3, 4, 1, 8)
     assert rope.shape == (3, 4, 1, 4)
-    assert key.shape == (3, 4, 1, 8)
-    assert scale.shape == (3, 4, 1, 1)
     assert nope.stride() == (160, 8, 8, 1)
     assert key.stride() == (320, 8, 8, 1)
     assert scale.stride() == (160, 1, 1, 1)
-    for cache in caches.values():
-        for component in cache:
-            assert component.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     assert rope.data_ptr() - nope.data_ptr() == 64
     assert scale.data_ptr() - key.data_ptr() == 32
     assert caches["main.1"][0].data_ptr() - nope.data_ptr() == 96
+    for components in caches.values():
+        for component in components:
+            assert component.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
     key[1, 2].fill_(7)
     scale[1, 2].fill_(0.5)
     expected = torch.full_like(raw, 33)
-    expected[224 + 320 + 16 : 224 + 320 + 24] = 7
-    expected[224 + 320 + 32 + 4 : 224 + 320 + 32 + 6] = torch.tensor([0.5], dtype=torch.float16).view(torch.int8)
+    expected[560:568] = 7
+    expected[580:582] = torch.tensor([0.5], dtype=torch.float16).view(torch.int8)
     assert torch.equal(raw, expected)
-
-
-@pytest.mark.parametrize(
-    "field,value,message",
-    [
-        ("size", 2048, "one shared backing"),
-        ("offset", 1000, "exceeds backing"),
-        ("offset", 225, "Unaligned"),
-        ("block_stride", 16, "geometry mismatch"),
-        ("layer_stride", 0, "positive layer stride"),
-        ("host_resident", True, "device descriptors"),
-    ],
-)
-def test_invalid_descriptor_rejected_before_allocation(field, value, message):
-    config = make_config()
-    config.kv_cache_tensors[1] = replace(config.kv_cache_tensors[1], **{field: value})
-    allocator = Mock()
-    with pytest.raises(ValueError, match=message):
-        allocate_glm_cache_views(config, [4, 4], allocator)
-    allocator.assert_not_called()
-
-
-def test_block_split_and_missing_owner_rejected():
-    config = make_config()
-    allocator = Mock()
-    with pytest.raises(ValueError, match="block splitting"):
-        allocate_glm_cache_views(config, [2, 4], allocator)
-    config.kv_cache_tensors.pop()
-    with pytest.raises(ValueError, match="every owner"):
-        allocate_glm_cache_views(config, [4, 4], allocator)
-    allocator.assert_not_called()
 
 
 @pytest.mark.parametrize("flag", ["cache_sparse_sfa_c8", "cache_sparse_sfa_turboquant"])
-def test_packed_main_preserves_record_width(flag):
+def test_packed_main_runtime_shape(flag):
     spec = replace(make_config().kv_cache_groups[0].kv_cache_spec, dtype=torch.int8, head_size=386, **{flag: True})
-    assert component_layout(spec) == [((1, 386), torch.int8)]
+    assert AscendSFABackend.get_runtime_shapes(spec, 3, None) == ((3, 1, 4, 386),)
+    assert AscendSFABackend.get_runtime_dtypes(spec) == (torch.int8,)
 
 
-def test_c4_scale_shape_and_replicated_rejection():
+def test_c4_scale_axes_are_backend_owned():
     spec = replace(make_config().kv_cache_groups[1].kv_cache_spec, scale_dim=4, cache_sparse_li_c4=True)
-    assert component_layout(spec)[1][0] == (1, 2, 2)
-    with pytest.raises(ValueError, match="Replicated"):
-        component_layout(replace(spec, sfa_dcp_replicated_indexer_size=2))
+    assert AscendSFAIndexerBackend.get_runtime_shapes(spec, 3, None)[1] == (3, 1, 4, 2, 4)
 
 
-def test_mapping_preserves_component_identity_and_delegates_other_caches():
-    _, caches = allocate()
-    groups = [SimpleNamespace(layer_names=list(caches), kernel_block_size=4)]
-    legacy = torch.empty(1)
-    original = Mock(side_effect=lambda values, groups: values)
-    result = map_glm_cache_components({**caches, "other": legacy}, iter(groups), original)
-    assert original.call_args.args[0] == {"other": legacy}
-    assert result["main.0"] is caches["main.0"]
-    groups[0].kernel_block_size = 2
-    with pytest.raises(ValueError, match="cannot be split"):
-        map_glm_cache_components(caches, groups, original)
+@pytest.mark.parametrize("offset,stride,message", [(1, 320, "aligned"), (0, 319, "aligned"), (900, 320, "exceeds")])
+def test_component_alignment_and_bounds(offset, stride, message):
+    raw = torch.empty(1024, dtype=torch.int8)
+    with pytest.raises(ValueError, match=message):
+        attn_utils.create_cache_component_views(raw[offset:], [(3, 4, 1, 8)], [torch.float16], stride)
 
 
-def reference_scatter(key, value, key_cache, value_cache, slots):
-    # CPU reference validates adaptation only, not native kernel support.
-    for updates, cache in ((key, key_cache), (value, value_cache)):
-        for row, slot in enumerate(slots.tolist()):
-            if slot >= 0:
-                block, token = divmod(slot, cache.shape[1])
-                cache[block, token] = updates[row]
-
-
-def test_byte_store_updates_underlying_storage_and_skips_padding():
-    raw, caches = allocate()
-    before = raw.clone()
-    keys = torch.arange(32, dtype=torch.int8).view(4, 8)
-    scales = torch.tensor([[0.5], [1.25], [2.5], [4.0]], dtype=torch.float16)
-    slots = torch.tensor([0, 5, -1, 11])
-    store_paged_components(caches["indexer.0"], (keys, scales), slots, reference_scatter)
-    expected = before.clone()
-    for row, slot in enumerate(slots.tolist()):
-        if slot < 0:
-            continue
-        block, token = divmod(slot, 4)
-        start = 224 + block * 320
-        expected[start + token * 8 : start + (token + 1) * 8] = keys[row]
-        expected[start + 32 + token * 2 : start + 34 + token * 2] = scales[row].view(torch.int8)
-    assert torch.equal(raw, expected)
-
-
-def test_empty_store_does_not_launch_and_dtype_mismatch_rejected():
-    _, caches = allocate()
-    scatter = Mock()
-    store_paged_components(
-        caches["indexer.0"],
-        (torch.empty(0, 8, dtype=torch.int8), torch.empty(0, 1)),
-        torch.empty(0, dtype=torch.int64),
-        scatter,
-    )
-    scatter.assert_not_called()
-    with pytest.raises(ValueError, match="dtype/token mismatch"):
-        store_paged_components(
-            caches["indexer.0"], (torch.zeros(1, 8, dtype=torch.int8), torch.ones(1, 1)), torch.tensor([0]), scatter
-        )
+def test_invalid_placement_does_not_allocate():
+    config = make_config()
+    config.kv_cache_tensors[1] = replace(config.kv_cache_tensors[1], offset=1000)
+    with (
+        patch.object(attn_utils, "get_current_vllm_config"),
+        patch.object(attn_utils, "get_layers_from_vllm_config", return_value={}),
+        patch.object(attn_utils, "_allocate_int8_cache_tensor") as allocator,
+        pytest.raises(ValueError, match="exceeds"),
+    ):
+        attn_utils.unified_allocate_kv_cache(config, torch.device("cpu"), None, [4, 4])
+    allocator.assert_not_called()
