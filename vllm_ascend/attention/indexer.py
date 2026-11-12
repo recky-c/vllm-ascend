@@ -43,6 +43,7 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
     get_sfa_pcp_global_metadata,
 )
 from vllm_ascend.attention.context_parallel.sharded_indexer import use_local_topk_output
+from vllm_ascend.attention.glm_cache_views import GLMCacheComponents, store_paged_components
 from vllm_ascend.attention.utils import split_decodes_and_prefills, uses_pcp_sharded_layout
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.device.device_op import DeviceOperator
@@ -512,6 +513,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         with a different cache layout should override it. Page-strided views
         require the builder's matching ``cache_scatter_indices``.
         """
+        if isinstance(self.k_cache.kv_cache, GLMCacheComponents):
+            updates = (k_li,)
+            if self.enable_sparse_li_quant:
+                assert k_li_scale is not None
+                updates += (k_li_scale,)
+            store_paged_components(self.k_cache.kv_cache, updates, slot_mapping, DeviceOperator.reshape_and_cache)
+            return
         indexer_k_cache = self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT]
         # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter
         # kernel; view as uint8 (same 1-byte layout) for the cache write.
