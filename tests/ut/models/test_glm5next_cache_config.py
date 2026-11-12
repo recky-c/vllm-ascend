@@ -397,3 +397,32 @@ def test_glm53_flash_small_pool_does_not_pad_main_pool(large_owner):
     assert sum(tensor.size for tensor in physical.kv_cache_tensors) == 7 * cost
     assert {tensor.block_stride for tensor in physical.kv_cache_tensors} == {main_page, small_page}
     assert all(specs[name] is spec for name, spec in original.items())
+
+
+@pytest.fixture(autouse=True)
+def legacy_slot_allocation(monkeypatch):
+    # Existing cases exercise the retained transfer/release slot ABI.
+    monkeypatch.setattr(
+        "vllm_ascend.models.glm5next.cache_config.uses_glm5_next_unified_cache", lambda config: False
+    )
+
+
+def test_shared_slot_descriptors_preserve_budget_and_aliases(monkeypatch):
+    from vllm_ascend.models.glm5next import cache_config
+
+    config = make_config()
+    groups = get_glm5_next_kv_cache_groups(config, make_specs())
+    budget = 3 * get_glm5_next_pool_bytes_per_block(groups)
+    legacy = get_glm5_next_kv_cache_config(config, groups, budget)
+    monkeypatch.setattr(cache_config, "uses_glm5_next_unified_cache", lambda config: True)
+    shared = get_glm5_next_kv_cache_config(config, groups, budget)
+    assert shared.num_blocks == legacy.num_blocks
+    offset = 0
+    for old, new in zip(legacy.kv_cache_tensors, shared.kv_cache_tensors, strict=True):
+        assert new.size == budget
+        assert new.offset == offset
+        assert new.layers == old.layers
+        assert new.layer_stride == old.layer_stride == 0
+        assert new.block_stride == old.block_stride
+        offset += old.size
+    assert offset == budget

@@ -4,8 +4,9 @@
 
 The main MLA cache and compressed indexer cache share scheduler block IDs,
 while compressor tail and every KDA/Mamba group allocate IDs independently.
-Physical storage uses standard unpacked KV cache descriptors with two page-size
-classes: main MLA/KDA pages and compressed-indexer/tail pages.
+Physical slots have two page-size classes: main MLA/KDA pages and compressed
+indexer/tail pages. Main's resident path places these slots in one backing;
+transfer/KVPP and the release runner retain separate slot allocations.
 """
 
 from dataclasses import dataclass, replace
@@ -30,12 +31,14 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
 )
+from vllm_ascend.utils import vllm_version_is
 
 
 @dataclass(frozen=True)
@@ -399,12 +402,32 @@ def get_glm5_next_pool_bytes_per_block(groups: list[KVCacheGroupSpec]) -> int:
     return layout.main_slot_count * layout.main_page_size + layout.small_slot_count * layout.small_page_size
 
 
+def uses_glm5_next_unified_cache(vllm_config: VllmConfig) -> bool:
+    """Use descriptor-backed runtime views on main, without changing transfer/KVPP layouts."""
+    return (
+        not vllm_version_is("0.33.0")
+        and vllm_config.kv_transfer_config is None
+        and KVPPConfig.from_vllm_config(vllm_config).size == 1
+    )
+
+
+def pack_glm5_next_cache_slots(tensors: list[KVCacheTensor]) -> list[KVCacheTensor]:
+    """Place physical slots consecutively; owners aliasing a slot stay aliases."""
+    backing_size = sum(tensor.size for tensor in tensors)
+    offset = 0
+    packed = []
+    for tensor in tensors:
+        packed.append(replace(tensor, size=backing_size, offset=offset))
+        offset += tensor.size
+    return packed
+
+
 def get_glm5_next_kv_cache_config(
     vllm_config: VllmConfig,
     groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> KVCacheConfig:
-    """Describe one standard unpacked tensor per physical cache slot."""
+    """Describe physical slots, preserving group aliases and the pool byte budget."""
 
     layout = _get_glm5_next_cache_layout(groups)
     if layout is None:
@@ -451,6 +474,8 @@ def get_glm5_next_kv_cache_config(
             )
         )
 
+    if uses_glm5_next_unified_cache(vllm_config):
+        tensors = pack_glm5_next_cache_slots(tensors)
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=tensors,
