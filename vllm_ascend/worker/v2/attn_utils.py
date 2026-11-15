@@ -1449,8 +1449,7 @@ def create_cache_component_views(
     placements and shared-layer aliases for the unified allocation path.
     """
     component_bytes = sum(
-        math.prod(shape[1:]) * get_dtype_size(dtype)
-        for shape, dtype in zip(cache_shapes, cache_dtypes, strict=True)
+        math.prod(shape[1:]) * get_dtype_size(dtype) for shape, dtype in zip(cache_shapes, cache_dtypes, strict=True)
     )
     if component_bytes > block_stride:
         raise ValueError("Cache components do not fit one physical kernel page.")
@@ -1629,9 +1628,8 @@ def allocate_kv_cache_main(
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
 
-    if (
-        _get_glm5_next_cache_layout(kv_cache_config.kv_cache_groups) is not None
-        and uses_glm5_next_unified_cache(vllm_config)
+    if _get_glm5_next_cache_layout(kv_cache_config.kv_cache_groups) is not None and uses_glm5_next_unified_cache(
+        vllm_config
     ):
         return unified_allocate_kv_cache(kv_cache_config, device, layout, kernel_block_sizes)
 

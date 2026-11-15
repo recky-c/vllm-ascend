@@ -7,7 +7,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterf
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
 
 from vllm_ascend.attention.indexer import AscendHiSparseIndexerBackend, AscendSFAIndexerBackend
 from vllm_ascend.attention.indexer_kpool import AscendIndexerKPoolBackend, AscendIndexerKPoolTailBackend

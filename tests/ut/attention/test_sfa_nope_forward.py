@@ -94,6 +94,7 @@ def test_nope_exec_kv_writes_strided_pages_without_touching_padding():
         enable_sparse_sfa_c8=False,
     )
     impl._exec_kv_local = AscendSFAImpl._exec_kv_local.__get__(impl)
+
     def write_rows(key, value, key_cache, value_cache, slot_mapping):
         assert key_cache.data_ptr() == cache.data_ptr()
         assert key_cache.stride(0) == cache.stride(0)

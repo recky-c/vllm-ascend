@@ -43,9 +43,8 @@ pytestmark = pytest.mark.usefixtures("keypool_kernels")
 @pytest.fixture
 def keypool_kernels(monkeypatch):
     # Existing metadata fixtures use the retained legacy cache layout.
-    monkeypatch.setattr(
-        "vllm_ascend.attention.indexer_kpool.uses_glm5_next_unified_cache", lambda config: False
-    )
+    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.uses_glm5_next_unified_cache", lambda config: False)
+
     def metadata(common, buffers, tokens, *_, **kwargs):
         n = common.num_reqs
         keys = "positions slot_mapping seq_lens raw_seq_lens query_start_loc cum_query_lens start_pos pool_tail"
@@ -779,18 +778,19 @@ def test_incomplete_inputs_fail_before_kernel_launch(field, keypool_kernels):
 def test_tail_metadata_uses_bound_stride(keypool_kernels, monkeypatch):
     config, common = _config(), _common()
     spec = AscendIndexerKPoolTailSpec(
-        block_size=4, ring_capacity=4, sliding_window=4, compress_ratio=4,
-        num_kv_heads=1, head_size=128, dtype=torch.float32,
+        block_size=4,
+        ring_capacity=4,
+        sliding_window=4,
+        compress_ratio=4,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
     )
     storage = torch.zeros(2 * 8192, dtype=torch.float32)
     tail = storage.as_strided((2, 4, 256), (8192, 256, 1))
     owner = SimpleNamespace(kv_cache=(tail,))
     config.compilation_config = SimpleNamespace(static_forward_context={"layer.indexer.tail_cache": owner})
-    monkeypatch.setattr(
-        "vllm_ascend.attention.indexer_kpool.uses_glm5_next_unified_cache", lambda config: True
-    )
-    builder = AscendIndexerKPoolTailMetadataBuilder(
-        spec, ["layer.indexer.tail_cache"], config, torch.device("cpu")
-    )
+    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.uses_glm5_next_unified_cache", lambda config: True)
+    builder = AscendIndexerKPoolTailMetadataBuilder(spec, ["layer.indexer.tail_cache"], config, torch.device("cpu"))
     builder.build(0, common)
     assert keypool_kernels.build_tail_inputs.call_args.args[3] == 32

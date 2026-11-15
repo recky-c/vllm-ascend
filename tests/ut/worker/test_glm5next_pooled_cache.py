@@ -345,9 +345,7 @@ def test_padded_page_layout_rejected_for_packed_hybrid_pool():
 @pytest.fixture(autouse=True)
 def legacy_slot_allocation(monkeypatch):
     # Existing cases exercise the retained transfer/release slot ABI.
-    monkeypatch.setattr(
-        "vllm_ascend.models.glm5next.cache_config.uses_glm5_next_unified_cache", lambda config: False
-    )
+    monkeypatch.setattr("vllm_ascend.models.glm5next.cache_config.uses_glm5_next_unified_cache", lambda config: False)
 
 
 @pytest.mark.parametrize("quantized", [False, True])
@@ -368,8 +366,9 @@ def test_unified_flash_views_preserve_aliases_and_kernel_pages(monkeypatch, quan
     plan = get_glm5_next_kv_cache_config(config, groups, 3 * get_glm5_next_pool_bytes_per_block(groups))
     backends = {MAIN: AscendSFABackend, INDEXER: AscendIndexerKPoolBackend, STATE: AscendIndexerKPoolTailBackend}
     layers = {
-        name: SimpleNamespace(get_attn_backend=lambda backend=backends.get(name, AscendSFABackend): backend)
-        for group in groups for name in group.layer_names
+        name: SimpleNamespace(get_attn_backend=lambda name=name: backends.get(name, AscendSFABackend))
+        for group in groups
+        for name in group.layer_names
     }
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *args: layers)
@@ -380,9 +379,7 @@ def test_unified_flash_views_preserve_aliases_and_kernel_pages(monkeypatch, quan
         return torch.zeros(size, dtype=torch.int8)
 
     monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", allocate)
-    caches = attn_utils.unified_allocate_kv_cache(
-        plan, torch.device("cpu"), None, [kernel_tokens, 2, 8]
-    )
+    caches = attn_utils.unified_allocate_kv_cache(plan, torch.device("cpu"), None, [kernel_tokens, 2, 8])
     assert sizes == [plan.kv_cache_tensors[0].size]
     components = [component for cache in caches.values() for component in cache]
     assert len({component.untyped_storage().data_ptr() for component in components}) == 1

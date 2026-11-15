@@ -415,7 +415,10 @@ def test_glm53_flash_planning_preserves_owner_specs_and_two_page_classes(pool):
     assert {name: spec.page_size_padded for name, spec in specs.items()} == owner_padding
     assert {name: spec.block_size for name, spec in specs.items()} == owner_blocks
     assert layout.main_page_size == specs["model.layers.3.attn"].page_size_bytes
-    assert layout.small_page_size == max(specs["model.layers.3.indexer.k_cache"].page_size_bytes, specs["model.layers.3.indexer.tail_cache"].page_size_bytes)
+    assert layout.small_page_size == max(
+        specs["model.layers.3.indexer.k_cache"].page_size_bytes,
+        specs["model.layers.3.indexer.tail_cache"].page_size_bytes,
+    )
     repeated = get_glm5_next_kv_cache_groups(make_config(), specs)
     assert _get_glm5_next_cache_layout(repeated) == layout
 
@@ -451,9 +454,7 @@ def test_glm53_flash_small_pool_does_not_pad_main_pool(large_owner):
 @pytest.fixture(autouse=True)
 def legacy_slot_allocation(monkeypatch):
     # Existing cases exercise the retained transfer/release slot ABI.
-    monkeypatch.setattr(
-        "vllm_ascend.models.glm5next.cache_config.uses_glm5_next_unified_cache", lambda config: False
-    )
+    monkeypatch.setattr("vllm_ascend.models.glm5next.cache_config.uses_glm5_next_unified_cache", lambda config: False)
 
 
 def test_shared_slot_descriptors_preserve_budget_and_aliases(monkeypatch):
