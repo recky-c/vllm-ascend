@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Store native-quantized indexer keys and scales in one kernel.
+"""Store native-quantized indexer keys and one scale per token in one kernel.
 
-Keep native quantization and its INT8 tie behavior. Only final scale conversion
-and the two scatters are fused. Valid cache slots must be unique, as provided
-by decode slot mapping; padded negative slots are skipped.
+Keep native quantization and its INT8 tie behavior. The destination scale dtype
+controls the final conversion (FP16 or FP32). Inputs must be contiguous and the
+key width a power of two. Valid cache slots must be unique; padded negative
+slots are skipped. K and scale may have different page strides.
 """
 
 import torch

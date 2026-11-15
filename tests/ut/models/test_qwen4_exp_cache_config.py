@@ -327,6 +327,7 @@ def _allocate_mrv2_kv_cache(
     """Allocate and materialize Qwen4Exp cache views through MRV2 only."""
     vllm_config = SimpleNamespace(
         additional_config={},
+        parallel_config=SimpleNamespace(),
         kv_transfer_config=kv_transfer_config,
         cache_config=SimpleNamespace(cache_dtype="auto"),
         model_config=SimpleNamespace(
@@ -792,7 +793,13 @@ def test_public_qwen4_grouping_and_pool_charge_match_physical_backing() -> None:
 
     config = object()
     groups = get_qwen4_exp_kv_cache_groups(config, specs, upstream)
-    assert calls == [(config, specs)]
+    assert len(calls) == 1 and calls[0][0] is config
+    assert calls[0][1].keys() == specs.keys()
+    state_page = max(s.page_size_bytes for s in specs.values() if isinstance(s, MambaSpec))
+    for name, spec in specs.items():
+        assert calls[0][1][name].page_size_bytes == (
+            spec.page_size_bytes if isinstance(spec, MambaSpec) else max(state_page, spec.page_size_bytes)
+        )
     assert groups is not None
     assert len(groups) == 6
     assert sorted(name for group in groups for name in group.layer_names) == sorted(specs)

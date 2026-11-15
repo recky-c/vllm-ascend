@@ -13,7 +13,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,  # type: ignore
     AttentionCGSupport,
@@ -373,6 +373,28 @@ class AscendSFABackend(AttentionBackend):
             width = get_sfa_qsfa_packed_head_dim(spec.kv_lora_rank, spec.qk_rope_head_dim, SFA_QSFA_TILE_SIZE)
         # mypy --follow-imports skip cannot see the upstream dataclass fields.
         return replace(spec, head_size=width)  # type: ignore[call-arg]
+
+    @classmethod
+    def get_runtime_shapes(
+        cls,
+        spec: AscendMLAAttentionSpec,
+        num_blocks: int,
+        layout: Any,
+        kernel_block_size: int | None = None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Page components in byte shapes [B,H,N,C], as in the DSA backend."""
+        widths: tuple[int, ...]
+        if spec.uses_packed_sfa_main_cache:
+            widths = (spec.head_size,)
+        else:
+            assert spec.kv_lora_rank is not None and spec.qk_rope_head_dim is not None
+            widths = (spec.kv_lora_rank, spec.qk_rope_head_dim)
+        prefix = (num_blocks, spec.num_kv_heads, spec.block_size)
+        return tuple((*prefix, width * get_dtype_size(spec.dtype)) for width in widths)
+
+    @staticmethod
+    def get_runtime_dtypes(spec: AscendMLAAttentionSpec) -> tuple[torch.dtype, ...]:
+        return (spec.dtype,) if spec.uses_packed_sfa_main_cache else (spec.dtype, spec.dtype)
 
     accept_output_buffer: bool = True
 
@@ -1840,11 +1862,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
         assert packed_kv.shape[-1] == packed_head_dim
         packed_kv = packed_kv.view(-1, packed_head_dim)
-        DeviceOperator.scatter_cache(
-            kv_cache[0].view(-1, packed_head_dim),
-            slot_mapping_sfa[: packed_kv.shape[0]].view(-1, 1),
-            packed_kv,
-        )
+        cache = kv_cache[0]
+        slots = slot_mapping_sfa[: packed_kv.shape[0]]
+        if packed_kv.shape[0] == 0:
+            return
+        if cache.is_contiguous():
+            DeviceOperator.scatter_cache(cache.view(-1, packed_head_dim), slots.view(-1, 1), packed_kv)
+        else:
+            rows = packed_kv.view(-1, 1, packed_head_dim)
+            DeviceOperator.reshape_and_cache(rows, rows, cache, cache, slots)
 
     def _sync_pcp_kv_cache(self, kv_cache: tuple[torch.Tensor, ...], attn_metadata: M) -> None:
         local_slots = attn_metadata.pcp_prolog_local_slots

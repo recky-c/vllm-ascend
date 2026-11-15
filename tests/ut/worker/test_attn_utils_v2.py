@@ -182,7 +182,7 @@ def test_main_allocator_attention_layout(
         additional_config={},
         cache_config=SimpleNamespace(cache_dtype="auto"),
         kv_transfer_config=object() if kv_transfer else None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         parallel_config=SimpleNamespace(decode_context_parallel_size=2 if cache_kind == "dcp" else 1),
         quant_config=None,
     )
@@ -272,7 +272,7 @@ def test_sparse_offload_allocator_uses_host_main_cache_and_device_resident_buffe
         additional_config={},
         cache_config=SimpleNamespace(cache_dtype="auto"),
         kv_transfer_config=object(),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         parallel_config=SimpleNamespace(),
     )
     calls = []
@@ -336,7 +336,7 @@ def test_hybrid_allocator_keeps_shared_backing_with_pa_configured(monkeypatch, p
     vllm_config = SimpleNamespace(
         additional_config={},
         kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         quant_config=None,
     )
@@ -362,7 +362,7 @@ def test_hybrid_attention_layout_preserves_padding(monkeypatch):
     group = SimpleNamespace(kv_cache_group_id=0, kv_cache_spec=spec, backend=AscendAttentionBackend, layer_names=[name])
     vllm_config = SimpleNamespace(
         kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         cache_config=SimpleNamespace(cache_dtype="auto"),
     )
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
@@ -412,7 +412,7 @@ def test_padded_full_attention_allocation_preserves_backend_behavior(monkeypatch
     vllm_config = SimpleNamespace(
         additional_config={},
         kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         quant_config=None,
     )
@@ -533,7 +533,7 @@ def test_v2_mla_single_raw_backing_selects_layout_by_resolved_backend(monkeypatc
         cache_config=SimpleNamespace(cache_dtype="auto"),
         compilation_config=SimpleNamespace(static_forward_context={layer_name: attn_module}),
         kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         quant_config=None,
     )
     kv_cache_config = KVCacheConfig(
@@ -2388,7 +2388,7 @@ def test_sfa_indexer_allocates_and_reshapes_scale_views(
     vllm_config = SimpleNamespace(
         additional_config={},
         kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
@@ -2538,7 +2538,7 @@ def test_sfa_indexer_li_c4_allocates_and_reshapes_scale_views(monkeypatch):
     vllm_config = SimpleNamespace(
         additional_config={},
         kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
@@ -2990,7 +2990,7 @@ def test_hybrid_mla_manager_pages_do_not_alias_other_mamba_blocks(
     vllm_config = SimpleNamespace(
         additional_config={},
         kv_transfer_config=None,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         quant_config=None,
     )
