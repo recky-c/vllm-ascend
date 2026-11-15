@@ -720,3 +720,41 @@ def test_c8_cache_write_selects_page_store(monkeypatch, key_dtype, scale_dtype, 
     else:
         store.assert_not_called()
         assert scatter.call_count == 2
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_c4_page_write_pairs_key_and_scale_without_copying_destination(monkeypatch, empty):
+    from vllm_ascend.worker.v2.attn_utils import create_cache_component_views
+
+    raw = torch.full((3 * 304,), 19, dtype=torch.int8)
+    key, scale = create_cache_component_views(
+        raw, [(3, 4, 1, 64), (3, 4, 1, 2, 2)], [torch.uint8, torch.uint8], 304
+    )
+    before = raw.clone()
+    backend = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+    backend.enable_sparse_li_c4, backend.enable_sparse_li_c8 = True, False
+    backend.k_cache = SimpleNamespace(kv_cache=(key, scale))
+    slots = torch.tensor([] if empty else [3, 4, -1], dtype=torch.int32)
+    keys = torch.arange(slots.numel() * 64, dtype=torch.uint8).view(-1, 64)
+    scales = torch.arange(slots.numel() * 4, dtype=torch.uint8).view(-1, 2, 2)
+
+    def write(k, v, kc, vc, indices):
+        assert kc.data_ptr() == key.data_ptr() and vc.data_ptr() == scale.data_ptr()
+        assert kc.stride(0) == vc.stride(0) == 304
+        assert k.dtype == v.dtype == kc.dtype == vc.dtype == torch.int8
+        assert k.shape[-1] == 64 and v.shape[-1] == 4
+        for i, slot in enumerate(indices.tolist()):
+            if slot >= 0:
+                kc[slot // 4, slot % 4].copy_(k[i])
+                vc[slot // 4, slot % 4].copy_(v[i])
+
+    paired = Mock(side_effect=write)
+    monkeypatch.setattr(indexer_module.DeviceOperator, "reshape_and_cache", paired)
+    backend.write_cache(keys, scales, slots)
+    assert paired.call_count == (0 if empty else 1)
+    for i, slot in enumerate(slots.tolist()):
+        if slot >= 0:
+            page, token = divmod(slot, 4)
+            before[page * 304 + token * 64:page * 304 + (token + 1) * 64] = keys[i].view(torch.int8)
+            before[page * 304 + 256 + token * 4:page * 304 + 256 + (token + 1) * 4] = scales[i].view(torch.int8).flatten()
+    assert torch.equal(raw, before)
