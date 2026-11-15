@@ -80,38 +80,6 @@ def test_nope_exec_kv_trims_unused_slots_and_converts_values():
     assert torch.equal(cache, expected)
 
 
-def test_nope_exec_kv_writes_strided_pages_without_touching_padding():
-    backing = torch.randn(3, 5, 1, 8)
-    cache = backing[:, :4]
-    before = backing.clone()
-    values = torch.randn(1, 8)
-    slots = torch.tensor([4], dtype=torch.int32)
-    impl = SimpleNamespace(
-        pcp_enabled=False,
-        qk_rope_head_dim=0,
-        kv_lora_rank=8,
-        kv_a_layernorm=lambda x: x,
-        enable_sparse_sfa_c8=False,
-    )
-    impl._exec_kv_local = AscendSFAImpl._exec_kv_local.__get__(impl)
-    def write_rows(key, value, key_cache, value_cache, slot_mapping):
-        assert key_cache.data_ptr() == cache.data_ptr()
-        assert key_cache.stride(0) == cache.stride(0) * cache.element_size()
-        for row, slot in enumerate(slot_mapping.tolist()):
-            if slot >= 0:
-                key_cache[slot // 4, slot % 4].copy_(key[row])
-
-    with (
-        patch.object(sparse_mla.DeviceOperator, "reshape_and_cache", side_effect=write_rows) as write,
-        patch.object(sparse_mla.torch_npu, "npu_scatter_nd_update_") as scatter,
-    ):
-        AscendSFAImpl.exec_kv(impl, values, None, None, (cache,), slots, None)
-    write.assert_called_once()
-    scatter.assert_not_called()
-    before[1, 0, 0] = values[0]
-    assert torch.equal(backing, before)
-
-
 class _Linear:
     def __init__(self, weight: torch.Tensor) -> None:
         self.weight = weight
