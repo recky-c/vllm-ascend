@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, compute_layout_strides
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
@@ -119,3 +120,37 @@ def test_invalid_placement_does_not_allocate():
     ):
         attn_utils.unified_allocate_kv_cache(config, torch.device("cpu"), None, [4, 4])
     allocator.assert_not_called()
+
+
+@pytest.mark.parametrize("replicas", [1, 2])
+@pytest.mark.parametrize(
+    "dtype,width,scale_dim,scale_dtype,c4",
+    [
+        (torch.bfloat16, 128, 0, torch.int8, False),
+        (torch.int8, 128, 1, torch.float16, False),
+        (torch.float8_e4m3fn, 128, 1, torch.float32, False),
+        (torch.int8, 64, 4, torch.uint8, True),
+    ],
+)
+def test_upstream_indexer_placement_includes_scales_and_replicas(dtype, width, scale_dim, scale_dtype, c4, replicas):
+    spec = AscendSFAIndexerCacheSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=width,
+        dtype=dtype,
+        scale_dim=scale_dim,
+        scale_dtype=scale_dtype,
+        cache_sparse_li_c8=scale_dim > 0,
+        cache_sparse_li_c4=c4,
+        sfa_dcp_replicated_indexer_size=replicas,
+    )
+    strides = compute_layout_strides(spec, 3, 2, KVCacheLayout.LBHNC)
+    page_bytes = 128 * replicas * (
+        width * torch.empty((), dtype=dtype).element_size()
+        + scale_dim * torch.empty((), dtype=scale_dtype).element_size()
+    )
+    assert strides[1] == page_bytes
+    assert strides[0] == 3 * page_bytes
+    assert spec.page_size_bytes == page_bytes
+    # The final layer's final page must fit the upstream backing exactly.
+    assert strides[0] + 2 * strides[1] + spec.page_size_bytes == 6 * page_bytes

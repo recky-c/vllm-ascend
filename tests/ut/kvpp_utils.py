@@ -31,6 +31,7 @@ def make_kvpp_config(tp=3, pcp=1):
         num_speculative_tokens_per_batch_size=None,
     )
     speculative_config.use_eagle = lambda: speculative_config.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+    hf_config = SimpleNamespace(num_hidden_layers=17, num_nextn_predict_layers=1)
     return SimpleNamespace(
         use_v2_model_runner=True,
         compilation_config=SimpleNamespace(
@@ -46,7 +47,8 @@ def make_kvpp_config(tp=3, pcp=1):
             decode_context_parallel_size=1,
         ),
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=17, num_nextn_predict_layers=1),
+            hf_config=hf_config,
+            hf_text_config=hf_config,
             enforce_eager=True,
             use_mla=True,
             is_hybrid=False,

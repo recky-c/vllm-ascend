@@ -353,6 +353,13 @@ class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
         )
 
     @property
+    def state_content_size_bytes(self) -> int:
+        """Physical bytes per state, including scales and CP replicas."""
+        return self.sfa_dcp_replicated_indexer_size * (
+            self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype)
+        )
+
+    @property
     def page_size_bytes(self) -> int:
         return self.real_page_size_bytes
 
