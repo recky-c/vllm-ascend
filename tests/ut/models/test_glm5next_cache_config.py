@@ -230,11 +230,14 @@ def test_fp8_shared_pages_preserve_tail_rows_and_kernel_scale_alignment():
     descriptor = next(tensor for tensor in plan.kv_cache_tensors if indexer_name in get_kv_cache_tensor_layers(tensor))
     raw = torch.zeros(descriptor.size, dtype=torch.uint8)
     (tail,) = view_kpool_tail_cache(tail_name, specs[tail_name], raw, plan.num_blocks)
-    page_rows = specs[tail_name].page_size_bytes // (2 * specs[tail_name].head_size * tail.element_size())
+    planned_tail = next(g.kv_cache_spec for g in groups if tail_name in g.layer_names)
+    page_rows = planned_tail.page_size_bytes // (2 * specs[tail_name].head_size * tail.element_size())
     assert page_rows * tail.shape[-1] == tail.stride(0)
 
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
-    keys, scales = view_compressed_indexer_cache(indexer_name, specs[indexer_name], raw, backend, 128)
+    planned_indexer = next(g.kv_cache_spec for g in groups if indexer_name in g.layer_names)
+    planned_indexer = getattr(planned_indexer, "kv_cache_specs", {}).get(indexer_name, planned_indexer)
+    keys, scales = view_compressed_indexer_cache(indexer_name, planned_indexer, raw, backend, 128)
     page_bytes = descriptor.size // plan.num_blocks
     assert keys.shape == (15, 32, 1, 128)
     assert scales.shape == (15, 32, 1, 1)
@@ -412,7 +415,7 @@ def test_glm53_flash_planning_preserves_owner_specs_and_two_page_classes(pool):
     assert {name: spec.page_size_padded for name, spec in specs.items()} == owner_padding
     assert {name: spec.block_size for name, spec in specs.items()} == owner_blocks
     assert layout.main_page_size == specs["model.layers.3.attn"].page_size_bytes
-    assert layout.small_page_size == specs["model.layers.3.indexer.k_cache"].page_size_bytes
+    assert layout.small_page_size == max(specs["model.layers.3.indexer.k_cache"].page_size_bytes, specs["model.layers.3.indexer.tail_cache"].page_size_bytes)
     repeated = get_glm5_next_kv_cache_groups(make_config(), specs)
     assert _get_glm5_next_cache_layout(repeated) == layout
 
