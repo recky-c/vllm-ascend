@@ -198,7 +198,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         prefix = (num_blocks, spec.num_kv_heads, spec.block_size)
         shapes = [(*prefix, spec.head_size * get_dtype_size(spec.dtype))]
         if spec.scale_dim:
-            scale_shape = (spec.scale_dim * get_dtype_size(spec.scale_dtype),)
+            scale_shape: tuple[int, ...] = (spec.scale_dim * get_dtype_size(spec.scale_dtype),)
             if spec.cache_sparse_li_c4:
                 scale_shape = (spec.scale_dim // 2, 2 * get_dtype_size(spec.scale_dtype))
             shapes.append((*prefix, *scale_shape))

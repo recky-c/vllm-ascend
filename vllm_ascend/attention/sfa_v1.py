@@ -383,9 +383,12 @@ class AscendSFABackend(AttentionBackend):
         kernel_block_size: int | None = None,
     ) -> tuple[tuple[int, ...], ...]:
         """Page components in byte shapes [B,H,N,C], as in the DSA backend."""
-        widths = (spec.kv_lora_rank, spec.qk_rope_head_dim)
+        widths: tuple[int, ...]
         if spec.uses_packed_sfa_main_cache:
             widths = (spec.head_size,)
+        else:
+            assert spec.kv_lora_rank is not None and spec.qk_rope_head_dim is not None
+            widths = (spec.kv_lora_rank, spec.qk_rope_head_dim)
         prefix = (num_blocks, spec.num_kv_heads, spec.block_size)
         return tuple((*prefix, width * get_dtype_size(spec.dtype)) for width in widths)
 
