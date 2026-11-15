@@ -681,3 +681,42 @@ def test_indexer_owner_tracks_runtime_cache_requirement(monkeypatch, mtp):
         assert ("cache_owner" in specs) is enabled
         if enabled:
             assert specs["cache_owner"] == spec
+
+
+@pytest.mark.parametrize("key_dtype,scale_dtype", [(torch.int8, torch.float16), (torch.float8_e4m3fn, torch.float32)])
+@pytest.mark.parametrize("paged,width", [(True, 128), (False, 128), (True, 96)])
+def test_c8_cache_write_selects_page_store(monkeypatch, key_dtype, scale_dtype, paged, width):
+    from vllm_ascend.worker.v2.attn_utils import create_cache_component_views
+
+    block_size = 128
+    page = block_size * (width + torch.empty((), dtype=scale_dtype).element_size())
+    raw = torch.full((2 * page,), 23, dtype=torch.int8)
+    key, scale = create_cache_component_views(
+        raw, [(2, block_size, 1, width), (2, block_size, 1, 1)], [key_dtype, scale_dtype], page
+    )
+    if not paged:
+        key, scale = key.contiguous(), scale.contiguous()
+    indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+    indexer.enable_sparse_li_c8, indexer.enable_sparse_li_c4 = True, False
+    indexer.k_cache = SimpleNamespace(kv_cache=(key, scale))
+    updates = torch.arange(6 * width, dtype=torch.float32).remainder(8).to(key_dtype).view(6, width)[::2]
+    scales = torch.tensor([1.25, 0, 2.5, 0, 3.75, 0], dtype=scale_dtype)[::2]
+    slots = torch.tensor([127, 128, -1])
+    store = Mock()
+    scatter = Mock()
+    monkeypatch.setattr(indexer_module, "store_indexer_key_scale", store)
+    monkeypatch.setattr(indexer_module.DeviceOperator, "scatter_paged_cache", scatter)
+    indexer.write_cache(updates, scales, slots)
+    if paged and width == 128:
+        store.assert_called_once()
+        scatter.assert_not_called()
+        actual_key, actual_scale, actual_slots, actual_cache, actual_scale_cache = store.call_args.args
+        assert actual_key.is_contiguous() and actual_scale.is_contiguous()
+        assert actual_key.dtype == key_dtype and actual_scale.dtype == scale_dtype
+        torch.testing.assert_close(actual_key.float(), updates.float())
+        torch.testing.assert_close(actual_scale, scales)
+        torch.testing.assert_close(actual_slots, slots)
+        assert actual_cache is key and actual_scale_cache is scale
+    else:
+        store.assert_not_called()
+        assert scatter.call_count == 2

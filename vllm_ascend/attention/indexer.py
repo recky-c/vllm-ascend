@@ -532,6 +532,23 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         require the builder's matching ``cache_scatter_indices``.
         """
         indexer_k_cache = self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT]
+        if (
+            self.enable_sparse_li_c8
+            and not self.enable_sparse_li_c4
+            and not indexer_k_cache.is_contiguous()
+            and k_li.shape[-1] & (k_li.shape[-1] - 1) == 0
+        ):
+            # C8 has one scale per token. Publish both components together,
+            # using their page strides without changing quantization/casts.
+            assert k_li_scale is not None
+            store_indexer_key_scale(
+                k_li.contiguous(),
+                k_li_scale.contiguous(),
+                slot_mapping.contiguous(),
+                indexer_k_cache,
+                self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
+            )
+            return
         # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter
         # kernel; view as uint8 (same 1-byte layout) for the cache write.
         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
