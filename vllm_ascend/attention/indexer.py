@@ -509,11 +509,10 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         if cache.is_contiguous():
             DeviceOperator.scatter_cache(cache.view(-1, *updates.shape[1:]), slots.view(-1, 1), updates)
         else:
-            # A hybrid page contains K and scales, so flattening its component
-            # views would either fail or copy the write destination. Address the
-            # block/token axes explicitly to retain the original shared storage.
-            assert cache_scatter_indices is not None
-            DeviceOperator.scatter_cache(cache, cache_scatter_indices, updates.view(-1, *cache.shape[2:]))
+            # PA K/V writes preserve the page stride; K/V alias for a single cache.
+            rows = updates.reshape(updates.shape[0], 1, -1)
+            destination = cache.view(*cache.shape[:2], 1, -1)
+            DeviceOperator.reshape_and_cache(rows, rows, destination, destination, slots.view(-1))
 
     def write_cache(
         self,
@@ -531,7 +530,22 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         with a different cache layout should override it. Page-strided views
         require the builder's matching ``cache_scatter_indices``.
         """
+        if slot_mapping.numel() == 0:
+            return
         indexer_k_cache = self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT]
+        if self.enable_sparse_li_c4 and not indexer_k_cache.is_contiguous():
+            assert k_li_scale is not None
+            # C4 K and MX scales share a byte type, so publish both in one PA
+            # call. Their row widths differ; both destination page strides stay intact.
+            scale_cache = self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT]
+            DeviceOperator.reshape_and_cache(
+                k_li.contiguous().view(torch.int8).view(k_li.shape[0], 1, -1),
+                k_li_scale.contiguous().view(torch.int8).view(k_li_scale.shape[0], 1, -1),
+                indexer_k_cache.view(torch.int8).view(*indexer_k_cache.shape[:2], 1, -1),
+                scale_cache.view(torch.int8).view(*scale_cache.shape[:2], 1, -1),
+                slot_mapping.view(-1),
+            )
+            return
         if (
             self.enable_sparse_li_c8
             and not self.enable_sparse_li_c4
@@ -554,7 +568,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
             indexer_k_cache = indexer_k_cache.view(torch.uint8)
             k_li = k_li.view(torch.uint8)
-        DeviceOperator.scatter_paged_cache(indexer_k_cache, slot_mapping, k_li)
+        self._write_cache_tensor(indexer_k_cache, k_li, slot_mapping, cache_scatter_indices)
         if self.enable_sparse_li_quant:
             assert k_li_scale is not None
             # C4 scale is multi-dimensional (b*s, d/64, 2); C8 is (b*s, 1).
@@ -563,7 +577,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             if indexer_scale_cache.dtype == torch.float8_e8m0fnu:
                 indexer_scale_cache = indexer_scale_cache.view(torch.uint8)
                 k_li_scale = k_li_scale.view(torch.uint8)
-            DeviceOperator.scatter_paged_cache(indexer_scale_cache, slot_mapping, k_li_scale)
+            self._write_cache_tensor(indexer_scale_cache, k_li_scale, slot_mapping, cache_scatter_indices)
 
     def _project_k(
         self,

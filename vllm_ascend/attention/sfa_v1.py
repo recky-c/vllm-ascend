@@ -1856,9 +1856,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
         assert packed_kv.shape[-1] == packed_head_dim
         packed_kv = packed_kv.view(-1, packed_head_dim)
-        DeviceOperator.scatter_paged_cache(
-            kv_cache[0], slot_mapping_sfa[: packed_kv.shape[0]], packed_kv
-        )
+        cache = kv_cache[0]
+        slots = slot_mapping_sfa[: packed_kv.shape[0]]
+        if packed_kv.shape[0] == 0:
+            return
+        if cache.is_contiguous():
+            DeviceOperator.scatter_cache(cache.view(-1, packed_head_dim), slots.view(-1, 1), packed_kv)
+        else:
+            rows = packed_kv.view(-1, 1, packed_head_dim)
+            DeviceOperator.reshape_and_cache(rows, rows, cache, cache, slots)
 
     def _sync_pcp_kv_cache(self, kv_cache: tuple[torch.Tensor, ...], attn_metadata: M) -> None:
         local_slots = attn_metadata.pcp_prolog_local_slots

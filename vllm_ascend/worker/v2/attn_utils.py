@@ -1591,6 +1591,8 @@ def allocate_kv_cache_main(
     device: torch.device,
     layout: Any,
     kernel_block_sizes: list[int],
+    *,
+    allocate: Callable[[int], torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Allocate Ascend KV cache through vLLM main's #51718 entry point.
 
@@ -1599,6 +1601,8 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
+    if allocate is not None:
+        raise NotImplementedError("Extensible KV cache allocation is not supported on Ascend.")
     vllm_config = get_current_vllm_config()
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
     shared_layers = {

@@ -705,7 +705,7 @@ def test_c8_cache_write_selects_page_store(monkeypatch, key_dtype, scale_dtype, 
     store = Mock()
     scatter = Mock()
     monkeypatch.setattr(indexer_module, "store_indexer_key_scale", store)
-    monkeypatch.setattr(indexer_module.DeviceOperator, "scatter_paged_cache", scatter)
+    monkeypatch.setattr(indexer, "_write_cache_tensor", scatter)
     indexer.write_cache(updates, scales, slots)
     if paged and width == 128:
         store.assert_called_once()
