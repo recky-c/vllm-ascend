@@ -6,8 +6,10 @@ import vllm.v1.worker.utils as v1_worker_utils
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_ascend.attention.indexer import AscendHiSparseIndexerBackend, AscendSFAIndexerBackend
+from vllm_ascend.attention.indexer_kpool import AscendIndexerKPoolBackend, AscendIndexerKPoolTailBackend
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.patch.worker.patch_bind_kv_cache import (
     bind_kv_cache,
@@ -117,10 +119,18 @@ def _install_sfa_component_mapping():
     original = v1_worker_utils.AttentionGroup.map_kv_cache_to_kernel_blocks
 
     def map_components(group, kv_cache):
-        if group.backend not in (AscendSFABackend, AscendSFAIndexerBackend) or isinstance(kv_cache, torch.Tensor):
+        if isinstance(group.kv_cache_spec, MambaSpec) and isinstance(kv_cache, (tuple, list)):
+            return kv_cache
+        if group.backend not in (
+            AscendSFABackend,
+            AscendSFAIndexerBackend,
+            AscendIndexerKPoolBackend,
+            AscendIndexerKPoolTailBackend,
+        ) or isinstance(kv_cache, torch.Tensor):
             return original(group, kv_cache)
-        if any(component.shape[1] != group.kernel_block_size for component in kv_cache):
-            raise ValueError("SFA component views require equal manager and kernel block sizes.")
+        kernel_rows = group.kv_cache_spec.get_num_kernel_states(group.kernel_block_size)
+        if any(component.shape[1] != kernel_rows for component in kv_cache):
+            raise ValueError("Cache components must already use the backend's kernel rows.")
         return kv_cache
 
     v1_worker_utils.AttentionGroup.map_kv_cache_to_kernel_blocks = map_components

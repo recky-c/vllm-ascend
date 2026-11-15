@@ -389,7 +389,10 @@ class AscendSFABackend(AttentionBackend):
         else:
             assert spec.kv_lora_rank is not None and spec.qk_rope_head_dim is not None
             widths = (spec.kv_lora_rank, spec.qk_rope_head_dim)
-        prefix = (num_blocks, spec.num_kv_heads, spec.block_size)
+        kernel_tokens = kernel_block_size or spec.block_size
+        if spec.block_size % kernel_tokens:
+            raise ValueError("SFA kernel pages must divide the manager page.")
+        prefix = (num_blocks * (spec.block_size // kernel_tokens), spec.num_kv_heads, kernel_tokens)
         return tuple((*prefix, width * get_dtype_size(spec.dtype)) for width in widths)
 
     @staticmethod
@@ -1414,12 +1417,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert self.kv_a_layernorm is not None
             values = self.kv_a_layernorm(kv_no_split.reshape(-1, self.kv_lora_rank))
             cache = kv_cache[0]
-            # The hybrid cache configuration keeps NoPE main KV pages packed.
-            torch_npu.npu_scatter_nd_update_(
-                cache.view(-1, self.kv_lora_rank),
-                slots[: values.shape[0]].view(-1, 1),
-                values.to(cache.dtype),
-            )
+            values = values.to(cache.dtype)
+            write_slots = slots[: values.shape[0]]
+            if values.shape[0] == 0:
+                return None, None
+            if cache.is_contiguous():
+                DeviceOperator.scatter_cache(cache.view(-1, self.kv_lora_rank), write_slots.view(-1, 1), values)
+            else:
+                rows = values.view(-1, 1, self.kv_lora_rank)
+                DeviceOperator.reshape_and_cache(rows, rows, cache, cache, write_slots)
             return None, None
         B = kv_no_split.shape[0]
         N = self.num_kv_heads

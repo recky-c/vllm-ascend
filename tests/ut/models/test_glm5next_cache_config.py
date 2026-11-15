@@ -230,11 +230,14 @@ def test_fp8_shared_pages_preserve_tail_rows_and_kernel_scale_alignment():
     descriptor = next(tensor for tensor in plan.kv_cache_tensors if indexer_name in get_kv_cache_tensor_layers(tensor))
     raw = torch.zeros(descriptor.size, dtype=torch.uint8)
     (tail,) = view_kpool_tail_cache(tail_name, specs[tail_name], raw, plan.num_blocks)
-    page_rows = specs[tail_name].page_size_bytes // (2 * specs[tail_name].head_size * tail.element_size())
+    planned_tail = next(g.kv_cache_spec for g in groups if tail_name in g.layer_names)
+    page_rows = planned_tail.page_size_bytes // (2 * specs[tail_name].head_size * tail.element_size())
     assert page_rows * tail.shape[-1] == tail.stride(0)
 
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
-    keys, scales = view_compressed_indexer_cache(indexer_name, specs[indexer_name], raw, backend, 128)
+    planned_indexer = next(g.kv_cache_spec for g in groups if indexer_name in g.layer_names)
+    planned_indexer = getattr(planned_indexer, "kv_cache_specs", {}).get(indexer_name, planned_indexer)
+    keys, scales = view_compressed_indexer_cache(indexer_name, planned_indexer, raw, backend, 128)
     page_bytes = descriptor.size // plan.num_blocks
     assert keys.shape == (15, 32, 1, 128)
     assert scales.shape == (15, 32, 1, 1)
@@ -412,7 +415,10 @@ def test_glm53_flash_planning_preserves_owner_specs_and_two_page_classes(pool):
     assert {name: spec.page_size_padded for name, spec in specs.items()} == owner_padding
     assert {name: spec.block_size for name, spec in specs.items()} == owner_blocks
     assert layout.main_page_size == specs["model.layers.3.attn"].page_size_bytes
-    assert layout.small_page_size == specs["model.layers.3.indexer.k_cache"].page_size_bytes
+    assert layout.small_page_size == max(
+        specs["model.layers.3.indexer.k_cache"].page_size_bytes,
+        specs["model.layers.3.indexer.tail_cache"].page_size_bytes,
+    )
     repeated = get_glm5_next_kv_cache_groups(make_config(), specs)
     assert _get_glm5_next_cache_layout(repeated) == layout
 
@@ -443,3 +449,30 @@ def test_glm53_flash_small_pool_does_not_pad_main_pool(large_owner):
     assert sum(tensor.size for tensor in physical.kv_cache_tensors) == 7 * cost
     assert {tensor.block_stride for tensor in physical.kv_cache_tensors} == {main_page, small_page}
     assert all(specs[name] is spec for name, spec in original.items())
+
+
+@pytest.fixture(autouse=True)
+def legacy_slot_allocation(monkeypatch):
+    # Existing cases exercise the retained transfer/release slot ABI.
+    monkeypatch.setattr("vllm_ascend.models.glm5next.cache_config.uses_glm5_next_unified_cache", lambda config: False)
+
+
+def test_shared_slot_descriptors_preserve_budget_and_aliases(monkeypatch):
+    from vllm_ascend.models.glm5next import cache_config
+
+    config = make_config()
+    groups = get_glm5_next_kv_cache_groups(config, make_specs())
+    budget = 3 * get_glm5_next_pool_bytes_per_block(groups)
+    legacy = get_glm5_next_kv_cache_config(config, groups, budget)
+    monkeypatch.setattr(cache_config, "uses_glm5_next_unified_cache", lambda config: True)
+    shared = get_glm5_next_kv_cache_config(config, groups, budget)
+    assert shared.num_blocks == legacy.num_blocks
+    offset = 0
+    for old, new in zip(legacy.kv_cache_tensors, shared.kv_cache_tensors, strict=True):
+        assert new.size == budget
+        assert new.offset == offset
+        assert new.layers == old.layers
+        assert new.layer_stride == old.layer_stride == 0
+        assert new.block_stride == old.block_stride
+        offset += old.size
+    assert offset == budget
