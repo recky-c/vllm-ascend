@@ -779,7 +779,7 @@ def test_incomplete_inputs_fail_before_kernel_launch(field, keypool_kernels):
 def test_tail_metadata_uses_bound_stride(keypool_kernels, monkeypatch):
     config, common = _config(), _common()
     spec = AscendIndexerKPoolTailSpec(
-        block_size=4, sliding_window=4, compress_ratio=4,
+        block_size=4, ring_capacity=4, sliding_window=4, compress_ratio=4,
         num_kv_heads=1, head_size=128, dtype=torch.float32,
     )
     storage = torch.zeros(2 * 8192, dtype=torch.float32)

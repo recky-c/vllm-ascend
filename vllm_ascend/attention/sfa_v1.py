@@ -1417,7 +1417,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert self.kv_a_layernorm is not None
             values = self.kv_a_layernorm(kv_no_split.reshape(-1, self.kv_lora_rank))
             cache = kv_cache[0]
-            DeviceOperator.scatter_paged_cache(cache, slots[: values.shape[0]], values.to(cache.dtype))
+            values = values.to(cache.dtype)
+            write_slots = slots[: values.shape[0]]
+            if values.shape[0] == 0:
+                return None, None
+            if cache.is_contiguous():
+                DeviceOperator.scatter_cache(cache.view(-1, self.kv_lora_rank), write_slots.view(-1, 1), values)
+            else:
+                rows = values.view(-1, 1, self.kv_lora_rank)
+                DeviceOperator.reshape_and_cache(rows, rows, cache, cache, write_slots)
             return None, None
         B = kv_no_split.shape[0]
         N = self.num_kv_heads

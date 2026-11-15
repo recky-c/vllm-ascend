@@ -761,7 +761,7 @@ class AscendIndexerKPoolTailBackend(AttentionBackend):
 
     @classmethod
     def get_runtime_shapes(cls, spec, num_blocks, layout, kernel_block_size=None):
-        return ((num_blocks, 1, spec.block_size, 2 * spec.head_size * get_dtype_size(spec.dtype)),)
+        return ((num_blocks, 1, spec.ring_capacity, 2 * spec.head_size * get_dtype_size(spec.dtype)),)
 
     @staticmethod
     def get_runtime_dtypes(spec):
