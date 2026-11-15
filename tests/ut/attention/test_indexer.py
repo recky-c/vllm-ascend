@@ -717,6 +717,11 @@ def test_c8_cache_write_selects_page_store(monkeypatch, key_dtype, scale_dtype, 
         torch.testing.assert_close(actual_scale, scales)
         torch.testing.assert_close(actual_slots, slots)
         assert actual_cache is key and actual_scale_cache is scale
+        assert store.call_args.kwargs == {
+            "block_size": block_size,
+            "key_block_stride": key.stride(0),
+            "scale_block_stride": scale.stride(0),
+        }
     else:
         store.assert_not_called()
         assert scatter.call_count == 2

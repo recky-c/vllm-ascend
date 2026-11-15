@@ -564,6 +564,9 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
                 slot_mapping.contiguous(),
                 indexer_k_cache,
                 self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
+                block_size=indexer_k_cache.shape[1],
+                key_block_stride=indexer_k_cache.stride(0),
+                scale_block_stride=self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT].stride(0),
             )
             return
         # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter
