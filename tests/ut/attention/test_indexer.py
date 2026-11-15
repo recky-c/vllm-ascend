@@ -727,9 +727,7 @@ def test_c4_page_write_pairs_key_and_scale_without_copying_destination(monkeypat
     from vllm_ascend.worker.v2.attn_utils import create_cache_component_views
 
     raw = torch.full((3 * 304,), 19, dtype=torch.int8)
-    key, scale = create_cache_component_views(
-        raw, [(3, 4, 1, 64), (3, 4, 1, 2, 2)], [torch.uint8, torch.uint8], 304
-    )
+    key, scale = create_cache_component_views(raw, [(3, 4, 1, 64), (3, 4, 1, 2, 2)], [torch.uint8, torch.uint8], 304)
     before = raw.clone()
     backend = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
     backend.enable_sparse_li_c4, backend.enable_sparse_li_c8 = True, False
@@ -755,6 +753,8 @@ def test_c4_page_write_pairs_key_and_scale_without_copying_destination(monkeypat
     for i, slot in enumerate(slots.tolist()):
         if slot >= 0:
             page, token = divmod(slot, 4)
-            before[page * 304 + token * 64:page * 304 + (token + 1) * 64] = keys[i].view(torch.int8)
-            before[page * 304 + 256 + token * 4:page * 304 + 256 + (token + 1) * 4] = scales[i].view(torch.int8).flatten()
+            before[page * 304 + token * 64 : page * 304 + (token + 1) * 64] = keys[i].view(torch.int8)
+            before[page * 304 + 256 + token * 4 : page * 304 + 256 + (token + 1) * 4] = (
+                scales[i].view(torch.int8).flatten()
+            )
     assert torch.equal(raw, before)

@@ -47,7 +47,6 @@ def make_config():
     )
 
 
-
 def allocate(config=None):
     config = config or make_config()
     raw = torch.full((1024,), 33, dtype=torch.int8)
@@ -145,9 +144,13 @@ def test_upstream_indexer_placement_includes_scales_and_replicas(dtype, width, s
         sfa_dcp_replicated_indexer_size=replicas,
     )
     strides = compute_layout_strides(spec, 3, 2, KVCacheLayout.LBHNC)
-    page_bytes = 128 * replicas * (
-        width * torch.empty((), dtype=dtype).element_size()
-        + scale_dim * torch.empty((), dtype=scale_dtype).element_size()
+    page_bytes = (
+        128
+        * replicas
+        * (
+            width * torch.empty((), dtype=dtype).element_size()
+            + scale_dim * torch.empty((), dtype=scale_dtype).element_size()
+        )
     )
     assert strides[1] == page_bytes
     assert strides[0] == 3 * page_bytes

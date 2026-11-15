@@ -188,7 +188,10 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
 
     @classmethod
     def get_runtime_shapes(
-        cls, spec: AscendSFAIndexerCacheSpec, num_blocks: int, layout: Any,
+        cls,
+        spec: AscendSFAIndexerCacheSpec,
+        num_blocks: int,
+        layout: Any,
         kernel_block_size: int | None = None,
     ) -> tuple[tuple[int, ...], ...]:
         """K followed by scale inside each page; C4 retains its scale axes."""

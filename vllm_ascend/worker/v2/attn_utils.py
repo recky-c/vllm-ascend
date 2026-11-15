@@ -1573,10 +1573,7 @@ def _uses_glm_component_views(vllm_config, kv_cache_config, attn_layers, kernel_
         and vllm_config.kv_transfer_config is None
         and KVPPConfig.from_vllm_config(vllm_config).size == 1
         and not get_ascend_config().sparse_kv_offload_config.enabled
-        and all(
-            attn_layers[name].get_attn_backend() in (AscendSFABackend, AscendSFAIndexerBackend)
-            for name in specs
-        )
+        and all(attn_layers[name].get_attn_backend() in (AscendSFABackend, AscendSFAIndexerBackend) for name in specs)
         and all(
             specs[name].block_size == kernel_block_sizes[group_id]
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)

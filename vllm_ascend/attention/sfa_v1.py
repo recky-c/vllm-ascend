@@ -376,7 +376,10 @@ class AscendSFABackend(AttentionBackend):
 
     @classmethod
     def get_runtime_shapes(
-        cls, spec: AscendMLAAttentionSpec, num_blocks: int, layout: Any,
+        cls,
+        spec: AscendMLAAttentionSpec,
+        num_blocks: int,
+        layout: Any,
         kernel_block_size: int | None = None,
     ) -> tuple[tuple[int, ...], ...]:
         """Page components in byte shapes [B,H,N,C], as in the DSA backend."""
